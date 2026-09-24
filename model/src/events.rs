@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use crate::{OrderBook, OrderData};
+use crate::{OrderBook, OrderData, TradeDirection};
 
 #[derive(Debug, Clone)]
 pub struct OrderBookEvent {
@@ -13,6 +13,22 @@ pub struct OrderBookDeltaEvent {
     pub timestamp: DateTime<Utc>,
     pub asks: Vec<OrderData>,
     pub bids: Vec<OrderData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderEvent {
+    pub deal_id: i32,
+    pub instrument_id: i32,
+    pub ticker: String,
+    pub direction: TradeDirection,
+    pub quantity: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderResponseEvent {
+    pub deal_id: i32,
+    pub direction: TradeDirection,
+    pub order_id: String,
 }
 
 pub fn merge_events(id1: i32, id2: i32, values1: &[OrderBook], values2: &[OrderBook]) -> Vec<OrderBookEvent> {

@@ -5,7 +5,7 @@ use log::{debug, error, info, warn};
 use model::common::EmptyResult;
 use model::events::{OrderBookDeltaEvent, OrderBookEvent};
 use model::utils::handle_delta;
-use model::{Instrument, OrderBook};
+use model::{Instrument, OrderBook, Trade};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -91,29 +91,65 @@ impl ListenerHandler {
     }
 }
 
-pub async fn listen(db: Db, instruments: Vec<Instrument>, order_book_event_sender: mpsc::Sender<OrderBookEvent>) -> EmptyResult {
+pub async fn listen(
+    db: Db,
+    instruments: Vec<Instrument>,
+    order_book_event_sender: mpsc::Sender<OrderBookEvent>,
+    trades_event_sender: mpsc::Sender<Trade>,
+    alor: &Alor,
+) -> EmptyResult {
     let mut instruments_map = HashMap::new();
     instruments.into_iter().for_each(|instrument| {
         if let Some(id) = instrument.id {
             instruments_map.insert(id, instrument);
         }
     });
+    
+    let db_clone = db.clone();
+    let (trades_sender, mut trades_receiver) = mpsc::channel(64);
+    tokio::spawn(async move {
+        while let Some(mut trade) = trades_receiver.recv().await {
+            if let Err(err) = db_clone.insert_trade(&mut trade).await {
+                error!("Failed to insert trade: {err}");
+            }
+            
+            if let Err(err) = trades_event_sender.send(trade).await {
+                error!("Error sending trades event: {err}");
+            }
+        }
+    });
+    
+    let alor_clone = alor.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = alor_clone.listen_trades(trades_sender.clone()).await {
+                error!("Error listening trades: {}", err);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
 
     let db_clone = db.clone();
+    let alor_clone = alor.clone();
     let instruments_map_clone = instruments_map.clone();
-
     let ticker = Arc::new(AtomicI64::new(0));
     loop {
         let now = Utc::now().timestamp();
         if ticker.load(Relaxed) < now - 5 * 60 {
-            start_listener(db_clone.clone(), instruments_map_clone.clone(), ticker.clone(), order_book_event_sender.clone());
+            start_listener(db_clone.clone(), instruments_map_clone.clone(), ticker.clone(), order_book_event_sender.clone(), alor_clone.clone());
             ticker.store(Utc::now().timestamp(), Relaxed);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-fn start_listener(db: Db, instruments: HashMap<i32, Instrument>, ticker: Arc<AtomicI64>, order_book_event_sender: mpsc::Sender<OrderBookEvent>) {
+fn start_listener(
+    db: Db,
+    instruments: HashMap<i32, Instrument>,
+    ticker: Arc<AtomicI64>,
+    order_book_event_sender: mpsc::Sender<OrderBookEvent>,
+    alor: Alor,
+) {
     let (order_book_sender,
         mut order_book_receiver) = mpsc::channel::<OrderBookEvent>(64);
     let (order_book_delta_sender,
@@ -139,8 +175,7 @@ fn start_listener(db: Db, instruments: HashMap<i32, Instrument>, ticker: Arc<Ato
 
     let instruments = instruments.values().cloned().collect::<Vec<_>>();
     tokio::spawn(async move {
-        let alor = Alor::default();
-        if let Err(err) = alor.listen(
+        if let Err(err) = alor.listen_order_books(
             &instruments,
             order_book_sender,
             order_book_delta_sender,

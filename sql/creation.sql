@@ -11,7 +11,7 @@ create table order_book
 (
     id            bigserial,
     created       timestamp with time zone default now() not null,
-    instrument_id integer,
+    instrument_id integer not null,
     ask_delta     bytea,
     bid_delta     bytea
 );
@@ -39,3 +39,27 @@ create table price
     id    serial,
     price numeric
 );
+
+create table spread_deal
+(
+    id serial,
+    started timestamp with time zone not null,
+    instrument_id integer not null,
+    direction char not null,
+    open_order_id varchar,
+    close_order_id varchar
+);
+create index on spread_deal (started);
+
+create table trade
+(
+    id serial,
+    order_id varchar not null,
+    executed timestamp with time zone not null,
+    direction char not null,
+    price numeric not null,
+    quantity smallint not null,
+    json varchar
+);
+create index on trade (order_id);
+create index on trade (executed);

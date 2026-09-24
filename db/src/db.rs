@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::utils::handle_delta;
-use model::{Instrument, OrderBook, OrderData, OrderDataDelta};
+use model::{Deal, Instrument, OrderBook, OrderData, OrderDataDelta, Trade, TradeDirection};
 use rust_decimal::Decimal;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, Row};
@@ -360,6 +360,54 @@ impl Db {
             .bind(bids_sizes)
             .execute(&self.pool).await?;
 
+        Ok(())
+    }
+    
+    pub async fn start_deal(&self, instrument_id: i32, direction: TradeDirection) -> Result<Deal, CommonError> {
+        let started = Utc::now();
+        let id_row = sqlx::query("INSERT INTO spread_deal (started, instrument_id, direction) VALUES ($1, $2, $3)")
+            .bind(started)
+            .bind(instrument_id)
+            .bind(direction.to_short_string())
+            .fetch_one(&self.pool).await?;
+        let id = id_row.get(0);
+        Ok(Deal {
+            id,
+            instrument_id,
+            started,
+            direction,
+            open_order_id: None,
+            close_order_id: None,
+        })
+    }
+    
+    pub async fn update_deal(&self, deal_id: i32, open_order_id: Option<String>, close_order_id: Option<String>) -> EmptyResult {
+        if let Some(open_order_id) = open_order_id {
+            sqlx::query("UPDATE spread_deal SET open_order_id = $1 WHERE id = $2")
+                .bind(open_order_id)
+                .bind(deal_id)
+                .execute(&self.pool).await?;
+        }
+        if let Some(close_order_id) = close_order_id {
+            sqlx::query("UPDATE spread_deal SET close_order_id = $1 WHERE id = $2")
+                .bind(close_order_id)
+                .bind(deal_id)
+                .execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+    
+    pub async fn insert_trade(&self, trade: &mut Trade) -> EmptyResult {
+        let id_row = sqlx::query("INSERT INTO trade (order_id, executed, direction, price, quantity, json) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id")
+            .bind(trade.order_id.clone())
+            .bind(trade.executed)
+            .bind(trade.direction.to_short_string())
+            .bind(trade.price)
+            .bind(trade.quantity)
+            .bind(trade.json.clone())
+            .fetch_one(&self.pool).await?;
+        let id = id_row.get(0);
+        trade.id = Some(id);
         Ok(())
     }
 

@@ -41,3 +41,52 @@ pub struct OrderDataSlice {
     pub timestamp: DateTime<Utc>,
     pub order_data: Vec<OrderData>,
 }
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum TradeDirection {
+    Buy, Sell,
+}
+
+impl TradeDirection {
+    pub fn reverse(&self) -> TradeDirection {
+        match self {
+            TradeDirection::Buy => TradeDirection::Sell,
+            TradeDirection::Sell => TradeDirection::Buy,
+        }
+    }
+    
+    pub fn to_short_string(&self) -> String {
+        match self {
+            TradeDirection::Buy => "b".to_string(),
+            TradeDirection::Sell => "s".to_string(),
+        }
+    }
+
+    pub fn to_full_string(&self) -> String {
+        match self {
+            TradeDirection::Buy => "buy".to_string(),
+            TradeDirection::Sell => "sell".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Deal {
+    pub id: i32,
+    pub instrument_id: i32,
+    pub started: DateTime<Utc>,
+    pub direction: TradeDirection,
+    pub open_order_id: Option<String>,
+    pub close_order_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct Trade {
+    pub id: Option<i32>,
+    pub order_id: String,
+    pub executed: DateTime<Utc>,
+    pub direction: TradeDirection,
+    pub price: Decimal,
+    pub quantity: i16,
+    pub json: String,
+}

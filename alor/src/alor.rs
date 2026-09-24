@@ -1,24 +1,28 @@
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::dangerous::insecure_decode_claims;
 use log::{error, info, warn};
 use model::common::{CommonError, EmptyResult};
-use model::events::{OrderBookDeltaEvent, OrderBookEvent};
-use model::{Instrument, OrderBook, OrderData};
+use model::events::{OrderBookDeltaEvent, OrderBookEvent, OrderEvent, OrderResponseEvent};
+use model::{Instrument, OrderBook, OrderData, Trade, TradeDirection};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, RwLock};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use yawc::{Frame, OpCode, WebSocket};
+use yawc::{Frame, MaybeTlsStream, OpCode, WebSocket};
 
 const ACCESS_TOKEN_URL: &str = "https://oauthdev.alor.ru/refresh";
 const API_ROOT: &str = "https://apidev.alor.ru/md/v2";
-const WS_URL: &str = "wss://apidev.alor.ru/ws";
+const WS_SUBSCRIBE_URL: &str = "wss://apidev.alor.ru/ws";
+const WS_COMMAND_URL: &str = "wss://apidev.alor.ru/cws";
 
 const INSTRUMENTS_LIMIT: usize = 100;
+
+const PORTFOLIO: &str = "D00013";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -47,7 +51,7 @@ struct InstrumentResponse {
 }
 
 #[derive(Serialize)]
-struct SubscribeRequest {
+struct OrderBookSubscribeRequest {
     opcode: String,
     exchange: String,
     code: String,
@@ -86,7 +90,110 @@ struct OrderBookPosition {
     v: i32,
 }
 
-#[derive(Default)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TradeSubscribeRequest {
+    opcode: String,
+    exchange: String,
+    portfolio: String,
+    skip_history: bool,
+    format: String,
+    guid: String,
+    token: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct TradeMessage {
+    data: TradeData,
+    guid: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct TradeData {
+    /// Уникальный идентификатор сделки
+    id: String,
+    /// Уникальный идентификатор заявки
+    eid: String,
+    /// Пользовательский комментарий к заявке. Максимальная длина комментария — 100 символов
+    cmt: Option<String>,
+    /// Тикер (Код финансового инструмента). [N/A] используется, если symbol не определен
+    sym: String,
+    ///  Пара Биржа:Тикер. Пример: "MOEX:ALRS-3.24"
+    tic: String,
+    /// Биржа: MOEX — Московская Биржа, SPBX — СПБ Биржа
+    ex: String,
+    /// Дата и время (UTC) закрытия заявки
+    d: DateTime<Utc>,
+    /// Количество (штуки)
+    q: i32,
+    /// Количество (лоты)
+    qb: i32,
+    /// Цена
+    px: Decimal,
+    /// Начислено (НКД)
+    ai: Decimal,
+    /// Направление сделки: buy — Покупка, sell — Продажа
+    s: String,
+    /// True — для данных из снепшота, то есть из истории. False — для новых событий
+    h: bool,
+    /// Суммарная комиссия (null для Срочного рынка)
+    cms: Option<String>,
+    /// Объём сделки в валюте расчётов, определённый по действовавшей на момент заключения цене лота
+    v: Decimal,
+    /// Только для фондового рынка MOEX и SPBX. Точная стоимость сделки в валюте расчётов, равная произведению цены одной штуки (price/px) в валюте расчётов на объём лота (qtyUnits/q)
+    val: Decimal,
+}
+
+#[derive(Serialize)]
+struct AuthRequest {
+    opcode: String,
+    guid: String,
+    token: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct CreateOrderRequest {
+    opcode: String,
+    guid: String,
+    /// Направление сделки: buy — Покупка, sell — Продажа
+    side: String,
+    /// Количество (лоты)
+    quantity: i32,
+    comment: Option<String>,
+    user: CreateOrderUser,
+    instrument: CreateOrderInstrument,
+    /// ImmediateOrCancel — Исполнение немедленно на весь доступный объём встречных заявок. Неисполненный остаток отменяется
+    time_in_force: String,
+    /// Флаг, подтверждающий согласие клиента с начальным уровнем риска (КНУР) на выставление или изменение заявки, исполнение которой может привести к возникновению или увеличению непокрытой позиции.
+    // Флаг не переносится между запросами — в каждом запросе, требующем подтверждения, должен быть свой флаг allowMargin: true
+    allow_margin: bool,
+}
+
+#[derive(Serialize, Debug)]
+struct CreateOrderUser {
+    /// Идентификатор клиентского портфеля
+    portfolio: String,
+}
+
+#[derive(Serialize, Debug)]
+struct CreateOrderInstrument {
+    /// Тикер (Код финансового инструмента)
+    symbol: String,
+    /// Биржа: MOEX — Московская Биржа, SPBX — СПБ Биржа
+    exchange: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateOrderResponse {
+    request_guid: String,
+    http_code: i32,
+    message: Option<String>,
+    order_number: i64,
+}
+
+#[derive(Default, Clone)]
 pub struct Alor {
     access_token: Arc<RwLock<String>>,
 }
@@ -144,7 +251,159 @@ impl Alor {
         }).collect())
     }
 
-    pub async fn listen(
+    async fn send_auth_command(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, token: String) {
+        let rq = AuthRequest {
+            opcode: "authorize".to_string(),
+            guid: Uuid::new_v4().to_string(),
+            token,
+        };
+        if let Ok(json) = serde_json::to_string(&rq) {
+            if let Err(err) = ws.send(Frame::text(json)).await {
+                error!("Failed to send authorize message: {err}");
+            } else {
+                info!("Successfully sent authorize message");
+            }
+        }
+    }
+
+    async fn handle_command(
+        event: OrderEvent,
+        ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+        response_sender: mpsc::Sender<OrderResponseEvent>,
+    ) {
+        let guid = Uuid::new_v4().to_string();
+        let rq = CreateOrderRequest {
+            opcode: "create:market".to_string(),
+            comment: None,
+            user: CreateOrderUser { portfolio: PORTFOLIO.to_string() },
+            instrument: CreateOrderInstrument { exchange: "MOEX".to_string(), symbol: event.ticker },
+            side: event.direction.to_full_string(),
+            quantity: event.quantity,
+            time_in_force: "ImmediateOrCancel".to_string(),
+            allow_margin: true,
+            guid,
+        };
+        if let Ok(json) = serde_json::to_string(&rq) {
+            if let Err(err) = ws.send(Frame::text(json)).await {
+                error!("Error sending command: {err}");
+                return;
+            }
+        } else {
+            error!("Failed to serialize event: {rq:?}");
+            return;
+        }
+
+        if let Some(frame) = ws.next().await {
+            match frame.opcode() {
+                OpCode::Text => {
+                    info!("Create order response: {}", frame.as_str());
+                    match serde_json::from_str::<CreateOrderResponse>(&*frame.as_str()) {
+                        Ok(response) => {
+                            let response = OrderResponseEvent {
+                                deal_id: event.deal_id,
+                                direction: event.direction,
+                                order_id: response.order_number.to_string(),
+                            };
+                            if let Err(err) = response_sender.send(response).await {
+                                error!("Failed to send order response: {err}");
+                            }
+                        }
+                        Err(err) => {
+                            error!("Failed to deserialize order response: {err}");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub async fn start_commands_stream(
+        &self,
+        response_sender: mpsc::Sender<OrderResponseEvent>,
+    ) -> Result<mpsc::Sender<OrderEvent>, CommonError> {
+        let (sender, mut receiver) = mpsc::channel::<OrderEvent>(64);
+
+        let mut ws = WebSocket::connect(WS_COMMAND_URL.parse()?).await?;
+
+        let mut auth_timer = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+        loop {
+            tokio::select! {
+                _ = auth_timer.tick() => {
+                    if let Ok(token) = self.get_actual_access_token().await {
+                        Self::send_auth_command(&mut ws, token).await;
+                    }
+                },
+                order_event = receiver.recv() => {
+                    match order_event {
+                        Some(event) => {
+                            Self::handle_command(event, &mut ws, response_sender.clone()).await;
+                        }
+                        None => {
+                            warn!("TradeEvent channel is closed");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(sender)
+    }
+
+    pub async fn listen_trades(&self, order_book_sender: mpsc::Sender<Trade>) -> EmptyResult {
+        let token = self.get_actual_access_token().await?;
+
+        let mut ws = WebSocket::connect(WS_SUBSCRIBE_URL.parse()?)
+            .with_options(yawc::Options::default().with_compression_level(yawc::CompressionLevel::best()))
+            .await?;
+
+        let rq = TradeSubscribeRequest {
+            opcode: "TradesGetAndSubscribeV2".to_string(),
+            exchange: "MOEX".to_string(),
+            portfolio: PORTFOLIO.to_string(),
+            skip_history: true,
+            format: "Slim".to_string(),
+            guid: Uuid::new_v4().to_string(),
+            token,
+        };
+        let json = serde_json::to_string(&rq)?;
+        ws.send(Frame::text(json)).await?;
+
+        while let Some(frame) = ws.next().await {
+            match frame.opcode() {
+                OpCode::Text => {
+                    match serde_json::from_str::<TradeMessage>(frame.as_str()) {
+                        Ok(msg) => {
+                            let trade = Trade {
+                                id: None,
+                                order_id: msg.data.eid,
+                                executed: msg.data.d,
+                                direction: if msg.data.s == "buy" {TradeDirection::Buy} else {TradeDirection::Sell},
+                                quantity: msg.data.q as i16,
+                                price: msg.data.px,
+                                json: frame.as_str().to_string(),
+                            };
+                            if let Err(err) = order_book_sender.send(trade).await {
+                                error!("Failed to send trade event {err}");
+                            }
+                        },
+                        Err(err) => {
+                            error!("{err}: {}", frame.as_str());
+                        }
+                    }
+                }
+                OpCode::Close => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn listen_order_books(
         &self,
         instruments: &[Instrument],
         order_book_sender: mpsc::Sender<OrderBookEvent>,
@@ -152,7 +411,7 @@ impl Alor {
     ) -> EmptyResult {
         let token = self.get_actual_access_token().await?;
 
-        let mut ws = WebSocket::connect(WS_URL.parse()?)
+        let mut ws = WebSocket::connect(WS_SUBSCRIBE_URL.parse()?)
             .with_options(yawc::Options::default().with_compression_level(yawc::CompressionLevel::best()))
             .await?;
 
@@ -161,7 +420,7 @@ impl Alor {
         for instrument in instruments {
             let guid = Uuid::new_v4().to_string();
             guid_to_instrument_id.insert(guid.clone(), instrument.id.unwrap());
-            let rq = SubscribeRequest {
+            let rq = OrderBookSubscribeRequest {
                 opcode: "OrderBookGetAndSubscribe".to_string(),
                 exchange: "MOEX".to_string(),
                 code: instrument.ticker.clone(),
@@ -240,7 +499,7 @@ impl Alor {
 
         let data = AccessTokenRequest {
             token: refresh_token,
-            allowed_portfolios: vec!["D00013".to_string()],
+            allowed_portfolios: vec![PORTFOLIO.to_string()],
         };
         let request = client.request(reqwest::Method::POST, ACCESS_TOKEN_URL)
             .headers(headers)
