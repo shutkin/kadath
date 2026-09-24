@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use log::{debug, info};
+use log::{debug, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::utils::handle_delta;
 use model::{Instrument, OrderBook, OrderData, OrderDataDelta};
@@ -153,6 +153,7 @@ impl Db {
             if let Some(price) = prices_map.get(&delta.price_id).copied() {
                 deltas.push(OrderData { price, size: delta.size });
             } else {
+                warn!("Price ID {} not found in map", delta.price_id);
                 return Ok(false);
             }
         }

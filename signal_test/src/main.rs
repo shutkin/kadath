@@ -2,11 +2,11 @@ use chrono::{DateTime, Datelike, TimeDelta, Timelike, Utc};
 use db::{Db, QueryAsksOrBids};
 use log::{LevelFilter, debug, info};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
-use model::events::OrderBookEvent;
+use model::events::{merge_events, OrderBookEvent};
 use model::{Instrument, OrderBook, order_book_cache};
 use rust_decimal::Decimal;
 use signal::signal_calculator::PairPerformance;
-use signal::{HOLD_TIME_VARIANTS, ModelConfig, TradeSignal, WalkForwardModel};
+use signal::{ModelConfig, TradeSignal, WalkForwardModel, WindowData, HOLD_TIME_VARIANTS};
 use simplelog::SimpleLogger;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -142,7 +142,8 @@ async fn main() -> EmptyResult {
         find_instrument_id(&all_instruments, tickers[1]),
     ) {
             let config = ModelConfig::default();
-            let mut model = WalkForwardModel::new_with_config(inst1_id, inst2_id, config);
+            let model = WalkForwardModel::new_with_config(inst1_id, inst2_id, config);
+            let mut window_data = WindowData::new();
 
             let mut diapason = TimeDiapason::new(
                 DateTime::parse_from_rfc3339("2026-09-18T05:00:00Z")?.to_utc(),
@@ -173,7 +174,7 @@ async fn main() -> EmptyResult {
                             //info!("Hour {prev_hour}");
                         }
 
-                        if let Some(pair_perf) = model.calibrate() {
+                        if let Some(pair_perf) = model.calibrate(true) {
                             let perf_up = pair_perf.up;
                             let perf_down = pair_perf.down;
                             let actual_wins_up = if perf_up.actual_deals > 0 {
@@ -198,7 +199,7 @@ async fn main() -> EmptyResult {
                             }
                         }
 
-                        let trade_signal = model.process(event);
+                        let trade_signal = model.process(&mut window_data, event);
 
                         if event.instrument_id == inst1_id {
                             last_ob1 = Some(event.order_book.clone());
@@ -260,6 +261,7 @@ async fn main() -> EmptyResult {
 struct TestContext {
     fixed_hold_time: u16,
     model: WalkForwardModel,
+    window_data: WindowData,
     active_deal: Option<TestDeal>,
     total_income: Decimal,
     total_outcome: Decimal,
@@ -271,6 +273,7 @@ impl TestContext {
         Self {
             fixed_hold_time,
             model,
+            window_data: WindowData::new(),
             active_deal: None,
             total_income: Decimal::ZERO,
             total_outcome: Decimal::ZERO,
@@ -332,14 +335,14 @@ async fn _main() -> EmptyResult {
                     }
 
                     for context in &mut contexts {
-                        if let Some(pair_perf) = context.model.calibrate()
+                        if let Some(pair_perf) = context.model.calibrate(true)
                             && (pair_perf.up.training_deals > 0 || pair_perf.down.training_deals > 0) {
                                 performances.entry(pair_perf.created_on)
                                     .or_default()
                                     .push((context.fixed_hold_time, pair_perf));
                         }
 
-                        let trade_signal = context.model.process(event);
+                        let trade_signal = context.model.process(&mut context.window_data, event);
 
                         if event.instrument_id == inst1_id {
                             last_ob1 = Some(event.order_book.clone());
@@ -476,48 +479,6 @@ fn get_best_ask(order_book: &OrderBook) -> Decimal {
 fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
 }
-
-fn merge_events(id1: i32, id2: i32, values1: &[OrderBook], values2: &[OrderBook]) -> Vec<OrderBookEvent> {
-    let mut events = Vec::with_capacity(values1.len() + values2.len());
-    let (mut v_index1, mut v_index2) = (0, 0);
-    while v_index1 < values1.len() || v_index2 < values2.len() {
-        let mut cur_event = None;
-        let mut cur_event_time = None;
-
-        if let Some(v) = values1.get(v_index1) {
-            let use_it = if let Some(event_time) = cur_event_time {
-                v.timestamp < event_time
-            } else { true };
-            if use_it {
-                cur_event_time = Some(v.timestamp);
-                cur_event = Some(OrderBookEvent { instrument_id: id1, order_book: v.clone() });
-            }
-        }
-
-        if let Some(v) = values2.get(v_index2) {
-            let use_it = if let Some(event_time) = cur_event_time {
-                v.timestamp < event_time
-            } else { true };
-            if use_it {
-                cur_event_time = Some(v.timestamp);
-                cur_event = Some(OrderBookEvent { instrument_id: id2, order_book: v.clone() });
-            }
-        }
-
-        if let Some(event) = cur_event {
-            if event.instrument_id == id1 {
-                v_index1 += 1;
-            } else {
-                v_index2 += 1;
-            }
-            events.push(event);
-        } else {
-            break;
-        }
-    }
-    events
-}
-
 
 fn find_instrument_id(instruments: &[Instrument], ticker: &str) -> Option<i32> {
     instruments

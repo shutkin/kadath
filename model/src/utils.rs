@@ -1,28 +1,4 @@
-use std::fs::File;
-use std::io::Write;
-use chrono::{DateTime, Timelike, Utc};
-use rust_decimal::Decimal;
-use crate::{OrderBook, OrderData};
-
-pub fn calculate_delta_sell(order_book1: &OrderBook, order_book2: &OrderBook, min_volume: Decimal) -> Option<OrderData> {
-    let max_bid = order_book1.bids.iter()
-        .filter(|bid| bid.price * bid.size > min_volume)
-        .max_by_key(|bid| bid.price);
-    let min_ask = order_book2.asks.iter()
-        .filter(|ask| ask.price * ask.size > min_volume)
-        .min_by_key(|ask| ask.price);
-    map_delta(max_bid, min_ask)
-}
-
-pub fn calculate_delta_buy(order_book1: &OrderBook, order_book2: &OrderBook, min_volume: Decimal) -> Option<OrderData> {
-    let min_ask = order_book1.asks.iter()
-        .filter(|ask| ask.price * ask.size > min_volume)
-        .min_by_key(|ask| ask.price);
-    let max_bid = order_book2.bids.iter()
-        .filter(|bid| bid.price * bid.size > min_volume)
-        .max_by_key(|bid| bid.price);
-    map_delta(min_ask, max_bid)
-}
+use crate::OrderData;
 
 fn map_delta(data1: Option<&OrderData>, data2: Option<&OrderData>) -> Option<OrderData> {
     if let (Some(data1), Some(data2)) = (data1, data2) {
@@ -37,7 +13,7 @@ fn map_delta(data1: Option<&OrderData>, data2: Option<&OrderData>) -> Option<Ord
 
 pub fn handle_delta(deltas: &[OrderData], order_book_data: &mut Vec<OrderData>) {
     for delta_data in deltas {
-        if delta_data.size.is_zero() {
+        if delta_data.size == 0 {
             order_book_data.retain(|data| data.price != delta_data.price);
         } else {
             let mut found = false;

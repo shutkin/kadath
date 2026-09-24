@@ -6,7 +6,6 @@ use model::common::EmptyResult;
 use model::events::{OrderBookDeltaEvent, OrderBookEvent};
 use model::utils::handle_delta;
 use model::{Instrument, OrderBook};
-use simplelog::{LevelFilter, SimpleLogger};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -22,12 +21,17 @@ struct ListenerHandler {
     instruments: HashMap<i32, Instrument>,
     order_books: Arc<Mutex<HashMap<i32, OrderBook>>>,
     ticker: Arc<AtomicI64>,
+    order_book_event_sender: mpsc::Sender<OrderBookEvent>,
 }
 
 impl ListenerHandler {
     async fn on_order_book(&self, event: OrderBookEvent) {
         self.ticker.store(Utc::now().timestamp(), Relaxed);
         if let Some(instrument) = self.instruments.get(&event.instrument_id) {
+            if let Err(err) = self.order_book_event_sender.send(event.clone()).await {
+                error!("Error sending order book event: {}", err);
+            }
+
             info!("Save snapshot order book {:?}", event.order_book);
             if let Err(err) = self.db.insert_order_book_full(&event.order_book, instrument).await {
                 error!("Failed to save order book: {}", err);
@@ -44,28 +48,41 @@ impl ListenerHandler {
         self.ticker.store(Utc::now().timestamp(), Relaxed);
         if let Some(instrument) = self.instruments.get(&event.instrument_id) {
             let mut updated_order_book = None;
+            let mut save_full = false;
+
             if let Ok(mut lock) = self.order_books.lock()
                 && let Some(order_book) = lock.get_mut(&event.instrument_id) {
                 let prev_timestamp_quant = order_book.timestamp.timestamp_micros() / (FULL_ORDER_BOOK_QUANT_MINUTES * 60 * 1000 * 1000);
                 order_book.timestamp = event.timestamp;
                 handle_delta(&event.asks, &mut order_book.asks);
                 handle_delta(&event.bids, &mut order_book.bids);
+                updated_order_book = Some(order_book.clone());
                 let cur_timestamp_quant = order_book.timestamp.timestamp_micros() / (FULL_ORDER_BOOK_QUANT_MINUTES * 60 * 1000 * 1000);
                 if cur_timestamp_quant > prev_timestamp_quant {
-                    updated_order_book = Some(order_book.clone());
+                    save_full = true;
                 }
             } else {
                 error!("Failed to lock order books");
             }
+
             if let Some(order_book) = updated_order_book {
-                info!("Save full order book {order_book:?}");
-                if let Err(err) = self.db.insert_order_book_full(&order_book, instrument).await {
-                    error!("Failed to save order book: {}", err);
+                if let Err(err) = self.order_book_event_sender.send(OrderBookEvent {
+                    instrument_id: event.instrument_id,
+                    order_book: order_book.clone(),
+                }).await {
+                    error!("Error sending order book event on delta: {}", err);
                 }
-            } else {
-                debug!("Save order book delta asks {:?}, bids {:?}", event.asks, event.bids);
-                if let Err(err) = self.db.insert_order_book_delta(instrument, event.timestamp, &event.asks, &event.bids).await {
-                    error!("Failed to save order book delta: {}", err);
+
+                if save_full {
+                    info!("Save full order book {order_book:?}");
+                    if let Err(err) = self.db.insert_order_book_full(&order_book, instrument).await {
+                        error!("Failed to save order book: {}", err);
+                    }
+                } else {
+                    debug!("Save order book delta asks {:?}, bids {:?}", event.asks, event.bids);
+                    if let Err(err) = self.db.insert_order_book_delta(instrument, event.timestamp, &event.asks, &event.bids).await {
+                        error!("Failed to save order book delta: {}", err);
+                    }
                 }
             }
         } else {
@@ -74,23 +91,11 @@ impl ListenerHandler {
     }
 }
 
-#[tokio::main]
-async fn main() -> EmptyResult {
-    dotenv::dotenv().ok();
-    SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
-
-    let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
-    let db = Db::new(&db_url).await?;
-
-    let alor = Alor::default();
-
-    let mut instruments = alor.get_instruments().await?;
-    db.insert_instruments(&mut instruments).await?;
-    let tickers = ["GLZ6", "GLH7", "GLM7", "GLU7", "BMV6", "BMX6", "BMZ6", "SiZ6", "SiH7"];
+pub async fn listen(db: Db, instruments: Vec<Instrument>, order_book_event_sender: mpsc::Sender<OrderBookEvent>) -> EmptyResult {
     let mut instruments_map = HashMap::new();
-    instruments.iter().for_each(|instrument| {
-        if tickers.contains(&instrument.ticker.as_str()) && let Some(id) = instrument.id {
-            instruments_map.insert(id, instrument.clone());
+    instruments.into_iter().for_each(|instrument| {
+        if let Some(id) = instrument.id {
+            instruments_map.insert(id, instrument);
         }
     });
 
@@ -101,14 +106,14 @@ async fn main() -> EmptyResult {
     loop {
         let now = Utc::now().timestamp();
         if ticker.load(Relaxed) < now - 5 * 60 {
-            start_listener(db_clone.clone(), instruments_map_clone.clone(), ticker.clone());
+            start_listener(db_clone.clone(), instruments_map_clone.clone(), ticker.clone(), order_book_event_sender.clone());
             ticker.store(Utc::now().timestamp(), Relaxed);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-fn start_listener(db: Db, instruments: HashMap<i32, Instrument>, ticker: Arc<AtomicI64>) {
+fn start_listener(db: Db, instruments: HashMap<i32, Instrument>, ticker: Arc<AtomicI64>, order_book_event_sender: mpsc::Sender<OrderBookEvent>) {
     let (order_book_sender,
         mut order_book_receiver) = mpsc::channel::<OrderBookEvent>(64);
     let (order_book_delta_sender,
@@ -118,6 +123,7 @@ fn start_listener(db: Db, instruments: HashMap<i32, Instrument>, ticker: Arc<Ato
         instruments: instruments.clone(),
         order_books: Arc::new(Mutex::new(HashMap::new())),
         ticker: ticker.clone(),
+        order_book_event_sender,
     };
     let listener_handler_clone = listener_handler.clone();
     tokio::spawn(async move {

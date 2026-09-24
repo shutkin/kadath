@@ -59,10 +59,10 @@ impl WindowValuesCalculator {
             let (mut bids_sum, mut asks_sum) = (0.0, 0.0);
             for level in 0..levels {
                 if let Some(bid) = bids.get(level) {
-                    bids_sum += bid.size.as_f64();
+                    bids_sum += bid.size as f64;
                 }
                 if let Some(ask) = asks.get(level) {
-                    asks_sum += ask.size.as_f64();
+                    asks_sum += ask.size as f64;
                 }
             }
             imbalances[i] = (bids_sum - asks_sum) / (bids_sum + asks_sum);

@@ -83,8 +83,7 @@ struct OrderBookPosition {
     #[serde(deserialize_with = "rust_decimal::serde::arbitrary_precision::deserialize")]
     p: Decimal,
     /// Объём
-    #[serde(deserialize_with = "rust_decimal::serde::arbitrary_precision::deserialize")]
-    v: Decimal,
+    v: i32,
 }
 
 #[derive(Default)]
@@ -333,7 +332,7 @@ fn calculate_delta(prev_orders: &[OrderData], new_orders: &[OrderData]) -> Vec<O
             } else {
                 Some(OrderData {
                     price: prev.price,
-                    size: Decimal::ZERO,
+                    size: 0,
                 })
             }
         }));

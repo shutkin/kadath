@@ -27,13 +27,13 @@ pub struct OrderBook {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct OrderData {
     pub price: Decimal,
-    pub size: Decimal,
+    pub size: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct OrderDataDelta {
     pub price_id: i32,
-    pub size: Decimal,
+    pub size: i32,
 }
 
 #[derive(Clone, Debug)]

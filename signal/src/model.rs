@@ -4,18 +4,19 @@ mod optimizer;
 mod simulation;
 mod strategy_optimizer;
 
+use std::sync::{Arc, Mutex, RwLock};
 use crate::optimizer::calibrate_signal_calculator;
 use crate::orderbook_values::{Leg, OrderBookValues, WindowValuesCalculator};
 use crate::signal_calculator::{CalculatorsPair, PairPerformance};
-use chrono::TimeDelta;
-use log::debug;
+use chrono::{TimeDelta, Utc};
+use log::{debug, info};
 use std::thread;
 use model::events::OrderBookEvent;
 
 const MAX_WINDOW_LENGTH_S: i64 = 2000;
-const TRAIN_DATA_MINUTES: u16 = 90;
+const TRAIN_DATA_MINUTES: u16 = 25;
 const TRAIN_INTERVAL_MINUTES: u16 = 1;
-const DEFAULT_DECAY_TIME: f64 = 0.25 * 60.0;
+const DEFAULT_DECAY_TIME: f64 = 15.0;
 const STD_DIAPASON_SECONDS: u16 = 1200;
 
 pub const HOLD_TIME_VARIANTS: [u16; 6] = [200, 300, 500, 750, 1000, 1500];
@@ -48,18 +49,28 @@ impl Default for ModelConfig {
     }
 }
 
+pub struct WindowData {
+    values1_calculator: WindowValuesCalculator,
+    values2_calculator: WindowValuesCalculator,
+}
+
+impl WindowData {
+    pub fn new() -> Self {
+        Self {
+            values1_calculator: WindowValuesCalculator::new(Leg::First),
+            values2_calculator: WindowValuesCalculator::new(Leg::Second),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct WalkForwardModel {
     instrument1_id: i32,
     instrument2_id: i32,
 
     config: ModelConfig,
-
-    values1_calculator: WindowValuesCalculator,
-    values2_calculator: WindowValuesCalculator,
-
-    calculator: Option<CalculatorsPair>,
-
-    buffer: Vec<OrderBookValues>,
+    calculator: Arc<RwLock<Option<CalculatorsPair>>>,
+    buffer: Arc<Mutex<Vec<OrderBookValues>>>,
 }
 
 impl WalkForwardModel {
@@ -68,13 +79,8 @@ impl WalkForwardModel {
             instrument1_id,
             instrument2_id,
             config: ModelConfig::default(),
-
-            values1_calculator: WindowValuesCalculator::new(Leg::First),
-            values2_calculator: WindowValuesCalculator::new(Leg::Second),
-
-            calculator: None,
-
-            buffer: Vec::new(),
+            calculator: Arc::new(RwLock::new(None)),
+            buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -83,25 +89,23 @@ impl WalkForwardModel {
             instrument1_id,
             instrument2_id,
             config,
-
-            values1_calculator: WindowValuesCalculator::new(Leg::First),
-            values2_calculator: WindowValuesCalculator::new(Leg::Second),
-
-            calculator: None,
-
-            buffer: Vec::new(),
+            calculator: Arc::new(RwLock::new(None)),
+            buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn get_last_values(&self) -> Option<(&OrderBookValues, &OrderBookValues)> {
+    fn get_last_values(&self) -> Option<(OrderBookValues, OrderBookValues)> {
         let (mut v1, mut v2) = (None, None);
-        let mut i = self.buffer.len() - 1;
-        while i > 0 && (v1.is_none() || v2.is_none()) {
-            match self.buffer[i].leg {
-                Leg::First => if v1.is_none() { v1 = Some(&self.buffer[i]) },
-                Leg::Second => if v2.is_none() { v2 = Some(&self.buffer[i]) },
+
+        if let Ok(lock) = self.buffer.lock() {
+            let mut i = lock.len() - 1;
+            while i > 0 && (v1.is_none() || v2.is_none()) {
+                match lock[i].leg {
+                    Leg::First => if v1.is_none() { v1 = Some(lock[i]) },
+                    Leg::Second => if v2.is_none() { v2 = Some(lock[i]) },
+                }
+                i -= 1;
             }
-            i -= 1;
         }
 
         if let Some(v1) = v1 && let Some(v2) = v2 {
@@ -111,17 +115,20 @@ impl WalkForwardModel {
         }
     }
 
-    pub fn process(&mut self, event: &OrderBookEvent) -> TradeSignal {
+    pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {
         let v = if self.instrument1_id == event.instrument_id {
-            self.values1_calculator.calculate(&event.order_book, self.config.std_diapason_s)
+            window_data.values1_calculator.calculate(&event.order_book, self.config.std_diapason_s)
         } else if self.instrument2_id == event.instrument_id {
-            self.values2_calculator.calculate(&event.order_book, self.config.std_diapason_s)
+            window_data.values2_calculator.calculate(&event.order_book, self.config.std_diapason_s)
         } else {
             return TradeSignal::None;
         };
-        self.buffer.push(v);
+        if let Ok(mut lock) = self.buffer.lock() {
+            lock.push(v);
+        }
 
-        if let Some(calculator) = &self.calculator
+        if let Ok(read) = self.calculator.read()
+            && let Some(calculator) = read.as_ref()
             && let Some((v1, v2)) = self.get_last_values() {
             calculator.calculate(v1, v2)
         } else {
@@ -129,67 +136,81 @@ impl WalkForwardModel {
         }
     }
     
-    pub fn inform_deal_result(&mut self, trade_signal: TradeSignal, profit: f64) {
-        if let Some(calc) = self.calculator.as_mut() {
+    pub fn inform_deal_result(&self, trade_signal: TradeSignal, profit: f64) {
+        if let Ok(mut write) = self.calculator.write()
+            && let Some(calc) = write.as_mut() {
             calc.deal_performance(trade_signal, profit);
         }
     }
     
-    pub fn calibrate(&mut self) -> Option<PairPerformance> {
-        if self.buffer.len() < 2 {
-            return None;
-        }
-        let delta = self.buffer[self.buffer.len() - 1].time - self.buffer[0].time;
-        let buf_minutes = delta.num_minutes() as u16;
+    pub fn calibrate(&self, check_time: bool) -> Option<PairPerformance> {
+        let buf_minutes = if let Ok(buffer) = self.buffer.lock() {
+            if buffer.len() >= 2 {
+                let delta = buffer[buffer.len() - 1].time - buffer[0].time;
+                delta.num_minutes() as u16
+            } else { 0 }
+        } else { 0 };
         if buf_minutes < self.config.train_data_minutes - 1 {
             return None;
         }
 
-        let last_time = self.buffer[self.buffer.len() - 1].time;
-        if self.calculator.as_ref()
-            .map(|calc| last_time - calc.get_created_on() > TimeDelta::minutes(self.config.train_interval_minutes as i64))
-            .unwrap_or(true) {
-            self.shrink_buffer();
-            
-            let performances = self.calculator.map(|calc| calc.get_performances());
-            
-            let decay_time = self.config.decay_time;
-            let fixed_hold_time = self.config.fixed_hold_time;
-
-            let buf_clone = self.buffer.clone();
-            let thread_up = thread::spawn(move || {
-                calibrate_signal_calculator(&buf_clone, true, decay_time, fixed_hold_time)
-            });
-
-            let buf_clone = self.buffer.clone();
-            let thread_down = thread::spawn(move || {
-                calibrate_signal_calculator(&buf_clone, false, decay_time, fixed_hold_time)
-            });
-
-            if let Ok(up) = thread_up.join()
-                && let Ok(down) = thread_down.join() {
-                let last_time = self.buffer[self.buffer.len() - 1].time;
-                let calc = CalculatorsPair::new(up, down, last_time);
-
-                debug!("{calc:?}");
-                self.calculator = Some(calc);
+        if check_time
+            && let Ok(read) = self.calculator.read()
+            && let Some(calc) = read.as_ref()
+            && let Ok(buffer) = self.buffer.lock() {
+            let last_time = buffer[buffer.len() - 1].time;
+            if last_time - calc.get_created_on() < TimeDelta::minutes(self.config.train_interval_minutes as i64) {
+                return None;
             }
-            
-            performances
+        }
+
+        self.shrink_buffer();
+
+        let performances = if let Ok(read) = self.calculator.read() {
+            read.map(|calc| calc.get_performances())
         } else {
             None
+        };
+
+        let decay_time = self.config.decay_time;
+        let fixed_hold_time = self.config.fixed_hold_time;
+
+        let buf_up = self.buffer.lock().map(|b| b.clone()).unwrap_or_default();
+        let buf_down = buf_up.clone();
+        let thread_up = thread::spawn(move || {
+            calibrate_signal_calculator(&buf_up, true, decay_time, fixed_hold_time)
+        });
+
+        let thread_down = thread::spawn(move || {
+            calibrate_signal_calculator(&buf_down, false, decay_time, fixed_hold_time)
+        });
+
+        if let Ok(up) = thread_up.join()
+            && let Ok(down) = thread_down.join() {
+            let last_time = self.buffer.lock()
+                .map(|buf| buf[buf.len() - 1].time).unwrap_or(Utc::now());
+            let calc = CalculatorsPair::new(up, down, last_time);
+
+            debug!("{calc:?}");
+            if let Ok(mut write) = self.calculator.write() {
+                *write = Some(calc);
+            }
         }
+
+        performances
     }
 
-    fn shrink_buffer(&mut self) {
-        let threshold = self.buffer[self.buffer.len() - 1].time - TimeDelta::minutes(self.config.train_data_minutes as i64);
-        let mut to_delete = 0;
-        while to_delete < self.buffer.len() && self.buffer[to_delete].time < threshold {
-            to_delete += 1;
-        }
+    fn shrink_buffer(&self) {
+        if let Ok(mut buffer) = self.buffer.lock() {
+            let threshold = buffer[buffer.len() - 1].time - TimeDelta::minutes(self.config.train_data_minutes as i64);
+            let mut to_delete = 0;
+            while to_delete < buffer.len() && buffer[to_delete].time < threshold {
+                to_delete += 1;
+            }
 
-        if to_delete > 0 {
-            self.buffer.drain(0..to_delete);
+            if to_delete > 0 {
+                buffer.drain(0..to_delete);
+            }
         }
     }
 }

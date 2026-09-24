@@ -111,7 +111,7 @@ pub fn run_simulation(
                     deals_count += 1;
                 }
             } else {
-                let signal = calculator.calculate(v1, v2);
+                let signal = calculator.calculate(*v1, *v2);
                 active_deal = match signal {
                     TradeSignal::Sell1Buy2(hold) => Some(SimDeal::sell1_buy2(v1, v2, signal, hold)),
                     TradeSignal::Buy1Sell2(hold) => Some(SimDeal::buy1_sell2(v1, v2, signal, hold)),

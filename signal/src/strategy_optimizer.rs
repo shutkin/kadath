@@ -1,4 +1,4 @@
-use crate::{ModelConfig, TradeSignal, WalkForwardModel};
+use crate::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
 use chrono::Datelike;
@@ -61,9 +61,10 @@ impl CostFunction for GlobalProblem<'_> {
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
         let config = config_from_param(param);
         info!("Check {config:?}");
-        let mut model = WalkForwardModel::new_with_config(
+        let model = WalkForwardModel::new_with_config(
             self.instrument1_id, self.instrument2_id, config,
         );
+        let mut window_data = WindowData::new();
 
         let mut daily_pnl = Vec::new();
         let (mut daily_revenue, mut daily_cost) = (0.0, 0.0);
@@ -79,12 +80,12 @@ impl CostFunction for GlobalProblem<'_> {
             }
             prev_event_time = event.order_book.timestamp;
             
-            model.calibrate();
-            let signal = model.process(event);
+            model.calibrate(true);
+            let signal = model.process(&mut window_data, event);
             if let Some((v1, v2)) = model.get_last_values() {
                 if let Some(deal) = active_deal.as_mut() {
-                    deal.close1(v1, v2);
-                    deal.close2(v1, v2);
+                    deal.close1(&v1, &v2);
+                    deal.close2(&v1, &v2);
                     if let Some((revenue, cost)) = deal.try_finish() {
                         daily_revenue += revenue;
                         daily_cost += cost;
@@ -94,10 +95,10 @@ impl CostFunction for GlobalProblem<'_> {
                     match signal {
                         TradeSignal::None => {}
                         TradeSignal::Sell1Buy2(hold) => {
-                            active_deal = Some(SimDeal::sell1_buy2(v1, v2, signal, hold));
+                            active_deal = Some(SimDeal::sell1_buy2(&v1, &v2, signal, hold));
                         }
                         TradeSignal::Buy1Sell2(hold) => {
-                            active_deal = Some(SimDeal::buy1_sell2(v1, v2, signal, hold));
+                            active_deal = Some(SimDeal::buy1_sell2(&v1, &v2, signal, hold));
                         }
                     }
                 }

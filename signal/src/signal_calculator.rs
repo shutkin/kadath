@@ -66,7 +66,7 @@ impl SignalCalculator {
         }
     }
 
-    fn calculate(&self, v1: &OrderBookValues, v2: &OrderBookValues) -> f64 {
+    fn calculate(&self, v1: OrderBookValues, v2: OrderBookValues) -> f64 {
         let mut score = self.derivative1_weight * v1.normal_derivative.abs()
             + self.derivative2_weight * v2.normal_derivative;
         for i in 0..IMBALANCE_LEVELS.len() {
@@ -140,7 +140,7 @@ impl CalculatorsPair {
         self.created_on
     }
     
-    pub fn calculate(&self, v1: &OrderBookValues, v2: &OrderBookValues) -> TradeSignal {
+    pub fn calculate(&self, v1: OrderBookValues, v2: OrderBookValues) -> TradeSignal {
         let calculator = if v1.normal_derivative > 0.0 {&self.up} else {&self.down};
         if let Some(calculator) = calculator {
             if calculator.calculate(v1, v2) > 0.0 {

@@ -30,8 +30,8 @@ impl OrderBookValues {
 
         let best_bid = bids[0].price.as_f64();
         let best_ask = asks[0].price.as_f64();
-        let best_bid_volume = bids[0].size.as_f64();
-        let best_ask_volume = asks[0].size.as_f64();
+        let best_bid_volume = bids[0].size as f64;
+        let best_ask_volume = asks[0].size as f64;
         let mid = (best_bid + best_ask) / 2.0;
         let micro = (best_ask * best_bid_volume + best_bid * best_ask_volume) / (best_bid_volume + best_ask_volume);
 
@@ -41,10 +41,10 @@ impl OrderBookValues {
             let (mut bids_sum, mut asks_sum) = (0.0, 0.0);
             for level in 0..levels {
                 if let Some(bid) = bids.get(level) {
-                    bids_sum += bid.size.as_f64();
+                    bids_sum += bid.size as f64;
                 }
                 if let Some(ask) = asks.get(level) {
-                    asks_sum += ask.size.as_f64();
+                    asks_sum += ask.size as f64;
                 }
             }
             imbalances[i] = (bids_sum - asks_sum) / (bids_sum + asks_sum);
@@ -55,8 +55,8 @@ impl OrderBookValues {
             bid: best_bid,
             ask: best_ask,
             mid,
-            quantity_bid: bids[0].size.as_i128() as u16,
-            quantity_ask: asks[0].size.as_i128() as u16,
+            quantity_bid: bids[0].size as u16,
+            quantity_ask: asks[0].size as u16,
             imbalances,
             std_derivative: 0.0,
             trend_deviation: 0.0,
