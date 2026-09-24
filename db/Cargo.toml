@@ -1,0 +1,16 @@
+[package]
+name = "db"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/db.rs"
+
+[dependencies]
+model = { path = "../model" }
+log = "0.4"
+sqlx = { version =  "0.8", features = ["chrono", "rust_decimal", "runtime-tokio-rustls", "postgres"] }
+bincode = { version = "2.0", features = ["serde"] }
+rust_decimal = { version = "1.39", features = ["db-postgres", "serde-bincode"] }
+chrono = "0.4"
+tokio = "1.48"

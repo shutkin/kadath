@@ -1,0 +1,15 @@
+[package]
+name = "signal_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+model = { path = "../model" }
+db = { path = "../db" }
+signal = { path = "../signal" }
+dotenv = "0.15"
+simplelog = "0.12"
+tokio = { version = "1.48", features = ["full"] }
+chrono = "0.4"
+log = "0.4"
+rust_decimal = "1.43"

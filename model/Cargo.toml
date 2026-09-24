@@ -1,0 +1,13 @@
+[package]
+name = "model"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/model.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+rust_decimal = "1.39"
+chrono = { version = "0.4", features = ["serde"] }
+bincode = { version = "2.0", features = ["serde"] }

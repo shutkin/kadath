@@ -1,0 +1,21 @@
+[package]
+name = "alor"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/alor.rs"
+
+[dependencies]
+model = { path = "../model" }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+reqwest = { version = "0.13", features = ["json", "query"] }
+chrono = "0.4"
+jsonwebtoken = "11.1"
+yawc = "0.4"
+futures-util = "0.3"
+uuid = { version = "1.26", features = ["v4"] }
+rust_decimal = { version = "1.43", features = ["serde-with-arbitrary-precision"] }
+tokio = "1.53"

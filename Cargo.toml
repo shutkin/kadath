@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "alor",
+    "cleaner",
+    "db",
+    "exp_single",
+    "experiment",
+    "kadath",
+    "model",
+    "signal",
+    "signal_test",
+]

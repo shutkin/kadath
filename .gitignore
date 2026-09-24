@@ -1,0 +1,7 @@
+# Project exclude paths
+/Cargo.lock
+/target/
+/.cache/
+/.cache_full/
+/*.csv
+/.env
