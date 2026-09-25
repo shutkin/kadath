@@ -57,7 +57,9 @@ pub fn calibrate_signal_calculator(values: &[OrderBookValues], is_up: bool, deca
             }
         }
     }
-    
+
+    debug!("{} {}: best score {best_profit} with {best_calculator:?}",
+        values[values.len() - 1].time, if is_up { "Up" } else { "Down" });
     best_calculator
 }
 

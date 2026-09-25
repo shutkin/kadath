@@ -90,3 +90,12 @@ pub struct Trade {
     pub quantity: i16,
     pub json: String,
 }
+
+#[derive(Clone)]
+pub struct SignalCalculatorLog {
+    pub trained_on : DateTime<Utc>,
+    pub up_score: Option<f32>,
+    pub down_score: Option<f32>,
+    pub up_params: Option<String>,
+    pub down_params: Option<String>,
+}

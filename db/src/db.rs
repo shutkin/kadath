@@ -2,13 +2,12 @@ use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::utils::handle_delta;
-use model::{Deal, Instrument, OrderBook, OrderData, OrderDataDelta, Trade, TradeDirection};
+use model::{Deal, Instrument, OrderBook, OrderData, OrderDataDelta, SignalCalculatorLog, Trade, TradeDirection};
 use rust_decimal::Decimal;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, Row};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 pub enum QueryAsksOrBids {
     ASKS,
@@ -47,38 +46,40 @@ impl Prices {
     }
 
     async fn init(&self, pool: &Pool<Postgres>) -> EmptyResult {
+        info!("Fetch prices");
         let rows = sqlx::query("SELECT id, price FROM price")
             .fetch_all(pool)
             .await?;
-        let mut lock = self.prices_map.write().await;
+        info!("handle {} rows", rows.len());
+        let mut write = self.prices_map.write().map_err(|err| format!("{err}"))?;
         rows.iter().for_each(|row| {
-            lock.insert(row.get(1), row.get(0));
+            write.insert(row.get(1), row.get(0));
         });
-        info!("Prices init with {} values", lock.len());
+        info!("Prices init with {} values", write.len());
         Ok(())
     }
 
     async fn get_id(&self, price: Decimal, pool: &Pool<Postgres>) -> Result<i32, CommonError> {
-        if let Some(id) = self.prices_map.read().await.get(&price) {
+        if let Some(id) = self.prices_map.read().map_err(|err| format!("{err}"))?.get(&price) {
             Ok(*id)
         } else {
             info!("Insert new price value {price}");
-            let mut lock = self.prices_map.write().await;
             let id_row = sqlx::query("INSERT INTO price (price) VALUES ($1) RETURNING id")
                 .bind(price)
                 .fetch_one(pool)
                 .await?;
             let id = id_row.get(0);
-            lock.insert(price, id);
+            self.prices_map.write().map_err(|err| format!("{err}"))?.insert(price, id);
             Ok(id)
         }
     }
 
     async fn get_prices(&self, map: &mut HashMap<i32, Decimal>) {
         map.clear();
-        let lock = self.prices_map.read().await;
-        for (price, id) in lock.iter() {
-            map.insert(*id, *price);
+        if let Ok(read) = self.prices_map.read() {
+            for (price, id) in read.iter() {
+                map.insert(*id, *price);
+            }
         }
     }
 }
@@ -408,6 +409,17 @@ impl Db {
             .fetch_one(&self.pool).await?;
         let id = id_row.get(0);
         trade.id = Some(id);
+        Ok(())
+    }
+    
+    pub async fn insert_calculator_log(&self, log: &SignalCalculatorLog) -> EmptyResult {
+        sqlx::query("INSERT INTO signal_calculator (trained_on, up_score, up_params, down_score, down_params) VALUES ($1, $2, $3, $4, $5)")
+            .bind(log.trained_on)
+            .bind(log.up_score)
+            .bind(log.up_params.clone())
+            .bind(log.down_score)
+            .bind(log.down_params.clone())
+            .execute(&self.pool).await?;
         Ok(())
     }
 

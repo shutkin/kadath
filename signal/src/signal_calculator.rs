@@ -1,7 +1,9 @@
 use crate::TradeSignal;
 use crate::orderbook_values::{IMBALANCE_LEVELS, OrderBookValues};
 use chrono::{DateTime, Utc};
+use log::trace;
 use ndarray::Array1;
+use std::collections::HashMap;
 
 #[derive(Copy, Clone, Debug)]
 pub struct SignalCalculator {
@@ -75,6 +77,20 @@ impl SignalCalculator {
         }
         score - self.threshold
     }
+    
+    pub fn to_params_map(&self) -> HashMap<String, f64> {
+        let mut map = HashMap::new();
+        map.insert("hold".to_string(), self.hold_time_ms.into());
+        map.insert("threshold".to_string(), self.threshold.into());
+        map.insert("d1".to_string(), self.derivative1_weight.into());
+        map.insert("d2".to_string(), self.derivative2_weight.into());
+        for (i, level) in IMBALANCE_LEVELS.iter().enumerate() {
+            map.insert(format!("i1_{level}"), self.imbalance1_weights[i]);
+            map.insert(format!("i2_{level}"), self.imbalance2_weights[i]);
+        }
+        map.insert("score".to_string(), self.performance.training_total_pnl);
+        map
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -143,7 +159,9 @@ impl CalculatorsPair {
     pub fn calculate(&self, v1: OrderBookValues, v2: OrderBookValues) -> TradeSignal {
         let calculator = if v1.normal_derivative > 0.0 {&self.up} else {&self.down};
         if let Some(calculator) = calculator {
-            if calculator.calculate(v1, v2) > 0.0 {
+            let score = calculator.calculate(v1, v2);
+            trace!("Score: {score}");
+            if score > 0.0 {
                 if v1.normal_derivative > 0.0 {
                     TradeSignal::Sell1Buy2(calculator.hold_time_ms)
                 } else {

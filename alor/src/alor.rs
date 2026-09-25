@@ -9,6 +9,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -196,6 +197,7 @@ struct CreateOrderResponse {
 #[derive(Default, Clone)]
 pub struct Alor {
     access_token: Arc<RwLock<String>>,
+    access_token_updating: Arc<AtomicBool>,
 }
 
 impl Alor {
@@ -324,29 +326,32 @@ impl Alor {
     ) -> Result<mpsc::Sender<OrderEvent>, CommonError> {
         let (sender, mut receiver) = mpsc::channel::<OrderEvent>(64);
 
-        let mut ws = WebSocket::connect(WS_COMMAND_URL.parse()?).await?;
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            let mut ws = WebSocket::connect(WS_COMMAND_URL.parse().unwrap()).await.unwrap();
 
-        let mut auth_timer = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
-        loop {
-            tokio::select! {
-                _ = auth_timer.tick() => {
-                    if let Ok(token) = self.get_actual_access_token().await {
-                        Self::send_auth_command(&mut ws, token).await;
-                    }
-                },
-                order_event = receiver.recv() => {
-                    match order_event {
-                        Some(event) => {
-                            Self::handle_command(event, &mut ws, response_sender.clone()).await;
+            let mut auth_timer = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+            loop {
+                tokio::select! {
+                    _ = auth_timer.tick() => {
+                        if let Ok(token) = self_clone.get_actual_access_token().await {
+                            Self::send_auth_command(&mut ws, token).await;
                         }
-                        None => {
-                            warn!("TradeEvent channel is closed");
-                            break;
+                    },
+                    order_event = receiver.recv() => {
+                        match order_event {
+                            Some(event) => {
+                                Self::handle_command(event, &mut ws, response_sender.clone()).await;
+                            }
+                            None => {
+                                warn!("TradeEvent channel is closed");
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
+        });
 
         Ok(sender)
     }
@@ -454,7 +459,7 @@ impl Alor {
                             }
                         },
                         Err(err) => {
-                            error!("{err}: {}", frame.as_str());
+                            info!("{err}: {}", frame.as_str());
                         }
                     }
                 }
@@ -488,6 +493,39 @@ impl Alor {
     }
 
     async fn refresh_access_token(&self) -> Result<String, CommonError> {
+        let mut wait_count = 0;
+        while self.access_token_updating.load(Ordering::Relaxed) && wait_count < 1000 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            wait_count += 1;
+        }
+
+        if wait_count > 0
+            && let Ok(token) = self.access_token.read()
+            && !token.is_empty() {
+            return Ok(token.clone());
+        }
+        self.access_token_updating.store(true, Ordering::Relaxed);
+
+        match Self::request_token().await {
+            Ok(resp_object) => {
+                if let Some(token) = resp_object.access_token &&
+                    let Ok(mut lock) = self.access_token.write() {
+                    *lock = token.clone();
+                    self.access_token_updating.store(false, Ordering::Relaxed);
+                    return Ok(token)
+                }
+            },
+            Err(err) => {
+                self.access_token_updating.store(false, Ordering::Relaxed);
+                return Err(err)
+            }
+        }
+
+        self.access_token_updating.store(false, Ordering::Relaxed);
+        Err("Unknown error".into())
+    }
+
+    async fn request_token() -> Result<AccessTokenResponse, CommonError> {
         let refresh_token = env::var("ALOR_REFRESH_TOKEN")?;
 
         let client = reqwest::Client::builder()
@@ -508,14 +546,7 @@ impl Alor {
         let response = request.send().await?;
         let resp_object = response.json::<AccessTokenResponse>().await?;
         info!("'{resp_object:?}'");
-
-        if let Some(token) = resp_object.access_token &&
-            let Ok(mut lock) = self.access_token.write() {
-            *lock = token.clone();
-            return Ok(token)
-        }
-
-        Err("Unknown error".into())
+        Ok(resp_object)
     }
 }
 

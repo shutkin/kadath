@@ -1,7 +1,7 @@
 use alor::Alor;
 use chrono::Utc;
 use db::Db;
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use model::common::EmptyResult;
 use model::events::{OrderBookDeltaEvent, OrderBookEvent};
 use model::utils::handle_delta;
@@ -32,7 +32,7 @@ impl ListenerHandler {
                 error!("Error sending order book event: {}", err);
             }
 
-            info!("Save snapshot order book {:?}", event.order_book);
+            debug!("Save snapshot order book {:?}", event.order_book);
             if let Err(err) = self.db.insert_order_book_full(&event.order_book, instrument).await {
                 error!("Failed to save order book: {}", err);
             }
@@ -74,7 +74,7 @@ impl ListenerHandler {
                 }
 
                 if save_full {
-                    info!("Save full order book {order_book:?}");
+                    debug!("Save full order book {order_book:?}");
                     if let Err(err) = self.db.insert_order_book_full(&order_book, instrument).await {
                         error!("Failed to save order book: {}", err);
                     }

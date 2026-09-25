@@ -63,3 +63,14 @@ create table trade
 );
 create index on trade (order_id);
 create index on trade (executed);
+
+create table signal_calculator
+(
+    id serial primary key,
+    trained_on timestamp with time zone not null,
+    up_score float4,
+    up_params text,
+    down_score float4,
+    down_params text
+);
+create index on signal_calculator (trained_on);

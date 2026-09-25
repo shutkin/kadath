@@ -174,7 +174,7 @@ async fn main() -> EmptyResult {
                             //info!("Hour {prev_hour}");
                         }
 
-                        if let Some(pair_perf) = model.calibrate(true) {
+                        if let Some(pair_perf) = model.calibrate(true).prev_cycle_performances {
                             let perf_up = pair_perf.up;
                             let perf_down = pair_perf.down;
                             let actual_wins_up = if perf_up.actual_deals > 0 {
@@ -335,7 +335,7 @@ async fn _main() -> EmptyResult {
                     }
 
                     for context in &mut contexts {
-                        if let Some(pair_perf) = context.model.calibrate(true)
+                        if let Some(pair_perf) = context.model.calibrate(true).prev_cycle_performances
                             && (pair_perf.up.training_deals > 0 || pair_perf.down.training_deals > 0) {
                                 performances.entry(pair_perf.created_on)
                                     .or_default()

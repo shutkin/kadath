@@ -4,17 +4,17 @@ mod optimizer;
 mod simulation;
 mod strategy_optimizer;
 
-use std::sync::{Arc, Mutex, RwLock};
 use crate::optimizer::calibrate_signal_calculator;
 use crate::orderbook_values::{Leg, OrderBookValues, WindowValuesCalculator};
-use crate::signal_calculator::{CalculatorsPair, PairPerformance};
+use crate::signal_calculator::{CalculatorsPair, PairPerformance, SignalCalculator};
 use chrono::{TimeDelta, Utc};
-use log::{debug, info};
-use std::thread;
+use log::debug;
 use model::events::OrderBookEvent;
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
 
 const MAX_WINDOW_LENGTH_S: i64 = 2000;
-const TRAIN_DATA_MINUTES: u16 = 25;
+const TRAIN_DATA_MINUTES: u16 = 45;
 const TRAIN_INTERVAL_MINUTES: u16 = 1;
 const DEFAULT_DECAY_TIME: f64 = 15.0;
 const STD_DIAPASON_SECONDS: u16 = 1200;
@@ -71,6 +71,13 @@ pub struct WalkForwardModel {
     config: ModelConfig,
     calculator: Arc<RwLock<Option<CalculatorsPair>>>,
     buffer: Arc<Mutex<Vec<OrderBookValues>>>,
+}
+
+#[derive(Copy, Clone, Default)]
+pub struct CalibrationResponse {
+    pub prev_cycle_performances: Option<PairPerformance>,
+    pub up: Option<SignalCalculator>,
+    pub down: Option<SignalCalculator>,
 }
 
 impl WalkForwardModel {
@@ -143,7 +150,7 @@ impl WalkForwardModel {
         }
     }
     
-    pub fn calibrate(&self, check_time: bool) -> Option<PairPerformance> {
+    pub fn calibrate(&self, check_time: bool) -> CalibrationResponse {
         let buf_minutes = if let Ok(buffer) = self.buffer.lock() {
             if buffer.len() >= 2 {
                 let delta = buffer[buffer.len() - 1].time - buffer[0].time;
@@ -151,7 +158,7 @@ impl WalkForwardModel {
             } else { 0 }
         } else { 0 };
         if buf_minutes < self.config.train_data_minutes - 1 {
-            return None;
+            return CalibrationResponse::default();
         }
 
         if check_time
@@ -160,7 +167,7 @@ impl WalkForwardModel {
             && let Ok(buffer) = self.buffer.lock() {
             let last_time = buffer[buffer.len() - 1].time;
             if last_time - calc.get_created_on() < TimeDelta::minutes(self.config.train_interval_minutes as i64) {
-                return None;
+                return CalibrationResponse::default();
             }
         }
 
@@ -170,6 +177,10 @@ impl WalkForwardModel {
             read.map(|calc| calc.get_performances())
         } else {
             None
+        };
+        let mut response = CalibrationResponse {
+            prev_cycle_performances: performances,
+            ..Default::default()
         };
 
         let decay_time = self.config.decay_time;
@@ -190,6 +201,8 @@ impl WalkForwardModel {
             let last_time = self.buffer.lock()
                 .map(|buf| buf[buf.len() - 1].time).unwrap_or(Utc::now());
             let calc = CalculatorsPair::new(up, down, last_time);
+            response.up = up;
+            response.down = down;
 
             debug!("{calc:?}");
             if let Ok(mut write) = self.calculator.write() {
@@ -197,7 +210,7 @@ impl WalkForwardModel {
             }
         }
 
-        performances
+        response
     }
 
     fn shrink_buffer(&self) {
