@@ -23,7 +23,7 @@ const WS_COMMAND_URL: &str = "wss://apidev.alor.ru/cws";
 
 const INSTRUMENTS_LIMIT: usize = 100;
 
-const PORTFOLIO: &str = "D00013";
+const PORTFOLIO: &str = "7500013";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -161,13 +161,15 @@ struct CreateOrderRequest {
     side: String,
     /// Количество (лоты)
     quantity: i32,
+    #[serde(with = "rust_decimal::serde::arbitrary_precision")]
+    price: Decimal,
     comment: Option<String>,
     user: CreateOrderUser,
     instrument: CreateOrderInstrument,
     /// ImmediateOrCancel — Исполнение немедленно на весь доступный объём встречных заявок. Неисполненный остаток отменяется
     time_in_force: String,
     /// Флаг, подтверждающий согласие клиента с начальным уровнем риска (КНУР) на выставление или изменение заявки, исполнение которой может привести к возникновению или увеличению непокрытой позиции.
-    // Флаг не переносится между запросами — в каждом запросе, требующем подтверждения, должен быть свой флаг allowMargin: true
+    /// Флаг не переносится между запросами — в каждом запросе, требующем подтверждения, должен быть свой флаг allowMargin: true
     allow_margin: bool,
 }
 
@@ -178,11 +180,14 @@ struct CreateOrderUser {
 }
 
 #[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct CreateOrderInstrument {
     /// Тикер (Код финансового инструмента)
     symbol: String,
     /// Биржа: MOEX — Московская Биржа, SPBX — СПБ Биржа
     exchange: String,
+    /// RFUD
+    instrument_group: String,
 }
 
 #[derive(Deserialize)]
@@ -253,6 +258,22 @@ impl Alor {
         }).collect())
     }
 
+    pub async fn client_positions(&self) -> Result<String, CommonError> {
+        let token = self.get_actual_access_token().await?;
+
+        let client = reqwest::Client::builder()
+            .build()?;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Accept", "application/json".parse()?);
+        headers.insert("Authorization", format!("Bearer {token}").parse()?);
+
+        let response = client.request(reqwest::Method::GET, format!("{API_ROOT}/Clients/P052863/positions"))
+            .headers(headers).send().await?;
+        let text = response.text().await?;
+        Ok(text)
+    }
+
     async fn send_auth_command(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, token: String) {
         let rq = AuthRequest {
             opcode: "authorize".to_string(),
@@ -271,21 +292,23 @@ impl Alor {
     async fn handle_command(
         event: OrderEvent,
         ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-        response_sender: mpsc::Sender<OrderResponseEvent>,
     ) {
         let guid = Uuid::new_v4().to_string();
+        let symbol = if event.ticker == "GLZ6" {"GOLD-12.26".to_string()} else {event.ticker.clone()};
         let rq = CreateOrderRequest {
-            opcode: "create:market".to_string(),
+            opcode: "create:limit".to_string(),
             comment: None,
             user: CreateOrderUser { portfolio: PORTFOLIO.to_string() },
-            instrument: CreateOrderInstrument { exchange: "MOEX".to_string(), symbol: event.ticker },
+            instrument: CreateOrderInstrument { exchange: "MOEX".to_string(), symbol, instrument_group: "RFUD".to_string() },
             side: event.direction.to_full_string(),
             quantity: event.quantity,
-            time_in_force: "ImmediateOrCancel".to_string(),
+            price: event.expected_price,
+            time_in_force: "OneDay".to_string(),
             allow_margin: true,
             guid,
         };
         if let Ok(json) = serde_json::to_string(&rq) {
+            info!("Send command {json}");
             if let Err(err) = ws.send(Frame::text(json)).await {
                 error!("Error sending command: {err}");
                 return;
@@ -293,30 +316,6 @@ impl Alor {
         } else {
             error!("Failed to serialize event: {rq:?}");
             return;
-        }
-
-        if let Some(frame) = ws.next().await {
-            match frame.opcode() {
-                OpCode::Text => {
-                    info!("Create order response: {}", frame.as_str());
-                    match serde_json::from_str::<CreateOrderResponse>(&*frame.as_str()) {
-                        Ok(response) => {
-                            let response = OrderResponseEvent {
-                                deal_id: event.deal_id,
-                                direction: event.direction,
-                                order_id: response.order_number.to_string(),
-                            };
-                            if let Err(err) = response_sender.send(response).await {
-                                error!("Failed to send order response: {err}");
-                            }
-                        }
-                        Err(err) => {
-                            error!("Failed to deserialize order response: {err}");
-                        }
-                    }
-                }
-                _ => {}
-            }
         }
     }
 
@@ -329,8 +328,10 @@ impl Alor {
         let self_clone = self.clone();
         tokio::spawn(async move {
             let mut ws = WebSocket::connect(WS_COMMAND_URL.parse().unwrap()).await.unwrap();
-
             let mut auth_timer = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+
+            let mut last_event = None;
+
             loop {
                 tokio::select! {
                     _ = auth_timer.tick() => {
@@ -341,10 +342,44 @@ impl Alor {
                     order_event = receiver.recv() => {
                         match order_event {
                             Some(event) => {
-                                Self::handle_command(event, &mut ws, response_sender.clone()).await;
+                                last_event = Some(event.clone());
+                                Self::handle_command(event, &mut ws).await;
                             }
                             None => {
                                 warn!("TradeEvent channel is closed");
+                                break;
+                            }
+                        }
+                    }
+                    frame = ws.next() => {
+                        match frame {
+                            Some(frame) => {
+                                match frame.opcode() {
+                                    OpCode::Text => {
+                                        info!("Command response: {}", frame.as_str());
+                                        match serde_json::from_str::<CreateOrderResponse>(&*frame.as_str()) {
+                                            Ok(response) => {
+                                                if let Some(last_event) = &last_event {
+                                                    let response = OrderResponseEvent {
+                                                        deal_id: last_event.deal_id,
+                                                        direction: last_event.direction,
+                                                        order_id: response.order_number.to_string(),
+                                                    };
+                                                    if let Err(err) = response_sender.send(response).await {
+                                                        error!("Failed to send order response: {err}");
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                info!("Failed to deserialize order response: {err}");
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            None => {
+                                warn!("Command websocket is closed");
                                 break;
                             }
                         }
@@ -394,7 +429,7 @@ impl Alor {
                             }
                         },
                         Err(err) => {
-                            error!("{err}: {}", frame.as_str());
+                            info!("{err}: {}", frame.as_str());
                         }
                     }
                 }

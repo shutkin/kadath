@@ -40,12 +40,17 @@ create table price
     price numeric
 );
 
+drop table spread_deal;
+
 create table spread_deal
 (
     id serial,
     started timestamp with time zone not null,
     instrument_id integer not null,
     direction char not null,
+    hold smallint not null,
+    open_price_expected numeric,
+    close_price_expected numeric,
     open_order_id varchar,
     close_order_id varchar
 );

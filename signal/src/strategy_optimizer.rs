@@ -15,10 +15,17 @@ pub struct StrategyOptimizer {
 }
 
 impl StrategyOptimizer {
+    pub fn new(instrument1_id: i32, instrument2_id: i32) -> Self {
+        Self {
+            instrument1_id,
+            instrument2_id,
+        }
+    }
+
     pub fn optimize(&self, events: &[OrderBookEvent]) -> Result<ModelConfig, CommonError> {
         let initial = Array1::from(
             // train_size, decay, stddiv_window
-            vec![90.0, 15.0, 1200.0]
+            vec![60.0, 15.0, 1200.0]
         );
         let mut simplex = Vec::with_capacity(initial.len() + 1);
 
@@ -28,7 +35,7 @@ impl StrategyOptimizer {
             let mut point = initial.clone();
             point[i] += match i {
                 0 => 10.0, // Train size
-                1 => 1.0,  // Decay
+                1 => 5.0,  // Decay
                 _ => 30.0, // stddiv window
             };
             simplex.push(point);
@@ -37,13 +44,13 @@ impl StrategyOptimizer {
         let solver = NelderMead::<Array1<f64>, f64>::new(simplex.clone());
         let problem = GlobalProblem { events, instrument1_id: self.instrument1_id, instrument2_id: self.instrument2_id };
         let result = Executor::new(problem, solver)
-            .configure(|state| state.max_iters(4096))
+            .configure(|state| state.max_iters(128))
             .run()?;
         let optimized_score = -result.state().get_best_cost();
         let param = result.state().get_best_param().ok_or("Failed to get best param")?;
         let config = config_from_param(param);
         info!("Best score {optimized_score} with {config:?}");
-        
+
         Ok(config)
     }
 }
@@ -69,9 +76,9 @@ impl CostFunction for GlobalProblem<'_> {
         let mut daily_pnl = Vec::new();
         let (mut daily_revenue, mut daily_cost) = (0.0, 0.0);
         let mut active_deal = Option::<SimDeal>::None;
-        
+
         let mut prev_event_time = self.events[0].order_book.timestamp;
-        
+
         for event in self.events {
             if event.order_book.timestamp.num_days_from_ce() > prev_event_time.num_days_from_ce() {
                 daily_pnl.push(daily_revenue - daily_cost);
@@ -79,7 +86,7 @@ impl CostFunction for GlobalProblem<'_> {
                 daily_cost = 0.0;
             }
             prev_event_time = event.order_book.timestamp;
-            
+
             model.calibrate(true);
             let signal = model.process(&mut window_data, event);
             if let Some((v1, v2)) = model.get_last_values() {
@@ -107,12 +114,12 @@ impl CostFunction for GlobalProblem<'_> {
         if daily_revenue > 0.0 || daily_cost > 0.0 {
             daily_pnl.push(daily_revenue - daily_cost);
         }
-        
+
         let max_pnl = daily_pnl.iter().copied().reduce(f64::max).unwrap_or_default();
         let pnl_deviation = standard_deviation(&daily_pnl).unwrap_or_default();
         let score = max_pnl - pnl_deviation;
         info!("Score: {score}");
-        
+
         Ok(-score)
     }
 }

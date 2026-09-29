@@ -76,6 +76,9 @@ pub struct Deal {
     pub instrument_id: i32,
     pub started: DateTime<Utc>,
     pub direction: TradeDirection,
+    pub hold: u16,
+    pub open_price_expected: Option<Decimal>,
+    pub close_price_expected: Option<Decimal>,
     pub open_order_id: Option<String>,
     pub close_order_id: Option<String>,
 }

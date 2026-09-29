@@ -2,7 +2,7 @@ mod orderbook_values;
 pub mod signal_calculator;
 mod optimizer;
 mod simulation;
-mod strategy_optimizer;
+pub mod strategy_optimizer;
 
 use crate::optimizer::calibrate_signal_calculator;
 use crate::orderbook_values::{Leg, OrderBookValues, WindowValuesCalculator};

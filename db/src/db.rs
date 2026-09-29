@@ -364,12 +364,14 @@ impl Db {
         Ok(())
     }
     
-    pub async fn start_deal(&self, instrument_id: i32, direction: TradeDirection) -> Result<Deal, CommonError> {
+    pub async fn start_deal(&self, instrument_id: i32, direction: TradeDirection, hold: u16, open_price_expected: Option<Decimal>) -> Result<Deal, CommonError> {
         let started = Utc::now();
-        let id_row = sqlx::query("INSERT INTO spread_deal (started, instrument_id, direction) VALUES ($1, $2, $3)")
+        let id_row = sqlx::query("INSERT INTO spread_deal (started, instrument_id, direction, hold, open_price_expected) VALUES ($1, $2, $3, $4, $5)")
             .bind(started)
             .bind(instrument_id)
             .bind(direction.to_short_string())
+            .bind(hold as i16)
+            .bind(open_price_expected)
             .fetch_one(&self.pool).await?;
         let id = id_row.get(0);
         Ok(Deal {
@@ -377,6 +379,9 @@ impl Db {
             instrument_id,
             started,
             direction,
+            hold: 0,
+            open_price_expected,
+            close_price_expected: None,
             open_order_id: None,
             close_order_id: None,
         })

@@ -4,7 +4,7 @@ use crate::signal_calculator::{CalculatorsPair, SignalCalculator, SignalPerforma
 use crate::simulation::run_simulation;
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use model::common::CommonError;
 use ndarray::Array1;
 
@@ -106,7 +106,7 @@ fn calibrate_signal_calculator_on_hold_time(
     let optimized_profit = -result.state().get_best_cost();
     let param = result.state().get_best_param().ok_or("Failed to get best param")?;
 
-    debug!("{} opt profit {optimized_profit} with {param:?}", if is_up {"UP"} else {"DOWN"});
+    debug!("{} opt profit {optimized_profit} with {param:?} and hold {hold_time_ms}", if is_up {"UP"} else {"DOWN"});
 
     let mut calc = SignalCalculator::from_optimizer_param(hold_time_ms, param);
     let pair = if is_up {
@@ -130,7 +130,7 @@ fn calibrate_signal_calculator_on_hold_time(
     });
 
     //Ok(Some(calc))
-    if profit > 1.0 {
+    if profit > 0.0 {
         Ok(Some(calc))
     } else {
         Ok(None)

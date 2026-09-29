@@ -77,7 +77,7 @@ impl SignalCalculator {
         }
         score - self.threshold
     }
-    
+
     pub fn to_params_map(&self) -> HashMap<String, f64> {
         let mut map = HashMap::new();
         map.insert("hold".to_string(), self.hold_time_ms.into());
@@ -160,7 +160,6 @@ impl CalculatorsPair {
         let calculator = if v1.normal_derivative > 0.0 {&self.up} else {&self.down};
         if let Some(calculator) = calculator {
             let score = calculator.calculate(v1, v2);
-            trace!("Score: {score}");
             if score > 0.0 {
                 if v1.normal_derivative > 0.0 {
                     TradeSignal::Sell1Buy2(calculator.hold_time_ms)
