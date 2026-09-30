@@ -8,12 +8,36 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub enum DataSource {
+    Alor, TInvest,
+}
+
+impl DataSource {
+    pub fn get_code(&self) -> &str {
+        match self {
+            DataSource::Alor => "A",
+            DataSource::TInvest => "T",
+        }
+    }
+
+    pub fn from_code (code: &str) -> DataSource {
+        if code == "T" {
+            DataSource::TInvest
+        } else {
+            DataSource::Alor
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Instrument {
     pub id: Option<i32>,
+    pub source: DataSource,
     pub ticker: String,
     pub name: String,
     pub lot_size: i16,
+    pub external_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +71,40 @@ pub enum TradeDirection {
     Buy, Sell,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum DealStatus {
+    Opening,
+    OpenConfirmed,
+    Closing,
+    CloseConfirmed,
+    OpenFailed,
+    CloseFailed,
+}
+
+impl DealStatus {
+    pub fn get_code(&self) -> &str {
+        match self {
+            DealStatus::Opening => "0",
+            DealStatus::OpenConfirmed => "1",
+            DealStatus::Closing => "2",
+            DealStatus::CloseConfirmed => "3",
+            DealStatus::OpenFailed => "8",
+            DealStatus::CloseFailed => "9",
+        }
+    }
+    
+    pub fn from_code (code: &str) -> DealStatus {
+        match code { 
+            "0" => DealStatus::Opening,
+            "1" => DealStatus::OpenConfirmed,
+            "2" => DealStatus::Closing,
+            "3" => DealStatus::CloseConfirmed,
+            "4" => DealStatus::OpenFailed,
+            _ => DealStatus::CloseFailed,
+        }
+    }
+}
+
 impl TradeDirection {
     pub fn reverse(&self) -> TradeDirection {
         match self {
@@ -71,7 +129,7 @@ impl TradeDirection {
 }
 
 #[derive(Clone, Debug)]
-pub struct Deal {
+pub struct SpreadDeal {
     pub id: i32,
     pub instrument_id: i32,
     pub started: DateTime<Utc>,
@@ -81,6 +139,25 @@ pub struct Deal {
     pub close_price_expected: Option<Decimal>,
     pub open_order_id: Option<String>,
     pub close_order_id: Option<String>,
+}
+
+pub struct Deal {
+    pub id: i32,
+    pub started: DateTime<Utc>,
+    pub leg1_instrument_id: i32,
+    pub leg2_instrument_id: i32,
+    pub direction: TradeDirection,
+    pub hold: u16,
+    pub leg1_status: DealStatus,
+    pub leg2_status: DealStatus,
+    pub leg1_open_price_expected: Decimal,
+    pub leg2_open_price_expected: Decimal,
+    pub leg1_close_price_expected: Option<Decimal>,
+    pub leg2_close_price_expected: Option<Decimal>,
+    pub leg1_open_order_id: Option<String>,
+    pub leg2_open_order_id: Option<String>,
+    pub leg1_close_order_id: Option<String>,
+    pub leg2_close_order_id: Option<String>,
 }
 
 #[derive(Clone)]

@@ -7,7 +7,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use db::{Db, QueryAsksOrBids};
 use log::{LevelFilter, info};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
-use model::{Instrument, OrderBook, order_book_cache};
+use model::{order_book_cache, DataSource, Instrument, OrderBook};
 use simplelog::SimpleLogger;
 
 #[tokio::main]
@@ -19,7 +19,7 @@ async fn main() -> EmptyResult {
 
     let ticker = "GLU6";
 
-    let all_instruments = db.get_instruments().await?;
+    let all_instruments = db.get_instruments(DataSource::Alor).await?;
     if let Some(inst_id) = find_instrument_id(&all_instruments, ticker) {
         let train_diapason = TimeDiapason::new(
             DateTime::parse_from_rfc3339("2026-09-04T05:00:00Z")?.to_utc(),

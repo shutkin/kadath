@@ -14,7 +14,7 @@ use db::{Db, QueryAsksOrBids};
 use log::{info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::math_util::standard_deviation;
-use model::{Instrument, OrderBook, order_book_cache};
+use model::{order_book_cache, DataSource, Instrument, OrderBook};
 use simplelog::{LevelFilter, SimpleLogger};
 use std::thread;
 
@@ -63,7 +63,7 @@ async fn __main() -> EmptyResult {
 
     let tickers = ["GLU6", "GLZ6", "GLH7", "GLM7"];
 
-    let all_instruments = db.get_instruments().await?;
+    let all_instruments = db.get_instruments(DataSource::Alor).await?;
     if let (Some(inst1_id), Some(inst2_id)) = (
         find_instrument_id(&all_instruments, tickers[0]),
         find_instrument_id(&all_instruments, tickers[1]),
@@ -176,7 +176,7 @@ async fn main() -> EmptyResult {
     );
     let end = DateTime::parse_from_rfc3339("2026-09-11T00:00:00Z")?.to_utc();
 
-    let all_instruments = db.get_instruments().await?;
+    let all_instruments = db.get_instruments(DataSource::Alor).await?;
     if let (Some(inst1_id), Some(inst2_id)) = (
         find_instrument_id(&all_instruments, tickers[0]),
         find_instrument_id(&all_instruments, tickers[1]),
@@ -221,7 +221,7 @@ async fn _main() -> EmptyResult {
     );
     let functions = [CostFunctionImpl::TradingSimulation];
 
-    let all_instruments = db.get_instruments().await?;
+    let all_instruments = db.get_instruments(DataSource::Alor).await?;
     if let (Some(inst1_id), Some(inst2_id)) = (
         find_instrument_id(&all_instruments, tickers[0]),
         find_instrument_id(&all_instruments, tickers[1]),

@@ -40,8 +40,6 @@ create table price
     price numeric
 );
 
-drop table spread_deal;
-
 create table spread_deal
 (
     id serial,
@@ -55,6 +53,28 @@ create table spread_deal
     close_order_id varchar
 );
 create index on spread_deal (started);
+
+drop table deal;
+create table deal
+(
+    id serial,
+    started timestamp with time zone not null,
+    leg1_instrument_id integer not null,
+    leg2_instrument_id integer not null,
+    direction char not null,
+    hold smallint not null,
+    leg1_status char not null,
+    leg2_status char not null,
+    leg1_open_price_expected numeric,
+    leg2_open_price_expected numeric,
+    leg1_close_price_expected numeric,
+    leg2_close_price_expected numeric,
+    leg1_open_order_id varchar,
+    leg2_open_order_id varchar,
+    leg1_close_order_id varchar,
+    leg2_close_order_id varchar
+);
+create index on deal (started);
 
 create table trade
 (
@@ -79,3 +99,8 @@ create table signal_calculator
     down_params text
 );
 create index on signal_calculator (trained_on);
+
+alter table instrument add column source char default 'A' not null;
+comment on column instrument.source is 'A - Alor, T - T-Invest';
+
+alter table instrument add column external_id varchar;

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::utils::handle_delta;
-use model::{Deal, Instrument, OrderBook, OrderData, OrderDataDelta, SignalCalculatorLog, Trade, TradeDirection};
+use model::{DataSource, SpreadDeal, Instrument, OrderBook, OrderData, OrderDataDelta, SignalCalculatorLog, Trade, TradeDirection, Deal, DealStatus};
 use rust_decimal::Decimal;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, Row};
@@ -98,22 +98,26 @@ impl Db {
         Ok(Self { pool, prices })
     }
 
-    pub async fn get_instruments(&self) -> Result<Vec<Instrument>, CommonError> {
-        let rows = sqlx::query("SELECT i.id, i.ticker, i.name, i.lot_size FROM instrument i")
+    pub async fn get_instruments(&self, source: DataSource) -> Result<Vec<Instrument>, CommonError> {
+        let rows = sqlx::query("SELECT id, ticker, name, lot_size, external_id  FROM instrument i WHERE source = $1")
+            .bind(source.get_code())
             .fetch_all(&self.pool).await?;
         Ok(rows
             .iter()
             .map(|row| Instrument {
                 id: row.get(0),
+                source,
                 ticker: row.get(1),
                 name: row.get(2),
                 lot_size: row.get(3),
+                external_id: row.get(4),
             })
             .collect())
     }
 
     pub async fn insert_instruments(&self, instruments: &mut [Instrument]) -> Result<(), CommonError> {
-        let existing_instruments = self.get_instruments().await?;
+        let source = instruments[0].source;
+        let existing_instruments = self.get_instruments(source).await?;
 
         for instrument in instruments {
             if let Some(existing_instrument) = existing_instruments.iter()
@@ -123,10 +127,11 @@ impl Db {
             }
 
             info!("Insert {:?}", instrument);
-            let id_row = sqlx::query("INSERT INTO instrument (ticker, name, lot_size) VALUES ($1, $2, $3) RETURNING id")
+            let id_row = sqlx::query("INSERT INTO instrument (ticker, name, lot_size, external_id) VALUES ($1, $2, $3, $4) RETURNING id")
                 .bind(instrument.ticker.clone())
                 .bind(instrument.name.clone())
                 .bind(instrument.lot_size)
+                .bind(instrument.external_id.clone())
                 .fetch_one(&self.pool).await?;
             let id = id_row.get(0);
             instrument.id = Some(id);
@@ -364,7 +369,7 @@ impl Db {
         Ok(())
     }
     
-    pub async fn start_deal(&self, instrument_id: i32, direction: TradeDirection, hold: u16, open_price_expected: Option<Decimal>) -> Result<Deal, CommonError> {
+    pub async fn start_spread_deal(&self, instrument_id: i32, direction: TradeDirection, hold: u16, open_price_expected: Option<Decimal>) -> Result<SpreadDeal, CommonError> {
         let started = Utc::now();
         let id_row = sqlx::query("INSERT INTO spread_deal (started, instrument_id, direction, hold, open_price_expected) VALUES ($1, $2, $3, $4, $5)")
             .bind(started)
@@ -374,7 +379,7 @@ impl Db {
             .bind(open_price_expected)
             .fetch_one(&self.pool).await?;
         let id = id_row.get(0);
-        Ok(Deal {
+        Ok(SpreadDeal {
             id,
             instrument_id,
             started,
@@ -384,6 +389,51 @@ impl Db {
             close_price_expected: None,
             open_order_id: None,
             close_order_id: None,
+        })
+    }
+
+    pub async fn start_deal(
+        &self,
+        leg1_instrument_id: i32,
+        leg2_instrument_id: i32,
+        direction: TradeDirection,
+        hold: u16,
+        leg1_open_price_expected: Decimal,
+        leg2_open_price_expected: Decimal,
+    ) -> Result<Deal, CommonError> {
+        let started = Utc::now();
+        let leg1_status = DealStatus::Opening;
+        let leg2_status = DealStatus::Opening;
+        let id_row = sqlx::query(
+            "INSERT INTO deal (started, leg1_instrument_id, leg2_instrument_id, direction, hold, leg1_status, leg2_status, leg1_open_price_expected, leg2_open_price_expected) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",)
+            .bind(started)
+            .bind(leg1_instrument_id)
+            .bind(leg2_instrument_id)
+            .bind(direction.to_short_string())
+            .bind(hold as i16)
+            .bind(leg1_status.get_code())
+            .bind(leg2_status.get_code())
+            .bind(leg1_open_price_expected)
+            .bind(leg2_open_price_expected)
+            .fetch_one(&self.pool).await?;
+        let id = id_row.get(0);
+        Ok(Deal {
+            id,
+            started,
+            leg1_instrument_id,
+            leg2_instrument_id,
+            direction,
+            hold,
+            leg1_status,
+            leg2_status,
+            leg1_open_price_expected,
+            leg2_open_price_expected,
+            leg1_close_price_expected: None,
+            leg2_close_price_expected: None,
+            leg1_open_order_id: None,
+            leg2_open_order_id: None,
+            leg1_close_order_id: None,
+            leg2_close_order_id: None,
         })
     }
     

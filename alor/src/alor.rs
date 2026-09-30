@@ -1,16 +1,18 @@
+use abstract_broker::BrokerListener;
+use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::dangerous::insecure_decode_claims;
 use log::{error, info, warn};
 use model::common::{CommonError, EmptyResult};
-use model::events::{OrderBookDeltaEvent, OrderBookEvent, OrderEvent, OrderResponseEvent};
-use model::{Instrument, OrderBook, OrderData, Trade, TradeDirection};
+use model::events::{OrderBookDeltaEvent, OrderBookEvent, OrderEvent};
+use model::{DataSource, Instrument, OrderBook, OrderData, Trade, TradeDirection};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -199,14 +201,15 @@ struct CreateOrderResponse {
     order_number: i64,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct Alor {
-    access_token: Arc<RwLock<String>>,
-    access_token_updating: Arc<AtomicBool>,
+    access_token: RwLock<String>,
+    access_token_updating: AtomicBool,
 }
 
-impl Alor {
-    pub async fn get_instruments(&self) -> Result<Vec<Instrument>, CommonError> {
+#[async_trait]
+impl BrokerListener for Alor {
+    async fn get_instruments(&self) -> Result<Vec<Instrument>, CommonError> {
         let token = self.get_actual_access_token().await?;
 
         let client = reqwest::Client::builder()
@@ -252,146 +255,15 @@ impl Alor {
 
         Ok(all_instruments.into_iter().map(|i| Instrument {
             id: None,
+            source: DataSource::Alor,
             ticker: i.desc,
             name: i.t,
             lot_size: i.lot as i16,
+            external_id: None,
         }).collect())
     }
 
-    pub async fn client_positions(&self) -> Result<String, CommonError> {
-        let token = self.get_actual_access_token().await?;
-
-        let client = reqwest::Client::builder()
-            .build()?;
-
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Accept", "application/json".parse()?);
-        headers.insert("Authorization", format!("Bearer {token}").parse()?);
-
-        let response = client.request(reqwest::Method::GET, format!("{API_ROOT}/Clients/P052863/positions"))
-            .headers(headers).send().await?;
-        let text = response.text().await?;
-        Ok(text)
-    }
-
-    async fn send_auth_command(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, token: String) {
-        let rq = AuthRequest {
-            opcode: "authorize".to_string(),
-            guid: Uuid::new_v4().to_string(),
-            token,
-        };
-        if let Ok(json) = serde_json::to_string(&rq) {
-            if let Err(err) = ws.send(Frame::text(json)).await {
-                error!("Failed to send authorize message: {err}");
-            } else {
-                info!("Successfully sent authorize message");
-            }
-        }
-    }
-
-    async fn handle_command(
-        event: OrderEvent,
-        ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-    ) {
-        let guid = Uuid::new_v4().to_string();
-        let symbol = if event.ticker == "GLZ6" {"GOLD-12.26".to_string()} else {event.ticker.clone()};
-        let rq = CreateOrderRequest {
-            opcode: "create:limit".to_string(),
-            comment: None,
-            user: CreateOrderUser { portfolio: PORTFOLIO.to_string() },
-            instrument: CreateOrderInstrument { exchange: "MOEX".to_string(), symbol, instrument_group: "RFUD".to_string() },
-            side: event.direction.to_full_string(),
-            quantity: event.quantity,
-            price: event.expected_price,
-            time_in_force: "OneDay".to_string(),
-            allow_margin: true,
-            guid,
-        };
-        if let Ok(json) = serde_json::to_string(&rq) {
-            info!("Send command {json}");
-            if let Err(err) = ws.send(Frame::text(json)).await {
-                error!("Error sending command: {err}");
-                return;
-            }
-        } else {
-            error!("Failed to serialize event: {rq:?}");
-            return;
-        }
-    }
-
-    pub async fn start_commands_stream(
-        &self,
-        response_sender: mpsc::Sender<OrderResponseEvent>,
-    ) -> Result<mpsc::Sender<OrderEvent>, CommonError> {
-        let (sender, mut receiver) = mpsc::channel::<OrderEvent>(64);
-
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            let mut ws = WebSocket::connect(WS_COMMAND_URL.parse().unwrap()).await.unwrap();
-            let mut auth_timer = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
-
-            let mut last_event = None;
-
-            loop {
-                tokio::select! {
-                    _ = auth_timer.tick() => {
-                        if let Ok(token) = self_clone.get_actual_access_token().await {
-                            Self::send_auth_command(&mut ws, token).await;
-                        }
-                    },
-                    order_event = receiver.recv() => {
-                        match order_event {
-                            Some(event) => {
-                                last_event = Some(event.clone());
-                                Self::handle_command(event, &mut ws).await;
-                            }
-                            None => {
-                                warn!("TradeEvent channel is closed");
-                                break;
-                            }
-                        }
-                    }
-                    frame = ws.next() => {
-                        match frame {
-                            Some(frame) => {
-                                match frame.opcode() {
-                                    OpCode::Text => {
-                                        info!("Command response: {}", frame.as_str());
-                                        match serde_json::from_str::<CreateOrderResponse>(&*frame.as_str()) {
-                                            Ok(response) => {
-                                                if let Some(last_event) = &last_event {
-                                                    let response = OrderResponseEvent {
-                                                        deal_id: last_event.deal_id,
-                                                        direction: last_event.direction,
-                                                        order_id: response.order_number.to_string(),
-                                                    };
-                                                    if let Err(err) = response_sender.send(response).await {
-                                                        error!("Failed to send order response: {err}");
-                                                    }
-                                                }
-                                            }
-                                            Err(err) => {
-                                                info!("Failed to deserialize order response: {err}");
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            None => {
-                                warn!("Command websocket is closed");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(sender)
-    }
-
-    pub async fn listen_trades(&self, order_book_sender: mpsc::Sender<Trade>) -> EmptyResult {
+    async fn listen_trades(&self, order_book_sender: mpsc::Sender<Trade>) -> EmptyResult {
         let token = self.get_actual_access_token().await?;
 
         let mut ws = WebSocket::connect(WS_SUBSCRIBE_URL.parse()?)
@@ -443,7 +315,7 @@ impl Alor {
         Ok(())
     }
 
-    pub async fn listen_order_books(
+    async fn listen_order_books(
         &self,
         instruments: &[Instrument],
         order_book_sender: mpsc::Sender<OrderBookEvent>,
@@ -506,6 +378,69 @@ impl Alor {
         }
 
         Ok(())
+    }
+}
+
+impl Alor {
+    pub async fn client_positions(&self) -> Result<String, CommonError> {
+        let token = self.get_actual_access_token().await?;
+
+        let client = reqwest::Client::builder()
+            .build()?;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Accept", "application/json".parse()?);
+        headers.insert("Authorization", format!("Bearer {token}").parse()?);
+
+        let response = client.request(reqwest::Method::GET, format!("{API_ROOT}/Clients/P052863/positions"))
+            .headers(headers).send().await?;
+        let text = response.text().await?;
+        Ok(text)
+    }
+
+    async fn send_auth_command(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>, token: String) {
+        let rq = AuthRequest {
+            opcode: "authorize".to_string(),
+            guid: Uuid::new_v4().to_string(),
+            token,
+        };
+        if let Ok(json) = serde_json::to_string(&rq) {
+            if let Err(err) = ws.send(Frame::text(json)).await {
+                error!("Failed to send authorize message: {err}");
+            } else {
+                info!("Successfully sent authorize message");
+            }
+        }
+    }
+
+    async fn handle_command(
+        event: OrderEvent,
+        ws: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    ) {
+        let guid = Uuid::new_v4().to_string();
+        let symbol = if event.ticker == "GLZ6" {"GOLD-12.26".to_string()} else {event.ticker.clone()};
+        let rq = CreateOrderRequest {
+            opcode: "create:limit".to_string(),
+            comment: None,
+            user: CreateOrderUser { portfolio: PORTFOLIO.to_string() },
+            instrument: CreateOrderInstrument { exchange: "MOEX".to_string(), symbol, instrument_group: "RFUD".to_string() },
+            side: event.direction.to_full_string(),
+            quantity: event.quantity,
+            price: event.expected_price,
+            time_in_force: "OneDay".to_string(),
+            allow_margin: true,
+            guid,
+        };
+        if let Ok(json) = serde_json::to_string(&rq) {
+            info!("Send command {json}");
+            if let Err(err) = ws.send(Frame::text(json)).await {
+                error!("Error sending command: {err}");
+                return;
+            }
+        } else {
+            error!("Failed to serialize event: {rq:?}");
+            return;
+        }
     }
 
     fn check_token(&self) -> Option<String> {

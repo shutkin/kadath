@@ -10,7 +10,9 @@ path = "src/kadath.rs"
 [dependencies]
 model = { path = "../model" }
 db = { path = "../db" }
+abstract_broker = { path = "../abstract_broker" }
 alor = { path = "../alor" }
+tinvest = { path = "../tinvest" }
 signal = { path = "../signal" }
 tokio = { version = "1.53", features = ["full"] }
 tokio_schedule = "0.3"

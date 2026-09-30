@@ -3,13 +3,14 @@ use db::{Db, QueryAsksOrBids};
 use log::{LevelFilter, debug, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
-use model::{Instrument, OrderBook, OrderData, order_book_cache};
+use model::{order_book_cache, DataSource, Instrument, OrderBook, OrderData};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use signal::strategy_optimizer::StrategyOptimizer;
 use signal::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use simplelog::SimpleLogger;
+use model::math_util::{mean, median, p10_p90, standard_deviation};
 
 #[derive(Copy, Clone)]
 struct TestDeal {
@@ -146,7 +147,7 @@ async fn _main() -> EmptyResult {
     //let tickers = ["GLU6", "GLZ6"];
     let tickers = ["GLZ6", "GLH7"];
 
-    let all_instruments = db.get_instruments().await?;
+    let all_instruments = db.get_instruments(DataSource::Alor).await?;
     if let (Some(inst1_id), Some(inst2_id)) = (
         find_instrument_id(&all_instruments, tickers[0]),
         find_instrument_id(&all_instruments, tickers[1]),
@@ -198,61 +199,69 @@ async fn main() -> EmptyResult {
     );
     let (alor1, alor2) = get_order_books(&TICKERS, &[INST1_ID, INST2_ID], diapason, Some(&db)).await?;
     let alor_events = merge_events(&[INST1_ID, INST2_ID], &[alor1, alor2]);
-    let alor_spreads = get_spreads(&[INST1_ID, INST2_ID], &alor_events);
-    info!("{} Alor spreads", alor_spreads.len());
+    let alor_prices = get_spreads(&[INST1_ID, INST2_ID], &alor_events);
+    info!("{} Alor prices", alor_prices.len());
 
     let t_invest1 = load_alt_order_books("GLZ6.json")?;
     let t_invest2 = load_alt_order_books("GLH7.json")?;
     let t_invest_events = merge_events(&[0, 1], &[t_invest1, t_invest2]);
-    let t_invest_spreads = get_spreads(&[0, 1], &t_invest_events);
-    info!("{} T-Invest spreads", t_invest_spreads.len());
+    let t_invest_prices = get_spreads(&[0, 1], &t_invest_events);
+    info!("{} T-Invest prices", t_invest_prices.len());
 
-    for i in -10..=10 {
+    /*for i in -10..=10 {
         let lag = i * 50;
-        let correlation = spreads_correlation(lag, &alor_spreads, &t_invest_spreads);
-        info!("Lag {lag}: {correlation}");
-    }
+        let (correlation, p50, p90, stddev) = spreads_correlation(lag, &alor_spreads, &t_invest_spreads);
+        info!("Lag {lag}: correlation={correlation}, p50={p50}, p90={p90}, stddev={stddev}");
+    }*/
+
+    let (mean, p50, p90, stddev) = spreads_correlation(0, &alor_prices, &t_invest_prices, 0);
+    info!("GLZ6 Alor - T_Invest: mean={mean}, p50={p50}, p90={p90}, stddev={stddev}");
+    let (mean, p50, p90, stddev) = spreads_correlation(0, &alor_prices, &t_invest_prices, 1);
+    info!("GLH7 Alor - T_Invest: mean={mean}, p50={p50}, p90={p90}, stddev={stddev}");
+    let (mean, p50, p90, stddev) = spreads_correlation(0, &alor_prices, &t_invest_prices, 2);
+    info!("Spread Alor - T_Invest: mean={mean}, p50={p50}, p90={p90}, stddev={stddev}");
 
     Ok(())
 }
 
-fn spreads_correlation(lag: i64, inst1: &[(i64, f64)], inst2: &[(i64, f64)]) -> f64 {
-    let mut index2 = 0;
-    let mut spreads1 = Vec::with_capacity(inst1.len());
-    let mut spreads2 = Vec::with_capacity(inst1.len());
-    let mut is_first = true;
-    for &(time1, spread1) in inst1 {
-        let i2_from: i32 = (index2 - 500).max(0);
-        let i2_to: i32 = (index2 + if is_first {50000} else {500}).min(inst2.len() as i32);
-        let mut nearest_distance = 10000;
-        let mut nearest_spread = None;
-        for i in i2_from..i2_to {
-            let (time2, spread2) = inst2[i as usize];
-            let distance = (time1 + lag - time2).abs();
-            if distance < nearest_distance {
-                nearest_distance = distance;
-                nearest_spread = Some(spread2);
-                index2 = i;
-            }
-        }
+fn spreads_correlation(lag: i64, prices1: &[(i64, f64, f64)], prices2: &[(i64, f64, f64)], case: u8) -> (f64, f64, f64, f64) {
+    let timestamp_from = prices1[0].0.max(prices2[0].0);
+    let timestamp_to = prices1[prices1.len() - 1].0.min(prices2[prices2.len() - 1].0);
 
-        if let Some(nearest_delta) = nearest_spread {
-            spreads1.push(spread1);
-            spreads2.push(nearest_delta);
-        } else {
-            break;
+    let (mut i1, mut i2) = (0, 0);
+    let mut timestamp = ((timestamp_from / 50) + 1) * 50;
+    let (mut grid_spreads1, mut grid_spreads2) = (Vec::new(), Vec::new());
+    while timestamp < timestamp_to - 50 {
+        while i1 < prices1.len() - 2 && prices1[i1 + 1].0 < timestamp {
+            i1 += 1;
         }
+        while i2 < prices2.len() - 2 && prices2[i2 + 1].0 < timestamp + lag {
+            i2 += 1;
+        }
+        grid_spreads1.push((prices1[i1].1, prices1[i1].2));
+        grid_spreads2.push((prices2[i2].1, prices2[i2].2));
 
-        is_first = false;
+        timestamp += 50;
     }
 
-    let ds1 = spreads1.windows(2).into_iter().map(|window| window[1] - window[0]).collect();
-    let ds2 = spreads2.windows(2).into_iter().map(|window| window[1] - window[0]).collect();
-
-    correlation::pearsonr(&ds1, &ds2)
+    let errors = grid_spreads1.iter().zip(&grid_spreads2)
+        .map(|(s1, s2)| {
+            match case {
+                0 => s1.0 - s2.0,
+                1 => s1.1 - s2.1,
+                _ => s1.1 - s1.0 - (s2.1 - s2.0),
+            }
+        })
+        .collect::<Vec<_>>();
+    let p50 = median(&errors);
+    let (_p10, p90) = p10_p90(&errors);
+    let stddev = standard_deviation(&errors).unwrap();
+    let mean = mean(&errors);
+    //let correlation = correlation::pearsonr(&grid_spreads1, &grid_spreads2);
+    (mean, p50, p90, stddev)
 }
 
-fn get_spreads(ids: &[i32], events: &[OrderBookEvent]) -> Vec<(i64, f64)> {
+fn get_spreads(ids: &[i32], events: &[OrderBookEvent]) -> Vec<(i64, f64, f64)> {
     let (mut ob1, mut ob2) = (None, None);
     let mut spreads = Vec::new();
     for event in events {
@@ -267,8 +276,7 @@ fn get_spreads(ids: &[i32], events: &[OrderBookEvent]) -> Vec<(i64, f64)> {
         if let Some(ob1) = ob1 && let Some(ob2) = ob2 {
             let price1 = (get_best_ask(ob1) + get_best_bid(ob1)).to_f64().unwrap() * 0.5;
             let price2 = (get_best_ask(ob2) + get_best_bid(ob2)).to_f64().unwrap() * 0.5;
-            let spread = price2 - price1;
-            spreads.push((event.order_book.timestamp.timestamp_millis(), spread));
+            spreads.push((event.order_book.timestamp.timestamp_millis(), price1, price2));
         }
     }
 
@@ -292,7 +300,7 @@ async fn __main() -> EmptyResult {
 
     let tickers = ["GLZ6", "GLH7"];
 
-    let all_instruments = db.get_instruments().await?;
+    let all_instruments = db.get_instruments(DataSource::Alor).await?;
     if let (Some(inst1_id), Some(inst2_id)) = (
         find_instrument_id(&all_instruments, tickers[0]),
         find_instrument_id(&all_instruments, tickers[1]),

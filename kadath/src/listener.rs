@@ -1,4 +1,5 @@
-use alor::Alor;
+use crate::queue::Queue;
+use abstract_broker::BrokerListener;
 use chrono::Utc;
 use db::Db;
 use log::{debug, error, warn};
@@ -21,16 +22,14 @@ struct ListenerHandler {
     instruments: HashMap<i32, Instrument>,
     order_books: Arc<Mutex<HashMap<i32, OrderBook>>>,
     ticker: Arc<AtomicI64>,
-    order_book_event_sender: mpsc::Sender<OrderBookEvent>,
+    order_book_queue: Arc<Queue<OrderBookEvent>>,
 }
 
 impl ListenerHandler {
     async fn on_order_book(&self, event: OrderBookEvent) {
         self.ticker.store(Utc::now().timestamp(), Relaxed);
         if let Some(instrument) = self.instruments.get(&event.instrument_id) {
-            if let Err(err) = self.order_book_event_sender.send(event.clone()).await {
-                error!("Error sending order book event: {}", err);
-            }
+            self.order_book_queue.push(event.clone());
 
             debug!("Save snapshot order book {:?}", event.order_book);
             if let Err(err) = self.db.insert_order_book_full(&event.order_book, instrument).await {
@@ -66,12 +65,10 @@ impl ListenerHandler {
             }
 
             if let Some(order_book) = updated_order_book {
-                if let Err(err) = self.order_book_event_sender.send(OrderBookEvent {
+                self.order_book_queue.push(OrderBookEvent {
                     instrument_id: event.instrument_id,
                     order_book: order_book.clone(),
-                }).await {
-                    error!("Error sending order book event on delta: {}", err);
-                }
+                });
 
                 if save_full {
                     debug!("Save full order book {order_book:?}");
@@ -94,9 +91,9 @@ impl ListenerHandler {
 pub async fn listen(
     db: Db,
     instruments: Vec<Instrument>,
-    order_book_event_sender: mpsc::Sender<OrderBookEvent>,
-    trades_event_sender: mpsc::Sender<Trade>,
-    alor: &Alor,
+    order_book_queue: Arc<Queue<OrderBookEvent>>,
+    trade_queue: Arc<Queue<Trade>>,
+    broker: Arc<Box<dyn BrokerListener + Sync + Send>>,
 ) -> EmptyResult {
     let mut instruments_map = HashMap::new();
     instruments.into_iter().for_each(|instrument| {
@@ -104,51 +101,60 @@ pub async fn listen(
             instruments_map.insert(id, instrument);
         }
     });
-    
+
     let db_clone = db.clone();
-    let (trades_sender, mut trades_receiver) = mpsc::channel(64);
-    tokio::spawn(async move {
-        while let Some(mut trade) = trades_receiver.recv().await {
-            if let Err(err) = db_clone.insert_trade(&mut trade).await {
-                error!("Failed to insert trade: {err}");
-            }
-            
-            if let Err(err) = trades_event_sender.send(trade).await {
-                error!("Error sending trades event: {err}");
-            }
-        }
-    });
-    
-    let alor_clone = alor.clone();
+    let broker_clone = broker.clone();
+    let trade_clone = trade_queue.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(err) = alor_clone.listen_trades(trades_sender.clone()).await {
+            if let Err(err) = listen_trades(db_clone.clone(), broker_clone.clone(), trade_clone.clone()).await {
                 error!("Error listening trades: {}", err);
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 
-    let db_clone = db.clone();
-    let alor_clone = alor.clone();
-    let instruments_map_clone = instruments_map.clone();
     let ticker = Arc::new(AtomicI64::new(0));
     loop {
         let now = Utc::now().timestamp();
         if ticker.load(Relaxed) < now - 5 * 60 {
-            start_listener(db_clone.clone(), instruments_map_clone.clone(), ticker.clone(), order_book_event_sender.clone(), alor_clone.clone());
+            start_listener(db.clone(), instruments_map.clone(), ticker.clone(), order_book_queue.clone(), broker.clone());
             ticker.store(Utc::now().timestamp(), Relaxed);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
+async fn listen_trades(db: Db, broker: Arc<Box<dyn BrokerListener + Sync + Send>>, trade_queue: Arc<Queue<Trade>>) -> EmptyResult {
+    let db_clone = db.clone();
+    let (trades_sender, mut trades_receiver) = mpsc::channel(64);
+    let h1 = tokio::spawn(async move {
+        while let Some(mut trade) = trades_receiver.recv().await {
+            if let Err(err) = db_clone.insert_trade(&mut trade).await {
+                error!("Failed to insert trade: {err}");
+            }
+            trade_queue.push(trade);
+        }
+    });
+    let h2 = tokio::spawn(async move {
+        loop {
+            if let Err(err) = broker.listen_trades(trades_sender.clone()).await {
+                error!("Error listening trades: {}", err);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    h1.await?;
+    h2.await?;
+    Ok(())
+}
+
 fn start_listener(
     db: Db,
     instruments: HashMap<i32, Instrument>,
     ticker: Arc<AtomicI64>,
-    order_book_event_sender: mpsc::Sender<OrderBookEvent>,
-    alor: Alor,
+    order_book_queue: Arc<Queue<OrderBookEvent>>,
+    broker: Arc<Box<dyn BrokerListener + Sync + Send>>,
 ) {
     let (order_book_sender,
         mut order_book_receiver) = mpsc::channel::<OrderBookEvent>(64);
@@ -159,7 +165,7 @@ fn start_listener(
         instruments: instruments.clone(),
         order_books: Arc::new(Mutex::new(HashMap::new())),
         ticker: ticker.clone(),
-        order_book_event_sender,
+        order_book_queue,
     };
     let listener_handler_clone = listener_handler.clone();
     tokio::spawn(async move {
@@ -175,7 +181,7 @@ fn start_listener(
 
     let instruments = instruments.values().cloned().collect::<Vec<_>>();
     tokio::spawn(async move {
-        if let Err(err) = alor.listen_order_books(
+        if let Err(err) = broker.listen_order_books(
             &instruments,
             order_book_sender,
             order_book_delta_sender,

@@ -1,21 +1,25 @@
 mod listener;
+mod queue;
 
 use crate::listener::listen;
+use crate::queue::Queue;
+use abstract_broker::BrokerListener;
 use alor::Alor;
 use chrono::{TimeDelta, Utc};
 use db::{Db, QueryAsksOrBids};
 use log::{error, info, warn};
 use model::common::{EmptyResult, TimeDiapason};
-use model::events::{merge_events, OrderBookEvent, OrderEvent, OrderResponseEvent};
-use model::{Deal, OrderBook, OrderData, SignalCalculatorLog, Trade, TradeDirection};
-use signal::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
+use model::events::{OrderBookEvent, OrderResponseEvent, merge_events};
+use model::{DataSource, OrderBook, OrderData, SignalCalculatorLog, SpreadDeal, Trade, TradeDirection};
+use rust_decimal::Decimal;
+use signal::{ModelConfig, WalkForwardModel, WindowData};
 use simplelog::{LevelFilter, SimpleLogger};
 use std::sync::{Arc, Mutex};
-use rust_decimal::Decimal;
 use tokio::sync::mpsc;
 use tokio_schedule::Job;
+use tinvest::TInvest;
 
-const CHANNEL_CAPACITY: usize = 65536;
+const QUEUE_CAPACITY: usize = 65536;
 
 const LISTEN_TICKERS: [&str; 9] = ["GLZ6", "GLH7", "GLM7", "GLU7", "BMV6", "BMX6", "BMZ6", "SiZ6", "SiH7"];
 const SIGNAL_TICKERS: [&str; 2] = ["GLZ6", "GLH7"];
@@ -30,6 +34,15 @@ async fn main() -> EmptyResult {
     info!("Initialize DB");
     let db = Db::new(&db_url).await?;
 
+    let data_source_code = std::env::var("DATA_SOURCE").expect("DATA_SOURCE is not set");
+    let data_source = DataSource::from_code(&data_source_code);
+    
+    let broker: Box<dyn BrokerListener + Send + Sync> = match data_source {
+        DataSource::Alor => Box::new(Alor::default()),
+        DataSource::TInvest => Box::new(TInvest::new().await?),
+    };
+    let broker = Arc::new(broker);
+
     let alor = Alor::default();
     let positions_text = alor.client_positions().await?;
     info!("Client positons: {positions_text}");
@@ -40,9 +53,9 @@ async fn main() -> EmptyResult {
         return Ok(());
     }
 
-    let instruments = db.get_instruments().await?;
-    let (order_book_sender, order_book_receiver) = mpsc::channel::<OrderBookEvent>(CHANNEL_CAPACITY);
-    let (trades_sender, trades_receiver) = mpsc::channel::<Trade>(CHANNEL_CAPACITY);
+    let instruments = db.get_instruments(data_source).await?;
+    let order_book_queue = Arc::new(Queue::<OrderBookEvent>::new(QUEUE_CAPACITY));
+    let trade_queue = Arc::new(Queue::<Trade>::new(QUEUE_CAPACITY));
 
     let signal_instruments = instruments.iter()
         .filter(|instrument| SIGNAL_TICKERS.contains(&instrument.ticker.as_str()))
@@ -63,7 +76,7 @@ async fn main() -> EmptyResult {
     let config = ModelConfig { std_diapason_s: 1184, train_data_minutes: 22, train_interval_minutes: 1, decay_time: 40.90421962773701, fixed_hold_time: None };
     let model = WalkForwardModel::new_with_config(inst1_id, inst2_id, config);
     let mut window_data = WindowData::new();
-    consume_history(inst1_id, inst2_id, &db, &model, &mut window_data).await?;
+    consume_history(data_source, inst1_id, inst2_id, &db, &model, &mut window_data).await?;
     model.calibrate(false);
 
     let model_clone = model.clone();
@@ -93,33 +106,16 @@ async fn main() -> EmptyResult {
     });
     tokio::spawn(calibrate_task);
 
-    let db_clone = db.clone();
-    let alor_clone = alor.clone();
-    tokio::spawn(async move {
-        if let Err(err) = trade(
-            order_book_receiver,
-            trades_receiver,
-            model,
-            window_data,
-            inst1_id,
-            inst2_id,
-            trade_instrument.id.unwrap(),
-            trade_instrument.ticker,
-            &db_clone, &alor_clone).await {
-            error!("Trade stopped with error {err}");
-        }
-    });
-
     let listen_instruments = instruments.iter()
         .filter(|instrument| LISTEN_TICKERS.contains(&instrument.ticker.as_str()))
         .cloned()
         .collect::<Vec<_>>();
-    listen(db.clone(), listen_instruments, order_book_sender, trades_sender, &alor).await?;
+    listen(db, listen_instruments, order_book_queue, trade_queue, broker).await?;
 
     Ok(())
 }
 
-async fn consume_history(inst1: i32, inst2: i32, db: &Db, model: &WalkForwardModel, window_data: &mut WindowData) -> EmptyResult {
+async fn consume_history(data_source: DataSource, inst1: i32, inst2: i32, db: &Db, model: &WalkForwardModel, window_data: &mut WindowData) -> EmptyResult {
     let diapason = TimeDiapason::new(
         Utc::now() - TimeDelta::hours(24),
         Utc::now(),
@@ -142,7 +138,7 @@ async fn handle_order_responses(mut order_response_receiver: mpsc::Receiver<Orde
     warn!("OrderBookEvent channel is closed");
 }
 
-async fn handle_trade(mut trade_receiver: mpsc::Receiver<Trade>, deal: Arc<Mutex<Option<Deal>>>, db: Db) {
+async fn handle_trade(mut trade_receiver: mpsc::Receiver<Trade>, deal: Arc<Mutex<Option<SpreadDeal>>>, db: Db) {
     while let Some(event) = trade_receiver.recv().await {
         let mut deal_id = 0;
         let (mut open_order_id, mut close_order_id) = (None, None);
@@ -177,133 +173,6 @@ async fn handle_trade(mut trade_receiver: mpsc::Receiver<Trade>, deal: Arc<Mutex
     }
     warn!("TradeEvent channel is closed");
 
-}
-
-async fn trade(
-    mut order_book_receiver: mpsc::Receiver<OrderBookEvent>,
-    trade_receiver: mpsc::Receiver<Trade>,
-    model: WalkForwardModel,
-    mut window_data: WindowData,
-    instrument1_id: i32,
-    instrument2_id: i32,
-    trade_instrument_id: i32,
-    trade_instrument_ticker: String,
-    db: &Db,
-    alor: &Alor,
-) -> EmptyResult {
-    let (order_response_sender, order_response_receiver) = mpsc::channel(64);
-    let order_event_sender = alor.start_commands_stream(order_response_sender).await?;
-
-    info!("Start trading");
-    let active_deal = Arc::new(Mutex::new(Option::<Deal>::None));
-
-    tokio::spawn(async move {
-        handle_order_responses(order_response_receiver).await;
-    });
-
-    let deal_clone = active_deal.clone();
-    let db_clone = db.clone();
-    tokio::spawn(async move {
-        handle_trade(trade_receiver, deal_clone, db_clone).await;
-    });
-
-    let (mut last_ob1, mut last_ob2) = (None, None);
-    let mut close_deal_sent = false;
-    let mut cnt = 0;
-
-    while let Some(event) = order_book_receiver.recv().await {
-        if event.instrument_id == instrument1_id {
-            last_ob1 = Some(event.order_book.clone());
-        } else if event.instrument_id == instrument2_id {
-            last_ob2 = Some(event.order_book.clone());
-        } else {
-            continue;
-        }
-
-        cnt += 1;
-        if cnt == 128 {
-            order_event_sender.send(OrderEvent {
-                deal_id: 0,
-                direction: TradeDirection::Buy,
-                instrument_id: trade_instrument_id,
-                quantity: 1,
-                ticker: trade_instrument_ticker.clone(),
-                expected_price: lowest_price(&last_ob1.as_ref().unwrap().asks).unwrap(),
-            }).await?;
-        }
-
-        let signal = model.process(&mut window_data, &event);
-
-        let cur_deal = if let Ok(lock) = active_deal.lock() {
-            lock.clone()
-        } else { None };
-
-        if let Some(deal) = cur_deal {
-            let close_time = deal.started + TimeDelta::milliseconds(deal.hold as i64);
-            if let Some(ob1) = &last_ob1 && let Some(ob2) = &last_ob2
-                && (close_time < ob1.timestamp || close_time < ob2.timestamp)
-                && let Some(expected_price) = get_single_close_price(ob1, deal.direction) {
-                if !close_deal_sent {
-                    if let Err(err) = order_event_sender.send(OrderEvent {
-                        deal_id: deal.id,
-                        direction: deal.direction.reverse(),
-                        instrument_id: trade_instrument_id,
-                        quantity: 1,
-                        ticker: trade_instrument_ticker.clone(),
-                        expected_price,
-                    }).await {
-                        error!("Close order event send error {err}");
-                    } else {
-                        close_deal_sent = true;
-                    }
-                } else if ob1.timestamp.max(ob2.timestamp) > close_time + TimeDelta::seconds(10)
-                    && let Ok(mut deal) = active_deal.lock() {
-                    *deal = None;
-                }
-            }
-        } else {
-            if let Some((dir, hold)) = match signal {
-                TradeSignal::Sell1Buy2(hold) => Some((TradeDirection::Sell, hold)),
-                TradeSignal::Buy1Sell2(hold) => Some((TradeDirection::Buy, hold)),
-                _ => None,
-            } && let Some(ob1) = &last_ob1 && let Some(ob2) = &last_ob2
-                && let Some(expected_price) = get_single_open_price(ob1, dir) {
-                match db.start_deal(trade_instrument_id, dir, hold, Some(expected_price)).await {
-                    Ok(deal) => {
-                        info!("Start {deal:?}");
-                        close_deal_sent = false;
-                        let deal_id = deal.id;
-                        if let Ok(mut lock) = active_deal.lock() {
-                            *lock = Some(deal);
-                        }
-                        if let Err(err) = order_event_sender.send(OrderEvent {
-                            deal_id,
-                            direction: dir,
-                            instrument_id: trade_instrument_id,
-                            quantity: 1,
-                            ticker: trade_instrument_ticker.clone(),
-                            expected_price,
-                        }).await {
-                            error!("Open order event send error {err}");
-                        }
-                    }
-                    Err(err) => {
-                        error!("Failed to create deal: {err}");
-                    }
-                }
-            }
-        }
-    }
-    warn!("OrderBookEvent channel is closed");
-
-    Ok(())
-}
-
-fn get_single_open_price(ob: &OrderBook, direction: TradeDirection) -> Option<Decimal> {
-    match direction {
-        TradeDirection::Buy => lowest_price(&ob.asks),
-        TradeDirection::Sell => highest_price(&ob.bids),
-    }
 }
 
 fn get_single_close_price(ob: &OrderBook, direction: TradeDirection) -> Option<Decimal> {
