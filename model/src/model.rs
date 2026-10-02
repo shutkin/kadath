@@ -71,7 +71,7 @@ pub enum TradeDirection {
     Buy, Sell,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DealStatus {
     Opening,
     OpenConfirmed,
@@ -141,6 +141,7 @@ pub struct SpreadDeal {
     pub close_order_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Deal {
     pub id: i32,
     pub started: DateTime<Utc>,
@@ -160,7 +161,7 @@ pub struct Deal {
     pub leg2_close_order_id: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Trade {
     pub id: Option<i32>,
     pub order_id: String,

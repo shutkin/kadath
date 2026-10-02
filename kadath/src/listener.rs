@@ -1,5 +1,5 @@
 use crate::queue::Queue;
-use abstract_broker::BrokerListener;
+use abstract_broker::{AbstractBroker, BrokerBox};
 use chrono::Utc;
 use db::Db;
 use log::{debug, error, warn};
@@ -93,7 +93,7 @@ pub async fn listen(
     instruments: Vec<Instrument>,
     order_book_queue: Arc<Queue<OrderBookEvent>>,
     trade_queue: Arc<Queue<Trade>>,
-    broker: Arc<Box<dyn BrokerListener + Sync + Send>>,
+    broker: BrokerBox,
 ) -> EmptyResult {
     let mut instruments_map = HashMap::new();
     instruments.into_iter().for_each(|instrument| {
@@ -125,7 +125,7 @@ pub async fn listen(
     }
 }
 
-async fn listen_trades(db: Db, broker: Arc<Box<dyn BrokerListener + Sync + Send>>, trade_queue: Arc<Queue<Trade>>) -> EmptyResult {
+async fn listen_trades(db: Db, broker: Arc<Box<dyn AbstractBroker + Sync + Send>>, trade_queue: Arc<Queue<Trade>>) -> EmptyResult {
     let db_clone = db.clone();
     let (trades_sender, mut trades_receiver) = mpsc::channel(64);
     let h1 = tokio::spawn(async move {
@@ -154,7 +154,7 @@ fn start_listener(
     instruments: HashMap<i32, Instrument>,
     ticker: Arc<AtomicI64>,
     order_book_queue: Arc<Queue<OrderBookEvent>>,
-    broker: Arc<Box<dyn BrokerListener + Sync + Send>>,
+    broker: Arc<Box<dyn AbstractBroker + Sync + Send>>,
 ) {
     let (order_book_sender,
         mut order_book_receiver) = mpsc::channel::<OrderBookEvent>(64);

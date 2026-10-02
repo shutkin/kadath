@@ -437,19 +437,18 @@ impl Db {
         })
     }
     
-    pub async fn update_deal(&self, deal_id: i32, open_order_id: Option<String>, close_order_id: Option<String>) -> EmptyResult {
-        if let Some(open_order_id) = open_order_id {
-            sqlx::query("UPDATE spread_deal SET open_order_id = $1 WHERE id = $2")
-                .bind(open_order_id)
-                .bind(deal_id)
+    pub async fn update_deal(&self, deal: &Deal) -> EmptyResult {
+            sqlx::query("UPDATE spread_deal SET leg1_close_price_expected = $1, leg2_close_price_expected = $2, leg1_open_order_id = $3, leg2_open_order_id = $4, leg1_close_order_id = $5, leg1_close_order_id = $6, leg1_status = $7, leg2_status = $8 WHERE id = $9")
+                .bind(deal.leg1_close_price_expected)
+                .bind(deal.leg2_close_price_expected)
+                .bind(deal.leg1_open_order_id.clone())
+                .bind(deal.leg2_open_order_id.clone())
+                .bind(deal.leg1_close_order_id.clone())
+                .bind(deal.leg2_close_order_id.clone())
+                .bind(deal.leg1_status.get_code())
+                .bind(deal.leg2_status.get_code())
+                .bind(deal.id)
                 .execute(&self.pool).await?;
-        }
-        if let Some(close_order_id) = close_order_id {
-            sqlx::query("UPDATE spread_deal SET close_order_id = $1 WHERE id = $2")
-                .bind(close_order_id)
-                .bind(deal_id)
-                .execute(&self.pool).await?;
-        }
         Ok(())
     }
     

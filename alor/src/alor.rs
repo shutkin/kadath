@@ -1,4 +1,4 @@
-use abstract_broker::BrokerListener;
+use abstract_broker::{calculate_delta, AbstractBroker};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -208,7 +208,7 @@ pub struct Alor {
 }
 
 #[async_trait]
-impl BrokerListener for Alor {
+impl AbstractBroker for Alor {
     async fn get_instruments(&self) -> Result<Vec<Instrument>, CommonError> {
         let token = self.get_actual_access_token().await?;
 
@@ -378,6 +378,10 @@ impl BrokerListener for Alor {
         }
 
         Ok(())
+    }
+
+    async fn make_order(&self, _instrument: &Instrument, _direction: TradeDirection, _quantity: u16) -> Result<String, CommonError> {
+        Err("Not implemented yet".into())
     }
 }
 
@@ -574,27 +578,3 @@ async fn handle_order_book(context: &mut ListenerContext, api_order_book: &Order
     Ok(())
 }
 
-fn calculate_delta(prev_orders: &[OrderData], new_orders: &[OrderData]) -> Vec<OrderData> {
-    let mut delta = new_orders.iter()
-        .filter(|new| {
-            if let Some(prev) = prev_orders.iter().find(|prev| prev.price == new.price) {
-                prev.size != new.size
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    delta.extend(prev_orders.iter()
-        .filter_map(|prev| {
-            if new_orders.iter().any(|new| new.price == prev.price) {
-                None
-            } else {
-                Some(OrderData {
-                    price: prev.price,
-                    size: 0,
-                })
-            }
-        }));
-    delta
-}

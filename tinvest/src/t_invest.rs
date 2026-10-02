@@ -1,3 +1,8 @@
+mod debug_to_json;
+
+use crate::debug_to_json::debug_value_to_json;
+use abstract_broker::{AbstractBroker, calculate_delta};
+use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use log::{error, info, warn};
 use model::common::{CommonError, EmptyResult};
@@ -6,22 +11,20 @@ use model::{DataSource, Instrument, OrderBook, OrderData, Trade};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::ops::Add;
-use async_trait::async_trait;
 use t_invest_sdk::TInvestSdk;
-use t_invest_sdk::api::market_data_response::Payload;
-use t_invest_sdk::api::{market_data_request, InstrumentStatus, InstrumentsRequest, MarketDataRequest, OrderBookInstrument, OrderBookType, PingRequest, Quotation, SubscribeOrderBookRequest, SubscribeTradesRequest, SubscriptionAction, TradeInstrument, TradeSourceType, TradeDirection};
+use t_invest_sdk::api::{AccountStatus, GetAccountsRequest, InstrumentStatus, InstrumentsRequest, MarketDataRequest, MoneyValue, OrderBookInstrument, OrderBookType, OrderStateStreamRequest, OrderType, PingRequest, PostOrderAsyncRequest, Quotation, SubscribeOrderBookRequest, SubscriptionAction, TradeDirection, market_data_request};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Sender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use abstract_broker::BrokerListener;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct TInvest {
     sdk: TInvestSdk,
+    account_id: String,
 }
 
 #[async_trait]
-impl BrokerListener for TInvest {
+impl AbstractBroker for TInvest {
     async fn get_instruments(&self) -> Result<Vec<Instrument>, CommonError> {
         let futures_response = self.sdk
             .instruments()
@@ -44,11 +47,63 @@ impl BrokerListener for TInvest {
         Ok(instruments)
     }
 
-    async fn listen_trades(&self, trade_sender: Sender<Trade>) -> EmptyResult {
-        todo!()
+    async fn listen_trades(&self, trade_sender: mpsc::Sender<Trade>) -> EmptyResult {
+
+        let request = OrderStateStreamRequest {
+            accounts: vec![self.account_id.clone()],
+            ping_delay_millis: None,
+        };
+        let mut streaming = self.sdk.orders_stream()
+            .order_state_stream(request).await?
+            .into_inner();
+
+        while let Some(message) = streaming.message().await? {
+            if let Some(payload) = message.payload {
+                match payload {
+                    t_invest_sdk::api::order_state_stream_response::Payload::OrderState(state) => {
+                        if let Some(direction) = decode_trade_direction(state.direction) {
+                            let value = heuristic_debug_parser::parse(&format!("{state:?}"))?;
+                            let json_value = debug_value_to_json(value);
+                            let json = serde_json::to_string(&json_value)?;
+                            let trade = Trade {
+                                id: None,
+                                direction,
+                                executed: convert_timestamp(state.completion_time.map(|t|  (t.seconds, t.nanos))),
+                                price: state.executed_order_price.map(|m| convert_money(&m)).unwrap_or_default(),
+                                quantity: state.lots_executed as i16,
+                                order_id: state.order_request_id.unwrap_or_default(),
+                                json,
+                            };
+                            if let Err(err) = trade_sender.send(trade).await {
+                                warn!("Failed to send trade: {err}");
+                                break;
+                            }
+                        } else {
+                            warn!("Order State unknown direction {}", state.direction);
+                        }
+                    }
+                    t_invest_sdk::api::order_state_stream_response::Payload::Ping(ping) => {
+                        info!("Order State ping {ping:?}");
+                    }
+                    t_invest_sdk::api::order_state_stream_response::Payload::Subscription(subs) => {
+                        info!("Order State subscription response {subs:?}");
+                    }
+                    t_invest_sdk::api::order_state_stream_response::Payload::StopOrderState(state) => {
+                        info!("Stop Order state {state:?}");
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    async fn listen_order_books(&self, instruments: &[Instrument], order_book_sender: Sender<OrderBookEvent>, order_book_delta_sender: Sender<OrderBookDeltaEvent>) -> EmptyResult {
+    async fn listen_order_books(
+        &self,
+        instruments: &[Instrument],
+        order_book_sender: mpsc::Sender<OrderBookEvent>,
+        order_book_delta_sender: mpsc::Sender<OrderBookDeltaEvent>
+    ) -> EmptyResult {
         let mut uid_id_map = HashMap::with_capacity(instruments.len());
         for instrument in instruments {
             if let Some(uid) = &instrument.external_id && let Some(id) = instrument.id {
@@ -91,15 +146,15 @@ impl BrokerListener for TInvest {
         while let Some(message) = streaming.message().await? {
             if let Some(payload) = message.payload {
                 match payload {
-                    Payload::SubscribeOrderBookResponse(response) => {
+                    t_invest_sdk::api::market_data_response::Payload::SubscribeOrderBookResponse(response) => {
                         info!("Order book subscribe response: {response:?}");
                     }
-                    Payload::Orderbook(order_book) => {
+                    t_invest_sdk::api::market_data_response::Payload::Orderbook(order_book) => {
                         if let Err(err) = handle_order_book(&mut context, order_book).await {
                             error!("Error handling orderbook: {err}");
                         }
                     }
-                    Payload::Ping(ping) => {
+                    t_invest_sdk::api::market_data_response::Payload::Ping(ping) => {
                         let request = MarketDataRequest {
                             payload: Some(market_data_request::Payload::Ping(
                                 PingRequest {
@@ -117,14 +172,52 @@ impl BrokerListener for TInvest {
         }
         Ok(())
     }
+    
+    async fn make_order(&self, instrument: &Instrument, direction: model::TradeDirection, quantity: u16) -> Result<String, CommonError> {
+        let order_id = Uuid::new_v4().to_string();
+        let direction = match direction {
+            model::TradeDirection::Buy => TradeDirection::Buy as i32,
+            model::TradeDirection::Sell => TradeDirection::Sell as i32,
+        };
+        let rq = PostOrderAsyncRequest {
+            account_id: self.account_id.clone(),
+            instrument_id: instrument.external_id.clone().ok_or("Instrument has no external id")?,
+            order_id,
+            quantity: quantity as i64,
+            direction,
+            price: None,
+            price_type: None,
+            order_type: OrderType::Limit as i32,
+            time_in_force: None,
+            confirm_margin_trade: false,
+        };
+
+        let resp = self.sdk.orders().post_order_async(rq).await?.into_inner();
+        match resp.execution_report_status {
+            2 => Err("Order status REJECTED".into()),
+            3 => Err("Order status CANCELED".into()),
+            _ => Ok(resp.order_request_id),
+        }
+    }
 }
 
 impl TInvest {
     pub async fn new() -> Result<Self, CommonError> {
         let token = std::env::var("T_INVEST_TOKEN").expect("Expected a T_INVEST_TOKEN in the environment");
         let sdk = TInvestSdk::new_production(&token).await?;
-        info!("SDK initialized");
-        Ok(Self { sdk })
+        info!("T-Invest SDK initialized");
+
+        let accounts_rq = GetAccountsRequest {
+            status: Some(AccountStatus::Open as i32),
+        };
+        let accounts_resp = sdk.users().get_accounts(accounts_rq)
+            .await?.into_inner();
+        let account_id = accounts_resp.accounts.first().ok_or("Active account not found")?.id.clone();
+        for account in accounts_resp.accounts {
+            info!("Account {} id '{}'", account.name, account.id);
+        }
+
+        Ok(Self { sdk, account_id })
     }
 }
 
@@ -169,31 +262,6 @@ async fn handle_order_book(context: &mut ListenerContext, api_order_book: t_inve
     Ok(())
 }
 
-fn calculate_delta(prev_orders: &[OrderData], new_orders: &[OrderData]) -> Vec<OrderData> {
-    let mut delta = new_orders.iter()
-        .filter(|new| {
-            if let Some(prev) = prev_orders.iter().find(|prev| prev.price == new.price) {
-                prev.size != new.size
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    delta.extend(prev_orders.iter()
-        .filter_map(|prev| {
-            if new_orders.iter().any(|new| new.price == prev.price) {
-                None
-            } else {
-                Some(OrderData {
-                    price: prev.price,
-                    size: 0,
-                })
-            }
-        }));
-    delta
-}
-
 fn convert_order_book(order_book: &t_invest_sdk::api::OrderBook) -> OrderBook {
     OrderBook {
         id: None,
@@ -225,11 +293,16 @@ fn convert_quotation(quotation: &Quotation) -> Decimal {
         .add(Decimal::from_i128_with_scale(quotation.nano as i128, 9))
 }
 
-fn decode_trade_direction(dir: i32) -> Option<char> {
+fn convert_money(money_value: &MoneyValue) -> Decimal {
+    Decimal::from(money_value.units)
+        .add(Decimal::from_i128_with_scale(money_value.nano as i128, 9))
+}
+
+fn decode_trade_direction(dir: i32) -> Option<model::TradeDirection> {
     if TradeDirection::Buy as i32 == dir {
-        Some('b')
+        Some(model::TradeDirection::Buy)
     } else if TradeDirection::Sell as i32 == dir {
-        Some('s')
+        Some(model::TradeDirection::Sell)
     } else {
         None
     }
