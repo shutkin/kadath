@@ -16,6 +16,5 @@ t-invest-sdk = "0.17"
 rust_decimal = "1.43"
 chrono = "0.4"
 async-trait = "0.1"
-uuid = { version = "1.26", features = ["v4"] }
 heuristic_debug_parser = "0.4"
 serde_json = "1.0"

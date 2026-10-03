@@ -3,9 +3,10 @@ use abstract_broker::BrokerBox;
 use db::Db;
 use log::{error, info, warn};
 use model::common::EmptyResult;
-use model::{Deal, DealStatus, Instrument, Trade, TradeDirection};
+use model::{Deal, DealStatus, Instrument, Trade, TradeDirection, TradeStatus};
 use rust_decimal::Decimal;
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 #[derive(Default)]
 pub struct LastPrices {
@@ -33,20 +34,19 @@ impl KadathExecutor {
         tokio::spawn(async move {
             loop {
                 let trade = trades.pop().await;
-                info!("{trade:?}");
                 if let Some(mut deal) = if let Ok(lock) = cur_deal_clone.lock() {
                     lock.clone()
                 } else {
                     None
                 } {
                     if let Some(order_id) = &deal.leg1_open_order_id && order_id == &trade.order_id {
-                        deal.leg1_status = if trade.quantity > 0 {DealStatus::OpenConfirmed} else {DealStatus::OpenFailed}
+                        deal.leg1_status = if trade.status == TradeStatus::Executed {DealStatus::OpenConfirmed} else {DealStatus::OpenFailed}
                     } else if let Some(order_id) = &deal.leg2_open_order_id && order_id == &trade.order_id {
-                        deal.leg2_status = if trade.quantity > 0 {DealStatus::OpenConfirmed} else {DealStatus::OpenFailed}
+                        deal.leg2_status = if trade.status == TradeStatus::Executed {DealStatus::OpenConfirmed} else {DealStatus::OpenFailed}
                     } else if let Some(order_id) = &deal.leg1_close_order_id && order_id == &trade.order_id {
-                        deal.leg1_status = if trade.quantity > 0 {DealStatus::CloseConfirmed} else {DealStatus::CloseFailed}
+                        deal.leg1_status = if trade.status == TradeStatus::Executed {DealStatus::CloseConfirmed} else {DealStatus::CloseFailed}
                     } else if let Some(order_id) = &deal.leg2_close_order_id && order_id == &trade.order_id {
-                        deal.leg2_status = if trade.quantity > 0 {DealStatus::CloseConfirmed} else {DealStatus::CloseFailed}
+                        deal.leg2_status = if trade.status == TradeStatus::Executed {DealStatus::CloseConfirmed} else {DealStatus::CloseFailed}
                     } else {
                         warn!("Unknown order id: {}", trade.order_id);
                     }
@@ -106,11 +106,10 @@ impl KadathExecutor {
         ).await?;
 
         let deal = self.make_orders(deal, true).await;
-        self.db.update_deal(&deal).await?;
-
         if let Ok(cur_deal) = self.cur_deal.lock().as_mut() {
-            cur_deal.replace(deal);
+            cur_deal.replace(deal.clone());
         }
+        self.db.update_deal(&deal).await?;
 
         let self_clone = self.clone();
         tokio::spawn(async move {
@@ -140,6 +139,9 @@ impl KadathExecutor {
             }
 
             let deal = self.make_orders(deal, false).await;
+            if let Ok(cur_deal) = self.cur_deal.lock().as_mut() {
+                cur_deal.replace(deal.clone());
+            }
             if let Err(err) = self.db.update_deal(&deal).await {
                 error!("Error updating deal: {err:?}");
             }
@@ -148,9 +150,26 @@ impl KadathExecutor {
         }
     }
 
-    async fn make_orders(&self, deal: Deal, is_opening: bool) -> Deal {
+    async fn make_orders(&self, mut deal: Deal, is_opening: bool) -> Deal {
         let direction = if is_opening {deal.direction} else {deal.direction.reverse()};
         let original_deal = deal.clone();
+
+        let id1 = Uuid::new_v4().to_string();
+        let id2 = Uuid::new_v4().to_string();
+        if is_opening {
+            deal.leg1_open_order_id = Some(id1.clone());
+            deal.leg2_open_order_id = Some(id2.clone());
+        } else {
+            deal.leg1_close_order_id = Some(id1.clone());
+            deal.leg2_close_order_id = Some(id2.clone());
+        }
+        if let Ok(cur_deal) = self.cur_deal.lock().as_mut() {
+            cur_deal.replace(deal.clone());
+        }
+        if let Err(err) = self.db.update_deal(&deal).await {
+            error!("Error updating deal on make orders: {err:?}");
+        }
+
         let deal_mutex = Arc::new(Mutex::new(deal));
 
         let h1 = if is_opening || original_deal.leg1_status == DealStatus::OpenConfirmed {
@@ -158,7 +177,7 @@ impl KadathExecutor {
             let instrument = self.instruments[0].clone();
             let deal_clone = deal_mutex.clone();
             Some(tokio::spawn(async move {
-                match broker.make_order(&instrument, direction, 1).await {
+                match broker.make_order(&id1, &instrument, direction, 1).await {
                     Ok(order_id) => {
                         if let Ok(deal) = deal_clone.lock().as_mut() {
                             if is_opening {
@@ -185,7 +204,7 @@ impl KadathExecutor {
             let instrument = self.instruments[1].clone();
             let deal_clone = deal_mutex.clone();
             Some(tokio::spawn(async move {
-                match broker.make_order(&instrument, direction.reverse(), 1).await {
+                match broker.make_order(&id2, &instrument, direction.reverse(), 1).await {
                     Ok(order_id) => {
                         if let Ok(deal) = deal_clone.lock().as_mut() {
                             deal.leg2_open_order_id = Some(order_id);

@@ -161,6 +161,11 @@ pub struct Deal {
     pub leg2_close_order_id: Option<String>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TradeStatus {
+    Executed, Failed,
+}
+
 #[derive(Clone, Debug)]
 pub struct Trade {
     pub id: Option<i32>,
@@ -169,6 +174,7 @@ pub struct Trade {
     pub direction: TradeDirection,
     pub price: Decimal,
     pub quantity: i16,
+    pub status: TradeStatus,
     pub json: String,
 }
 

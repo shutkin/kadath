@@ -4,7 +4,7 @@ use crate::debug_to_json::debug_value_to_json;
 use abstract_broker::{AbstractBroker, calculate_delta};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use model::common::{CommonError, EmptyResult};
 use model::events::{OrderBookDeltaEvent, OrderBookEvent};
 use model::{DataSource, Instrument, OrderBook, OrderData, Trade};
@@ -12,10 +12,9 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::ops::Add;
 use t_invest_sdk::TInvestSdk;
-use t_invest_sdk::api::{AccountStatus, GetAccountsRequest, InstrumentStatus, InstrumentsRequest, MarketDataRequest, MoneyValue, OrderBookInstrument, OrderBookType, OrderStateStreamRequest, OrderType, PingRequest, PostOrderAsyncRequest, Quotation, SubscribeOrderBookRequest, SubscriptionAction, TradeDirection, market_data_request};
+use t_invest_sdk::api::{AccountStatus, GetAccountsRequest, GetInfoRequest, GetMarginAttributesRequest, GetTradingStatusRequest, InstrumentStatus, InstrumentsRequest, MarketDataRequest, MoneyValue, OrderBookInstrument, OrderBookType, OrderExecutionReportStatus, OrderStateStreamRequest, OrderType, PingRequest, PostOrderAsyncRequest, PriceType, Quotation, SubscribeOrderBookRequest, SubscriptionAction, TimeInForceType, TradeDirection, market_data_request};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct TInvest {
@@ -61,13 +60,14 @@ impl AbstractBroker for TInvest {
             if let Some(payload) = message.payload {
                 match payload {
                     t_invest_sdk::api::order_state_stream_response::Payload::OrderState(state) => {
-                        if let Some(direction) = decode_trade_direction(state.direction) {
+                        if let Some(direction) = decode_trade_direction(state.direction) && let Some(status) = decode_trade_status(state.execution_report_status) {
                             let value = heuristic_debug_parser::parse(&format!("{state:?}"))?;
                             let json_value = debug_value_to_json(value);
                             let json = serde_json::to_string(&json_value)?;
                             let trade = Trade {
                                 id: None,
                                 direction,
+                                status,
                                 executed: convert_timestamp(state.completion_time.map(|t|  (t.seconds, t.nanos))),
                                 price: state.executed_order_price.map(|m| convert_money(&m)).unwrap_or_default(),
                                 quantity: state.lots_executed as i16,
@@ -79,7 +79,7 @@ impl AbstractBroker for TInvest {
                                 break;
                             }
                         } else {
-                            warn!("Order State unknown direction {}", state.direction);
+                            debug!("Order State unknown direction {} or status {}", state.direction, state.execution_report_status);
                         }
                     }
                     t_invest_sdk::api::order_state_stream_response::Payload::Ping(ping) => {
@@ -112,6 +112,7 @@ impl AbstractBroker for TInvest {
         }
         let subs = uid_id_map.keys()
             .map(|uid| {
+                #[allow(deprecated)]
                 OrderBookInstrument {
                     instrument_id: uid.clone(),
                     depth: 50,
@@ -173,26 +174,28 @@ impl AbstractBroker for TInvest {
         Ok(())
     }
     
-    async fn make_order(&self, instrument: &Instrument, direction: model::TradeDirection, quantity: u16) -> Result<String, CommonError> {
-        let order_id = Uuid::new_v4().to_string();
+    async fn make_order(&self, internal_id: &str, instrument: &Instrument, direction: model::TradeDirection, quantity: u16) -> Result<String, CommonError> {
         let direction = match direction {
             model::TradeDirection::Buy => TradeDirection::Buy as i32,
             model::TradeDirection::Sell => TradeDirection::Sell as i32,
         };
+
         let rq = PostOrderAsyncRequest {
             account_id: self.account_id.clone(),
             instrument_id: instrument.external_id.clone().ok_or("Instrument has no external id")?,
-            order_id,
+            order_id: internal_id.to_string(),
             quantity: quantity as i64,
             direction,
             price: None,
-            price_type: None,
-            order_type: OrderType::Limit as i32,
-            time_in_force: None,
-            confirm_margin_trade: false,
+            price_type: Some(PriceType::Unspecified as i32),
+            order_type: OrderType::Market as i32,
+            time_in_force: Some(TimeInForceType::TimeInForceUnspecified as i32),
+            confirm_margin_trade: true,
         };
 
+        info!("Post request {rq:?}");
         let resp = self.sdk.orders().post_order_async(rq).await?.into_inner();
+        info!("Response {resp:?}");
         match resp.execution_report_status {
             2 => Err("Order status REJECTED".into()),
             3 => Err("Order status CANCELED".into()),
@@ -212,10 +215,26 @@ impl TInvest {
         };
         let accounts_resp = sdk.users().get_accounts(accounts_rq)
             .await?.into_inner();
+        info!("Account {accounts_resp:?}");
         let account_id = accounts_resp.accounts.first().ok_or("Active account not found")?.id.clone();
-        for account in accounts_resp.accounts {
-            info!("Account {} id '{}'", account.name, account.id);
-        }
+
+        let info_rq = GetInfoRequest {};
+        let info = sdk.users().get_info(info_rq).await?.into_inner();
+        info!("Info {info:?}");
+
+        #[allow(deprecated)]
+        let status_rq = GetTradingStatusRequest {
+            instrument_id: Some("312c293a-462d-4684-a8e2-882255c44f2e".to_string()),
+            figi: None,
+        };
+        let status = sdk.market_data().get_trading_status(status_rq).await?.into_inner();
+        info!("Trading status: {status:?}");
+
+        let margin_rq = GetMarginAttributesRequest {
+            account_id: account_id.clone(),
+        };
+        let margin = sdk.users().get_margin_attributes(margin_rq).await?.into_inner();
+        info!("Margin attributes: {margin:?}");
 
         Ok(Self { sdk, account_id })
     }
@@ -303,6 +322,16 @@ fn decode_trade_direction(dir: i32) -> Option<model::TradeDirection> {
         Some(model::TradeDirection::Buy)
     } else if TradeDirection::Sell as i32 == dir {
         Some(model::TradeDirection::Sell)
+    } else {
+        None
+    }
+}
+
+fn decode_trade_status(status: i32) -> Option<model::TradeStatus> {
+    if OrderExecutionReportStatus::ExecutionReportStatusFill as i32 == status {
+        Some(model::TradeStatus::Executed)
+    } else if OrderExecutionReportStatus::ExecutionReportStatusRejected as i32 == status || OrderExecutionReportStatus::ExecutionReportStatusCancelled as i32 == status {
+        Some(model::TradeStatus::Failed)
     } else {
         None
     }

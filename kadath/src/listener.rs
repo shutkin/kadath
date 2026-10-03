@@ -38,7 +38,7 @@ impl ListenerHandler {
             if let Ok(mut lock) = self.order_books.lock() {
                 lock.insert(event.instrument_id, event.order_book);
             } else {
-                error!("Failed to lock order books");
+                error!("Failed to lock order books on snapshot");
             }
         }
     }
@@ -61,7 +61,7 @@ impl ListenerHandler {
                     save_full = true;
                 }
             } else {
-                error!("Failed to lock order books");
+                error!("Failed to lock order books on delta");
             }
 
             if let Some(order_book) = updated_order_book {

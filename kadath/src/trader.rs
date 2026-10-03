@@ -56,9 +56,15 @@ impl KadathTrader {
     }
     
     pub async fn run(&self) -> EmptyResult {
+        if let Err(err) = self.run_calibration() {
+            error!("Failed to run calibration task: {err}");
+        }
+
         let mut window_data = WindowData::new();
         self.consume_history(&mut window_data).await?;
         self.model.calibrate(false);
+
+        let mut deals = 0;
 
         loop {
             let event = self.queue.pop().await;
@@ -73,8 +79,8 @@ impl KadathTrader {
                 }
             }
             
-            let signal = self.model.process(&mut window_data, &event);
-            
+            let mut signal = self.model.process(&mut window_data, &event);
+
             if !self.executor.has_active_deal() {
                 match signal {
                     TradeSignal::None => {}
@@ -82,12 +88,18 @@ impl KadathTrader {
                         info!("Sell1 Buy2 hold: {hold:?}");
                         if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold).await {
                             error!("error opening deal: {err}");
+                        } else {
+                            deals += 1;
+                            info!("Deals: {deals}");
                         }
                     }
                     TradeSignal::Buy1Sell2(hold) => {
                         info!("Buy1 Sell2 hold: {hold:?}");
                         if let Err(err) = self.executor.open_deal(TradeDirection::Buy, hold).await {
                             error!("error opening deal: {err}");
+                        } else {
+                            deals += 1;
+                            info!("Deals: {deals}");
                         }
                     }
                 }
@@ -107,6 +119,7 @@ impl KadathTrader {
         for event in events {
             self.model.process(window_data, &event);
         }
+        info!("History events consumed");
 
         Ok(())
     }

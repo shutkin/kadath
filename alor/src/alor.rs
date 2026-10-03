@@ -6,7 +6,7 @@ use jsonwebtoken::dangerous::insecure_decode_claims;
 use log::{error, info, warn};
 use model::common::{CommonError, EmptyResult};
 use model::events::{OrderBookDeltaEvent, OrderBookEvent, OrderEvent};
-use model::{DataSource, Instrument, OrderBook, OrderData, Trade, TradeDirection};
+use model::{DataSource, Instrument, OrderBook, OrderData, Trade, TradeDirection, TradeStatus};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,10 +18,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 use yawc::{Frame, MaybeTlsStream, OpCode, WebSocket};
 
-const ACCESS_TOKEN_URL: &str = "https://oauthdev.alor.ru/refresh";
-const API_ROOT: &str = "https://apidev.alor.ru/md/v2";
-const WS_SUBSCRIBE_URL: &str = "wss://apidev.alor.ru/ws";
-const WS_COMMAND_URL: &str = "wss://apidev.alor.ru/cws";
+const ACCESS_TOKEN_URL: &str = "https://oauth.alor.ru/refresh";
+const API_ROOT: &str = "https://api.alor.ru/md/v2";
+const WS_SUBSCRIBE_URL: &str = "wss://api.alor.ru/ws";
+const WS_COMMAND_URL: &str = "wss://api.alor.ru/cws";
 
 const INSTRUMENTS_LIMIT: usize = 100;
 
@@ -289,6 +289,7 @@ impl AbstractBroker for Alor {
                         Ok(msg) => {
                             let trade = Trade {
                                 id: None,
+                                status: TradeStatus::Executed,
                                 order_id: msg.data.eid,
                                 executed: msg.data.d,
                                 direction: if msg.data.s == "buy" {TradeDirection::Buy} else {TradeDirection::Sell},
@@ -380,7 +381,7 @@ impl AbstractBroker for Alor {
         Ok(())
     }
 
-    async fn make_order(&self, _instrument: &Instrument, _direction: TradeDirection, _quantity: u16) -> Result<String, CommonError> {
+    async fn make_order(&self, _internal_id: &str, _instrument: &Instrument, _direction: TradeDirection, _quantity: u16) -> Result<String, CommonError> {
         Err("Not implemented yet".into())
     }
 }

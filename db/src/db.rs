@@ -63,7 +63,7 @@ impl Prices {
         if let Some(id) = self.prices_map.read().map_err(|err| format!("{err}"))?.get(&price) {
             Ok(*id)
         } else {
-            info!("Insert new price value {price}");
+            debug!("Insert new price value {price}");
             let id_row = sqlx::query("INSERT INTO price (price) VALUES ($1) RETURNING id")
                 .bind(price)
                 .fetch_one(pool)
@@ -127,7 +127,8 @@ impl Db {
             }
 
             info!("Insert {:?}", instrument);
-            let id_row = sqlx::query("INSERT INTO instrument (ticker, name, lot_size, external_id) VALUES ($1, $2, $3, $4) RETURNING id")
+            let id_row = sqlx::query("INSERT INTO instrument (source, ticker, name, lot_size, external_id) VALUES ($1, $2, $3, $4, $5) RETURNING id")
+                .bind(instrument.source.get_code())
                 .bind(instrument.ticker.clone())
                 .bind(instrument.name.clone())
                 .bind(instrument.lot_size)
@@ -438,7 +439,7 @@ impl Db {
     }
     
     pub async fn update_deal(&self, deal: &Deal) -> EmptyResult {
-            sqlx::query("UPDATE spread_deal SET leg1_close_price_expected = $1, leg2_close_price_expected = $2, leg1_open_order_id = $3, leg2_open_order_id = $4, leg1_close_order_id = $5, leg1_close_order_id = $6, leg1_status = $7, leg2_status = $8 WHERE id = $9")
+            sqlx::query("UPDATE deal SET leg1_close_price_expected = $1, leg2_close_price_expected = $2, leg1_open_order_id = $3, leg2_open_order_id = $4, leg1_close_order_id = $5, leg2_close_order_id = $6, leg1_status = $7, leg2_status = $8 WHERE id = $9")
                 .bind(deal.leg1_close_price_expected)
                 .bind(deal.leg2_close_price_expected)
                 .bind(deal.leg1_open_order_id.clone())

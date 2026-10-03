@@ -18,7 +18,7 @@ pub trait AbstractBroker {
         order_book_delta_sender: mpsc::Sender<OrderBookDeltaEvent>,
     ) -> EmptyResult;
 
-    async fn make_order(&self, instrument: &Instrument, direction: TradeDirection, quantity: u16) -> Result<String, CommonError>;
+    async fn make_order(&self, internal_id: &str, instrument: &Instrument, direction: TradeDirection, quantity: u16) -> Result<String, CommonError>;
 }
 
 pub fn calculate_delta(prev_orders: &[OrderData], new_orders: &[OrderData]) -> Vec<OrderData> {
