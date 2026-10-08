@@ -91,6 +91,22 @@ impl SignalCalculator {
         map.insert("score".to_string(), self.performance.training_total_pnl);
         map
     }
+    
+    pub fn from_params_map(map: &HashMap<String, f64>) -> Option<Self> {
+        Some(Self {
+            hold_time_ms: map.get("hold").copied()? as u16,
+            threshold: map.get("threshold").copied()?,
+            derivative1_weight: map.get("d1").copied()?,
+            derivative2_weight: map.get("d2").copied()?,
+            imbalance1_weights: IMBALANCE_LEVELS.iter()
+                .map(|level| map.get(&format!("i1_{level}")).copied().unwrap_or_default())
+                .collect::<Vec<f64>>().try_into().ok()?,
+            imbalance2_weights: IMBALANCE_LEVELS.iter()
+                .map(|level| map.get(&format!("i2_{level}")).copied().unwrap_or_default())
+                .collect::<Vec<f64>>().try_into().ok()?,
+            performance: SignalPerformance::default(),
+        })
+    }
 }
 
 #[derive(Copy, Clone, Debug)]

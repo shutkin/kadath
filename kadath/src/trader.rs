@@ -29,7 +29,7 @@ impl KadathTrader {
         db: Db,
         trades: Arc<Queue<Trade>>,
     ) -> Self {
-        let config = ModelConfig { std_diapason_s: 1184, train_data_minutes: 22, train_interval_minutes: 1, decay_time: 40.90421962773701, fixed_hold_time: None };
+        let config = ModelConfig { std_diapason_s: 1211, train_data_minutes: 42, train_interval_minutes: 1, decay_time: 12.406388913778208, fixed_hold_time: None };
         let model = WalkForwardModel::new_with_config(instruments[0].id.unwrap(), instruments[1].id.unwrap(), config);
         
         let last_prices = Arc::new(Mutex::new(LastPrices::default()));
@@ -64,44 +64,58 @@ impl KadathTrader {
         self.consume_history(&mut window_data).await?;
         self.model.calibrate(false);
 
+        let mut online_events = 0;
         let mut deals = 0;
 
         loop {
             let event = self.queue.pop().await;
-            
+
+            let mut last_prices_copy = None;
             if let Ok(last_prices) = self.last_prices.lock().as_mut() {
                 if event.instrument_id == self.inst1_id() {
+                    last_prices.leg1_time = event.order_book.timestamp;
                     last_prices.leg1_ask = lowest_price(&event.order_book.asks);
                     last_prices.leg1_bid = highest_price(&event.order_book.bids);
                 } else if event.instrument_id == self.inst2_id() {
+                    last_prices.leg2_time = event.order_book.timestamp;
                     last_prices.leg2_ask = lowest_price(&event.order_book.asks);
                     last_prices.leg2_bid = highest_price(&event.order_book.bids);
                 }
+                last_prices_copy = Some(last_prices.clone());
             }
             
-            let mut signal = self.model.process(&mut window_data, &event);
-
-            if !self.executor.has_active_deal() {
-                match signal {
-                    TradeSignal::None => {}
-                    TradeSignal::Sell1Buy2(hold) => {
-                        info!("Sell1 Buy2 hold: {hold:?}");
-                        if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold).await {
-                            error!("error opening deal: {err}");
-                        } else {
-                            deals += 1;
-                            info!("Deals: {deals}");
+            let signal = self.model.process(&mut window_data, &event);
+            if online_events < 1024 {
+                online_events += 1;
+            } else {
+                if online_events == 1024 {
+                    info!("Start trading");
+                    online_events += 1;
+                }
+                if !self.executor.has_active_deal() {
+                    match signal {
+                        TradeSignal::None => {}
+                        TradeSignal::Sell1Buy2(hold) => {
+                            info!("Sell1 Buy2 hold: {hold:?}");
+                            if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold).await {
+                                error!("error opening deal: {err}");
+                            } else {
+                                deals += 1;
+                                info!("Deals: {deals}");
+                            }
+                        }
+                        TradeSignal::Buy1Sell2(hold) => {
+                            info!("Buy1 Sell2 hold: {hold:?}");
+                            if let Err(err) = self.executor.open_deal(TradeDirection::Buy, hold).await {
+                                error!("error opening deal: {err}");
+                            } else {
+                                deals += 1;
+                                info!("Deals: {deals}");
+                            }
                         }
                     }
-                    TradeSignal::Buy1Sell2(hold) => {
-                        info!("Buy1 Sell2 hold: {hold:?}");
-                        if let Err(err) = self.executor.open_deal(TradeDirection::Buy, hold).await {
-                            error!("error opening deal: {err}");
-                        } else {
-                            deals += 1;
-                            info!("Deals: {deals}");
-                        }
-                    }
+                } else if let Some(last_prices) = last_prices_copy {
+                    self.executor.try_close_deal(last_prices).await;
                 }
             }
         }
@@ -117,7 +131,11 @@ impl KadathTrader {
         let events = merge_events(&[self.inst1_id(), self.inst2_id()], &[ob1, ob2]);
         info!("Got {} history events", events.len());
         for event in events {
-            self.model.process(window_data, &event);
+            if !event.order_book.asks.is_empty() && !event.order_book.bids.is_empty() {
+                self.model.process(window_data, &event);
+            } else {
+                warn!("Order book {} is empty", event.order_book.id.unwrap_or_default());
+            }
         }
         info!("History events consumed");
 

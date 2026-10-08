@@ -54,7 +54,6 @@ create table spread_deal
 );
 create index on spread_deal (started);
 
-drop table deal;
 create table deal
 (
     id serial,

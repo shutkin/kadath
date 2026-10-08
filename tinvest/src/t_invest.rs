@@ -83,7 +83,7 @@ impl AbstractBroker for TInvest {
                         }
                     }
                     t_invest_sdk::api::order_state_stream_response::Payload::Ping(ping) => {
-                        info!("Order State ping {ping:?}");
+                        debug!("Order State ping {ping:?}");
                     }
                     t_invest_sdk::api::order_state_stream_response::Payload::Subscription(subs) => {
                         info!("Order State subscription response {subs:?}");

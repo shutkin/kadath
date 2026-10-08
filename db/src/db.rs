@@ -478,6 +478,20 @@ impl Db {
         Ok(())
     }
 
+    pub async fn get_signal_calculators(&self, diapason: TimeDiapason) -> Result<Vec<SignalCalculatorLog>, CommonError> {
+        let rows = sqlx::query("SELECT trained_on, up_score, up_params, down_score, down_params FROM signal_calculator WHERE trained_on BETWEEN $1 AND $2")
+            .bind(diapason.from)
+            .bind(diapason.to)
+            .fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| SignalCalculatorLog {
+            trained_on: row.get(0),
+            up_score: row.get(1),
+            up_params: row.get(2),
+            down_score: row.get(3),
+            down_params: row.get(4),
+        }).collect())
+    }
+
     pub async fn get_order_books_ids(&self, from: DateTime<Utc>, to: DateTime<Utc>, limit: i32)
                                      -> Result<Vec<i64>, CommonError> {
         let ids = sqlx::query("SELECT id FROM order_book WHERE created BETWEEN $1 AND $2 LIMIT $3")

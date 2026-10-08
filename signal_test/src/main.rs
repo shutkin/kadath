@@ -11,6 +11,7 @@ use signal::strategy_optimizer::StrategyOptimizer;
 use signal::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use simplelog::SimpleLogger;
 use model::math_util::{mean, median, p10_p90, standard_deviation};
+use signal::signal_calculator::{CalculatorsPair, SignalCalculator};
 
 #[derive(Copy, Clone)]
 struct TestDeal {
@@ -138,7 +139,7 @@ struct TestContext {
 }
 
 #[tokio::main]
-async fn _main() -> EmptyResult {
+async fn __main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
@@ -153,10 +154,10 @@ async fn _main() -> EmptyResult {
         find_instrument_id(&all_instruments, tickers[1]),
     ) {
         let mut diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-09-25T05:00:00Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-09-25T20:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-06T05:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-06T20:00:00Z")?.to_utc(),
         );
-        let end = DateTime::parse_from_rfc3339("2026-09-26T00:00:00Z")?.to_utc();
+        let end = DateTime::parse_from_rfc3339("2026-10-07T00:00:00Z")?.to_utc();
 
         let mut all_events = Vec::new();
 
@@ -183,7 +184,7 @@ async fn _main() -> EmptyResult {
 }
 
 #[tokio::main]
-async fn main() -> EmptyResult {
+async fn _main() -> EmptyResult {
     const INST1_ID: i32 = 26;
     const INST2_ID: i32 = 121;
     const TICKERS: [&str; 2] = ["GLZ6", "GLH7"];
@@ -194,8 +195,8 @@ async fn main() -> EmptyResult {
     let db = Db::new(&db_url).await?;
 
     let diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-09-25T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-09-25T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-06T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-06T20:00:00Z")?.to_utc(),
     );
     let (alor1, alor2) = get_order_books(&TICKERS, &[INST1_ID, INST2_ID], diapason, Some(&db)).await?;
     let alor_events = merge_events(&[INST1_ID, INST2_ID], &[alor1, alor2]);
@@ -292,7 +293,7 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
 }
 
 #[tokio::main]
-async fn __main() -> EmptyResult {
+async fn main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
@@ -300,22 +301,22 @@ async fn __main() -> EmptyResult {
 
     let tickers = ["GLZ6", "GLH7"];
 
-    let all_instruments = db.get_instruments(DataSource::Alor).await?;
+    let all_instruments = db.get_instruments(DataSource::TInvest).await?;
     if let (Some(inst1_id), Some(inst2_id)) = (
         find_instrument_id(&all_instruments, tickers[0]),
         find_instrument_id(&all_instruments, tickers[1]),
     ) {
         //let config = ModelConfig { std_diapason_s: 1195, train_data_minutes: 52, train_interval_minutes: 1, decay_time: 21.273781754192633, fixed_hold_time: None };
-        let config = ModelConfig { std_diapason_s: 1184, train_data_minutes: 22, train_interval_minutes: 1, decay_time: 40.90421962773701, fixed_hold_time: None };
-        let model = WalkForwardModel::new_with_config(0, 1, config);
+        let config = ModelConfig { std_diapason_s: 1257, train_data_minutes: 50, train_interval_minutes: 1, decay_time: 15.789609053497927, fixed_hold_time: None };
+        let model = WalkForwardModel::new_with_config(inst1_id, inst2_id, config);
         let mut window_data = WindowData::new();
 
         let mut diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-09-25T05:00:00Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-09-25T20:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-07T05:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-07T20:00:00Z")?.to_utc(),
         );
         //let end = Utc::now();
-        let end = DateTime::parse_from_rfc3339("2026-09-26T00:00:00Z")?.to_utc();
+        let end = DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")?.to_utc();
 
         let (mut total_income, mut total_outcome, mut total_commission) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
         let mut active_deal = Option::<TestDeal>::None;
@@ -329,32 +330,37 @@ async fn __main() -> EmptyResult {
                 let (order_books1, order_books2) = get_order_books(&tickers, &[inst1_id, inst2_id], diapason, Some(&db)).await?;
                 info!("{} {} order books, {} {} order books", order_books1.len(), tickers[0], order_books2.len(), tickers[1]);
 
-                let order_books1_alt = load_alt_order_books("GLZ6.json")?;
-                let order_books2_alt = load_alt_order_books("GLH7.json")?;
-                info!("{} {} alternative order books, {} {} alternative order books", order_books1_alt.len(), tickers[0], order_books2_alt.len(), tickers[1]);
+                let calculators = get_calculators(&db, diapason).await?;
+                info!("{} signal calculators", calculators.len());
 
-                let events = merge_events(&[inst1_id, inst2_id, 0, 1], &[order_books1, order_books2, order_books1_alt, order_books2_alt]);
+                //let order_books1_alt = load_alt_order_books("GLZ6.json")?;
+                //let order_books2_alt = load_alt_order_books("GLH7.json")?;
+                //info!("{} {} alternative order books, {} {} alternative order books", order_books1_alt.len(), tickers[0], order_books2_alt.len(), tickers[1]);
+
+                let events = merge_events(&[inst1_id, inst2_id], &[order_books1, order_books2]);
                 info!("Total events: {}", events.len());
 
+                let mut cur_calculator_index = 0;
                 let mut prev_hour = events[0].order_book.timestamp.hour();
                 let (mut last_ob1, mut last_ob2) = (None, None);
                 for (i, event) in events.iter().enumerate() {
                     if event.order_book.timestamp.hour() != prev_hour {
                         prev_hour = event.order_book.timestamp.hour();
-                        info!("Hour {prev_hour}");
+                        info!("Hour {prev_hour} PnL {}", daily_income - daily_outcome);
                     }
 
-                    let trade_signal = if event.instrument_id == 0 || event.instrument_id == 1 {
-                        model.calibrate(true);
-                        model.process(&mut window_data, event)
+                    if calculators.len() > cur_calculator_index + 1
+                        && event.order_book.timestamp > calculators[cur_calculator_index + 1].get_created_on() - TimeDelta::seconds(15) {
+                        cur_calculator_index += 1;
+                    }
+                    if event.order_book.timestamp <= calculators[cur_calculator_index].get_created_on() + TimeDelta::minutes(1) - TimeDelta::seconds(15) {
+                        model.set_calculator(Some(calculators[cur_calculator_index].clone()));
                     } else {
-                        TradeSignal::None
-                    };
-                    let _trade_signal = match trade_signal {
-                        TradeSignal::None => TradeSignal::None,
-                        TradeSignal::Buy1Sell2(hold) => TradeSignal::Sell1Buy2(hold),
-                        TradeSignal::Sell1Buy2(hold) => TradeSignal::Buy1Sell2(hold),
-                    };
+                        model.set_calculator(Some(CalculatorsPair::new(None, None, event.order_book.timestamp)));
+                    }
+
+                    //model.calibrate(true);
+                    let trade_signal = model.process(&mut window_data, event);
 
                     if event.instrument_id == inst1_id {
                         last_ob1 = Some(event.order_book.clone());
@@ -558,4 +564,21 @@ pub struct OrderBookAlt {
 pub struct OrderDataAlt {
     pub price: Decimal,
     pub size: Decimal,
+}
+
+async fn get_calculators(db: &Db, diapason: TimeDiapason) -> Result<Vec<CalculatorsPair>, CommonError> {
+    let logs = db.get_signal_calculators(diapason).await?;
+    Ok(logs.into_iter().map(|log| {
+        let up = if let Some(up_params) = &log.up_params {
+            let map = serde_json::from_str(up_params).unwrap();
+            SignalCalculator::from_params_map(&map)
+        } else { None };
+
+        let down = if let Some(down_params) = &log.down_params {
+            let map = serde_json::from_str(down_params).unwrap();
+            SignalCalculator::from_params_map(&map)
+        } else { None };
+
+        CalculatorsPair::new(up, down, log.trained_on)
+    }).collect())
 }

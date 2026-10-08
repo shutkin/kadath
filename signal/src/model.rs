@@ -8,7 +8,7 @@ use crate::optimizer::calibrate_signal_calculator;
 use crate::orderbook_values::{Leg, OrderBookValues, WindowValuesCalculator};
 use crate::signal_calculator::{CalculatorsPair, PairPerformance, SignalCalculator};
 use chrono::{TimeDelta, Utc};
-use log::debug;
+use log::{debug, info};
 use model::events::OrderBookEvent;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -211,6 +211,12 @@ impl WalkForwardModel {
         }
 
         response
+    }
+    
+    pub fn set_calculator(&self, calculator: Option<CalculatorsPair>) {
+        if let Ok(mut write) = self.calculator.write() {
+            *write = calculator;
+        }
     }
 
     fn shrink_buffer(&self) {
