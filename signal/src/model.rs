@@ -8,10 +8,11 @@ use crate::optimizer::calibrate_signal_calculator;
 use crate::orderbook_values::{Leg, OrderBookValues, WindowValuesCalculator};
 use crate::signal_calculator::{CalculatorsPair, PairPerformance, SignalCalculator};
 use chrono::{TimeDelta, Utc};
-use log::{debug, info};
+use log::{debug, error, info};
 use model::events::OrderBookEvent;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use model::common::EmptyResult;
 
 const MAX_WINDOW_LENGTH_S: i64 = 2000;
 const TRAIN_DATA_MINUTES: u16 = 45;
@@ -188,6 +189,12 @@ impl WalkForwardModel {
 
         let buf_up = self.buffer.lock().map(|b| b.clone()).unwrap_or_default();
         let buf_down = buf_up.clone();
+        let leg1_size = buf_up.iter().filter(|event| matches!(event.leg, Leg::First)).count();
+        let leg2_size = buf_up.iter().filter(|event| matches!(event.leg, Leg::Second)).count();
+        debug!("Calibrate on {} events ({leg1_size}, {leg2_size}) from {} to {}", buf_up.len(), buf_up[0].time, buf_up[buf_up.len() - 1].time);
+        //if let Err(err) = Self::save_buf_csv(&buf_up) {
+        //    error!("Failed to save calibration buffer csv: {err}");
+        //}
         let thread_up = thread::spawn(move || {
             calibrate_signal_calculator(&buf_up, true, decay_time, fixed_hold_time)
         });
@@ -231,5 +238,38 @@ impl WalkForwardModel {
                 buffer.drain(0..to_delete);
             }
         }
+    }
+
+    fn save_buf_csv(buf: &[OrderBookValues]) -> EmptyResult {
+        let mut csv = Vec::new();
+        csv.push("time, leg1 mid, leg1 derivative, leg1 i3, leg1 i5, leg1 i10, leg1 i20, leg1 i50, leg2 mid, leg2 derivative, leg2 i3, leg2 i5, leg2 i10, leg2 i20, leg2 i50".to_string());
+        for v in buf {
+            if matches!(v.leg, Leg::First) {
+                csv.push(format!("{}, {}, {}, {}, {}, {}, {}, {},,,,,,,",
+                                 v.time,
+                                 v.mid(),
+                                 v.normal_derivative,
+                                 v.imbalances[0],
+                                 v.imbalances[1],
+                                 v.imbalances[2],
+                                 v.imbalances[3],
+                                 v.imbalances[4],
+                ));
+            } else {
+                csv.push(format!("{},,,,,,,,{}, {}, {}, {}, {}, {}, {}",
+                                 v.time,
+                                 v.mid(),
+                                 v.normal_derivative,
+                                 v.imbalances[0],
+                                 v.imbalances[1],
+                                 v.imbalances[2],
+                                 v.imbalances[3],
+                                 v.imbalances[4],
+                ));
+            }
+        }
+        let filename = format!("h_buf_{}.csv", buf[0].time.timestamp());
+        std::fs::write(&filename, csv.join("\n"))?;
+        Ok(())
     }
 }

@@ -320,7 +320,6 @@ impl AbstractBroker for Alor {
         &self,
         instruments: &[Instrument],
         order_book_sender: mpsc::Sender<OrderBookEvent>,
-        order_book_delta_sender: mpsc::Sender<OrderBookDeltaEvent>,
     ) -> EmptyResult {
         let token = self.get_actual_access_token().await?;
 
@@ -350,7 +349,6 @@ impl AbstractBroker for Alor {
         let mut context = ListenerContext {
             order_books: HashMap::new(),
             order_book_sender,
-            order_book_delta_sender,
         };
 
         while let Some(frame) = ws.next().await {
@@ -528,7 +526,6 @@ impl Alor {
 struct ListenerContext {
     order_books: HashMap<i32, OrderBook>,
     order_book_sender: mpsc::Sender<OrderBookEvent>,
-    order_book_delta_sender: mpsc::Sender<OrderBookDeltaEvent>,
 }
 
 fn convert_order_book(api_order_book: &OrderBookData) -> Option<OrderBook> {
@@ -546,33 +543,11 @@ fn convert_order_book(api_order_book: &OrderBookData) -> Option<OrderBook> {
 
 async fn handle_order_book(context: &mut ListenerContext, api_order_book: &OrderBookData, instrument_id: i32) -> EmptyResult {
     if let Some(new_order_book) = convert_order_book(api_order_book) {
-        let mut prev_order_book = OrderBook {
-            id: None,
-            timestamp: new_order_book.timestamp,
-            asks: Vec::new(),
-            bids: Vec::new(),
-        };
-        if let Some(order_books) = context.order_books.get(&instrument_id) {
-            prev_order_book = order_books.clone();
-        }
-        if prev_order_book.asks.is_empty() || prev_order_book.bids.is_empty() {
-            if let Err(err) = context.order_book_sender.send(OrderBookEvent {
-                instrument_id,
-                order_book: new_order_book.clone(),
-            }).await {
-                error!("Failed to send order book event: {err}");
-            }
-        } else {
-            let ask_delta = calculate_delta(&prev_order_book.asks, &new_order_book.asks);
-            let bid_delta = calculate_delta(&prev_order_book.bids, &new_order_book.bids);
-            if let Err(err) = context.order_book_delta_sender.send(OrderBookDeltaEvent {
-                instrument_id,
-                timestamp: new_order_book.timestamp,
-                asks: ask_delta,
-                bids: bid_delta,
-            }).await {
-                error!("Failed to send order book delta event: {err}");
-            }
+        if let Err(err) = context.order_book_sender.send(OrderBookEvent {
+            instrument_id,
+            order_book: new_order_book.clone(),
+        }).await {
+            error!("Failed to send order book event: {err}");
         }
         context.order_books.insert(instrument_id, new_order_book);
     }

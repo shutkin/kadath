@@ -18,6 +18,17 @@ create table order_book
 create index on order_book (created);
 create index on order_book (instrument_id);
 
+create table order_book_full
+(
+    id            bigserial,
+    created       timestamp with time zone default now() not null,
+    instrument_id integer not null,
+    ask     bytea,
+    bid     bytea
+);
+create index on order_book_full (created);
+create index on order_book_full (instrument_id);
+
 create table order_book_ask
 (
     order_book_id bigint,
@@ -103,3 +114,17 @@ alter table instrument add column source char default 'A' not null;
 comment on column instrument.source is 'A - Alor, T - T-Invest';
 
 alter table instrument add column external_id varchar;
+
+alter table signal_calculator add column train_time_ms int;
+
+create table signal_calculator2
+(
+    id serial primary key,
+    trained_on timestamp with time zone not null,
+    up_score float4,
+    up_params text,
+    down_score float4,
+    down_params text,
+    train_time_ms int
+);
+create index on signal_calculator2 (trained_on);

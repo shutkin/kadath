@@ -55,7 +55,7 @@ pub struct OrderData {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct OrderDataDelta {
+pub struct OrderDataCompact {
     pub price_id: i32,
     pub size: i32,
 }
@@ -185,4 +185,5 @@ pub struct SignalCalculatorLog {
     pub down_score: Option<f32>,
     pub up_params: Option<String>,
     pub down_params: Option<String>,
+    pub train_time_ms: i32,
 }

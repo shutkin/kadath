@@ -102,7 +102,6 @@ impl AbstractBroker for TInvest {
         &self,
         instruments: &[Instrument],
         order_book_sender: mpsc::Sender<OrderBookEvent>,
-        order_book_delta_sender: mpsc::Sender<OrderBookDeltaEvent>
     ) -> EmptyResult {
         let mut uid_id_map = HashMap::with_capacity(instruments.len());
         for instrument in instruments {
@@ -140,7 +139,6 @@ impl AbstractBroker for TInvest {
         let mut context = ListenerContext {
             uid_id_map,
             order_book_sender,
-            order_book_delta_sender,
             order_books: HashMap::new(),
         };
         let mut streaming = response.into_inner();
@@ -244,7 +242,6 @@ struct ListenerContext {
     uid_id_map: HashMap<String, i32>,
     order_books: HashMap<String, OrderBook>,
     order_book_sender: mpsc::Sender<OrderBookEvent>,
-    order_book_delta_sender: mpsc::Sender<OrderBookDeltaEvent>,
 }
 
 async fn handle_order_book(context: &mut ListenerContext, api_order_book: t_invest_sdk::api::OrderBook) -> EmptyResult {
@@ -252,31 +249,11 @@ async fn handle_order_book(context: &mut ListenerContext, api_order_book: t_inve
         warn!("Order book is not consistent: {api_order_book:?}");
     }
     let new_order_book = convert_order_book(&api_order_book);
-    let mut prev_order_book = OrderBook {
-        id: None,
-        timestamp: new_order_book.timestamp,
-        asks: Vec::new(),
-        bids: Vec::new(),
-    };
-    if let Some(order_books) = context.order_books.get(&api_order_book.instrument_uid) {
-        prev_order_book = order_books.clone();
-    }
     let instrument_id = context.uid_id_map.get(&api_order_book.instrument_uid).copied().unwrap_or_default();
-    if prev_order_book.asks.is_empty() || prev_order_book.bids.is_empty() {
-        context.order_book_sender.send(OrderBookEvent {
-            instrument_id,
-            order_book: new_order_book.clone(),
-        }).await?;
-    } else {
-        let ask_delta = calculate_delta(&prev_order_book.asks, &new_order_book.asks);
-        let bid_delta = calculate_delta(&prev_order_book.bids, &new_order_book.bids);
-        context.order_book_delta_sender.send(OrderBookDeltaEvent {
-            instrument_id,
-            timestamp: new_order_book.timestamp,
-            asks: ask_delta,
-            bids: bid_delta,
-        }).await?;
-    }
+    context.order_book_sender.send(OrderBookEvent {
+        instrument_id,
+        order_book: new_order_book.clone(),
+    }).await?;
     context.order_books.insert(api_order_book.instrument_uid, new_order_book);
     Ok(())
 }

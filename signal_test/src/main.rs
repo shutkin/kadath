@@ -1,9 +1,9 @@
 use chrono::{DateTime, Datelike, TimeDelta, Timelike, Utc};
 use db::{Db, QueryAsksOrBids};
-use log::{LevelFilter, debug, info, warn};
+use log::{debug, error, info, warn, LevelFilter};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
-use model::{order_book_cache, DataSource, Instrument, OrderBook, OrderData};
+use model::{order_book_cache, DataSource, Instrument, OrderBook, OrderData, SignalCalculatorLog};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -128,18 +128,8 @@ impl TestDeal {
 const ENTRY_SLIPPAGE_MS: u16 = 300;
 const EXIT_SLIPPAGE_MS: u16 = 100;
 
-struct TestContext {
-    fixed_hold_time: u16,
-    model: WalkForwardModel,
-    window_data: WindowData,
-    active_deal: Option<TestDeal>,
-    total_income: Decimal,
-    total_outcome: Decimal,
-    total_commission: Decimal,
-}
-
 #[tokio::main]
-async fn __main() -> EmptyResult {
+async fn _main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
@@ -154,10 +144,10 @@ async fn __main() -> EmptyResult {
         find_instrument_id(&all_instruments, tickers[1]),
     ) {
         let mut diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-10-06T05:00:00Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-10-06T20:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-09T14:19:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-09T20:00:00Z")?.to_utc(),
         );
-        let end = DateTime::parse_from_rfc3339("2026-10-07T00:00:00Z")?.to_utc();
+        let end = DateTime::parse_from_rfc3339("2026-10-10T00:00:00Z")?.to_utc();
 
         let mut all_events = Vec::new();
 
@@ -177,14 +167,14 @@ async fn __main() -> EmptyResult {
         let optimizer = StrategyOptimizer::new(inst1_id, inst2_id);
         info!("Start optimizing");
         let config = optimizer.optimize(&all_events)?;
-        std::fs::write("optimized_config_03-25.txt", format!("{config:?}"))?;
+        std::fs::write("optimized_config_10_09.txt", format!("{config:?}"))?;
         info!("Done");
     }
     Ok(())
 }
 
 #[tokio::main]
-async fn _main() -> EmptyResult {
+async fn __main() -> EmptyResult {
     const INST1_ID: i32 = 26;
     const INST2_ID: i32 = 121;
     const TICKERS: [&str; 2] = ["GLZ6", "GLH7"];
@@ -307,16 +297,15 @@ async fn main() -> EmptyResult {
         find_instrument_id(&all_instruments, tickers[1]),
     ) {
         //let config = ModelConfig { std_diapason_s: 1195, train_data_minutes: 52, train_interval_minutes: 1, decay_time: 21.273781754192633, fixed_hold_time: None };
-        let config = ModelConfig { std_diapason_s: 1257, train_data_minutes: 50, train_interval_minutes: 1, decay_time: 15.789609053497927, fixed_hold_time: None };
+        let config = ModelConfig { std_diapason_s: 1217, train_data_minutes: 64, train_interval_minutes: 1, decay_time: 3.8888888888888857, fixed_hold_time: None };
         let model = WalkForwardModel::new_with_config(inst1_id, inst2_id, config);
         let mut window_data = WindowData::new();
 
         let mut diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-10-07T05:00:00Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-10-07T20:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-09T14:19:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-09T20:00:00Z")?.to_utc(),
         );
-        //let end = Utc::now();
-        let end = DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")?.to_utc();
+        let end = DateTime::parse_from_rfc3339("2026-10-10T00:00:00Z")?.to_utc();
 
         let (mut total_income, mut total_outcome, mut total_commission) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
         let mut active_deal = Option::<TestDeal>::None;
@@ -333,14 +322,9 @@ async fn main() -> EmptyResult {
                 let calculators = get_calculators(&db, diapason).await?;
                 info!("{} signal calculators", calculators.len());
 
-                //let order_books1_alt = load_alt_order_books("GLZ6.json")?;
-                //let order_books2_alt = load_alt_order_books("GLH7.json")?;
-                //info!("{} {} alternative order books, {} {} alternative order books", order_books1_alt.len(), tickers[0], order_books2_alt.len(), tickers[1]);
-
                 let events = merge_events(&[inst1_id, inst2_id], &[order_books1, order_books2]);
                 info!("Total events: {}", events.len());
 
-                let mut cur_calculator_index = 0;
                 let mut prev_hour = events[0].order_book.timestamp.hour();
                 let (mut last_ob1, mut last_ob2) = (None, None);
                 for (i, event) in events.iter().enumerate() {
@@ -349,17 +333,27 @@ async fn main() -> EmptyResult {
                         info!("Hour {prev_hour} PnL {}", daily_income - daily_outcome);
                     }
 
-                    if calculators.len() > cur_calculator_index + 1
-                        && event.order_book.timestamp > calculators[cur_calculator_index + 1].get_created_on() - TimeDelta::seconds(15) {
-                        cur_calculator_index += 1;
-                    }
-                    if event.order_book.timestamp <= calculators[cur_calculator_index].get_created_on() + TimeDelta::minutes(1) - TimeDelta::seconds(15) {
-                        model.set_calculator(Some(calculators[cur_calculator_index].clone()));
-                    } else {
-                        model.set_calculator(Some(CalculatorsPair::new(None, None, event.order_book.timestamp)));
+                    let started = Utc::now();
+                    let resp = model.calibrate(true);
+                    let elapsed = Utc::now().signed_duration_since(started);
+
+                    let up_map = resp.up.map(|calc| calc.to_params_map()).unwrap_or_default();
+                    let down_map = resp.down.map(|calc| calc.to_params_map()).unwrap_or_default();
+
+                    if !up_map.is_empty() || !down_map.is_empty() {
+                        let calculator_log = SignalCalculatorLog {
+                            trained_on: event.order_book.timestamp,
+                            up_score: up_map.get("score").map(|s| *s as f32),
+                            down_score: down_map.get("score").map(|s| *s as f32),
+                            up_params: if up_map.is_empty() { None } else { serde_json::to_string(&up_map).ok() },
+                            down_params: if down_map.is_empty() { None } else { serde_json::to_string(&down_map).ok() },
+                            train_time_ms: elapsed.num_milliseconds() as i32,
+                        };
+                        if let Err(err) = db.insert_calculator_log2(&calculator_log).await {
+                            error!("Failed to insert calculator log: {err}");
+                        }
                     }
 
-                    //model.calibrate(true);
                     let trade_signal = model.process(&mut window_data, event);
 
                     if event.instrument_id == inst1_id {
@@ -419,20 +413,6 @@ async fn main() -> EmptyResult {
     Ok(())
 }
 
-impl TestContext {
-    fn new(fixed_hold_time: u16, model: WalkForwardModel) -> Self {
-        Self {
-            fixed_hold_time,
-            model,
-            window_data: WindowData::new(),
-            active_deal: None,
-            total_income: Decimal::ZERO,
-            total_outcome: Decimal::ZERO,
-            total_commission: Decimal::ZERO,
-        }
-    }
-}
-
 fn on_horizon(events: &[OrderBookEvent], i: usize, first_leg_id: i32, horizon: u16) -> Option<(&OrderBook, &OrderBook)> {
     if horizon == 0 {
         return None;
@@ -476,8 +456,10 @@ async fn get_order_books(tickers: &[&str], ids: &[i32], diapason: TimeDiapason, 
         Ok((order_books1, order_books2))
     } else {
         let (order_books1, order_books2) =
-            (db.unwrap().get_order_books(Some(ids[0]), diapason, QueryAsksOrBids::BOTH).await?,
-             db.unwrap().get_order_books(Some(ids[1]), diapason, QueryAsksOrBids::BOTH).await?);
+            (db.unwrap().get_order_books_compact(ids[0], diapason).await?,
+             db.unwrap().get_order_books_compact(ids[1], diapason).await?);
+        //let order_books1 = order_books1.into_iter().filter(|ob| ob.asks.len() > 0 && ob.bids.len() > 0).collect::<Vec<_>>();
+        //let order_books2 = order_books2.into_iter().filter(|ob| ob.asks.len() > 0 && ob.bids.len() > 0).collect::<Vec<_>>();
         order_book_cache::write(tickers[0], diapason, &order_books1, true)?;
         order_book_cache::write(tickers[1], diapason, &order_books2, true)?;
         Ok((order_books1, order_books2))

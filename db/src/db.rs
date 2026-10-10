@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::utils::handle_delta;
-use model::{DataSource, SpreadDeal, Instrument, OrderBook, OrderData, OrderDataDelta, SignalCalculatorLog, Trade, TradeDirection, Deal, DealStatus};
+use model::{DataSource, SpreadDeal, Instrument, OrderBook, OrderData, OrderDataCompact, SignalCalculatorLog, Trade, TradeDirection, Deal, DealStatus};
 use rust_decimal::Decimal;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, Row};
@@ -74,7 +74,7 @@ impl Prices {
         }
     }
 
-    async fn get_prices(&self, map: &mut HashMap<i32, Decimal>) {
+    fn get_prices(&self, map: &mut HashMap<i32, Decimal>) {
         map.clear();
         if let Ok(read) = self.prices_map.read() {
             for (price, id) in read.iter() {
@@ -141,10 +141,10 @@ impl Db {
         Ok(())
     }
 
-    async fn serialize_delta(&self, delta: &[OrderData]) -> Result<Vec<u8>, CommonError> {
-        let mut delta_vec = Vec::with_capacity(delta.len());
-        for data in delta {
-            delta_vec.push(OrderDataDelta {
+    async fn serialize_compact(&self, data: &[OrderData]) -> Result<Vec<u8>, CommonError> {
+        let mut delta_vec = Vec::with_capacity(data.len());
+        for data in data {
+            delta_vec.push(OrderDataCompact {
                 price_id: self.prices.get_id(data.price, &self.pool).await?,
                 size: data.size,
             });
@@ -154,7 +154,7 @@ impl Db {
     }
 
     fn deserialize_and_handle(data: &[u8], cur_data: &mut Vec<OrderData>, prices_map: &HashMap<i32, Decimal>) -> Result<bool, CommonError> {
-        let (delta_vec, _): (Vec<OrderDataDelta>, usize) = bincode::serde::decode_from_slice(data, bincode::config::standard())?;
+        let (delta_vec, _): (Vec<OrderDataCompact>, usize) = bincode::serde::decode_from_slice(data, bincode::config::standard())?;
         let mut deltas = Vec::with_capacity(delta_vec.len());
         for delta in delta_vec {
             if let Some(price) = prices_map.get(&delta.price_id).copied() {
@@ -206,7 +206,7 @@ impl Db {
         };
 
         let mut prices_map = HashMap::new();
-        self.prices.get_prices(&mut prices_map).await;
+        self.prices.get_prices(&mut prices_map);
         let mut cur_asks = Vec::new();
         let mut cur_bids = Vec::new();
 
@@ -233,7 +233,7 @@ impl Db {
                             break;
                         }
                         self.prices.init(&self.pool).await?;
-                        self.prices.get_prices(&mut prices_map).await;
+                        self.prices.get_prices(&mut prices_map);
                     }
                     order_book.asks = cur_asks.clone();
                 }
@@ -248,7 +248,7 @@ impl Db {
                             break;
                         }
                         self.prices.init(&self.pool).await?;
-                        self.prices.get_prices(&mut prices_map).await;
+                        self.prices.get_prices(&mut prices_map);
                     }
                     order_book.bids = cur_bids.clone();
                 }
@@ -292,6 +292,67 @@ impl Db {
         Ok(result)
     }
 
+    pub async fn get_order_books_compact(&self, instrument_id: i32, diapason: TimeDiapason) -> Result<Vec<OrderBook>, CommonError> {
+        info!("Query order books instrument {instrument_id} {diapason:?}");
+        let rows = sqlx::query("SELECT id, created, ask, bid FROM order_book_full WHERE instrument_id = $1 AND created BETWEEN $2 AND $3 ORDER BY id")
+            .bind(instrument_id)
+            .bind(diapason.from)
+            .bind(diapason.to)
+            .fetch_all(&self.pool).await?;
+
+        let mut prices_map = HashMap::new();
+        self.prices.get_prices(&mut prices_map);
+
+        let result = rows.iter().filter_map(|row| {
+            if let Ok(asks) = Self::deserialize_compact_data(row.get(2), &prices_map)
+                && let Ok(bids) = Self::deserialize_compact_data(row.get(3), &prices_map) {
+                Some(OrderBook {
+                    id: Some(row.get(0)),
+                    timestamp: row.get(1),
+                    asks,
+                    bids,
+                })
+            } else {
+                None
+            }
+        }).collect();
+
+        Ok(result)
+    }
+
+    fn deserialize_compact_data(data: Vec<u8>, prices_map: &HashMap<i32, Decimal>) -> Result<Vec<OrderData>, CommonError> {
+        let (delta_vec, _): (Vec<OrderDataCompact>, usize) = bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+        let mut result = Vec::with_capacity(delta_vec.len());
+        for delta in delta_vec {
+            if let Some(price) = prices_map.get(&delta.price_id).copied() {
+                result.push(OrderData { price, size: delta.size });
+            } else {
+                warn!("Price ID {} not found in map", delta.price_id);
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn insert_order_book_compact(&self, order_book: &OrderBook, instrument: &Instrument) -> Result<(), CommonError> {
+        let instrument_id = instrument
+            .id
+            .ok_or::<CommonError>(format!("Instrument {} has no id", instrument.ticker).into())?;
+
+        let ask_serialized = self.serialize_compact(&order_book.asks).await?;
+        let bid_serialized = self.serialize_compact(&order_book.bids).await?;
+
+        sqlx::query(
+            "INSERT INTO order_book_full (created, instrument_id, ask, bid) VALUES ($1, $2, $3, $4)",
+        )
+            .bind(order_book.timestamp)
+            .bind(instrument_id)
+            .bind(ask_serialized)
+            .bind(bid_serialized)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn insert_order_book(
         &self,
         order_book: &OrderBook,
@@ -321,8 +382,8 @@ impl Db {
             .id
             .ok_or::<CommonError>(format!("Instrument {} has no id", instrument.ticker).into())?;
 
-        let ask_serialized = self.serialize_delta(ask_delta).await?;
-        let bid_serialized = self.serialize_delta(bid_delta).await?;
+        let ask_serialized = self.serialize_compact(ask_delta).await?;
+        let bid_serialized = self.serialize_compact(bid_delta).await?;
 
         sqlx::query("INSERT INTO order_book (created, instrument_id, ask_delta, bid_delta) VALUES ($1, $2, $3, $4)")
             .bind(timestamp)
@@ -468,18 +529,31 @@ impl Db {
     }
     
     pub async fn insert_calculator_log(&self, log: &SignalCalculatorLog) -> EmptyResult {
-        sqlx::query("INSERT INTO signal_calculator (trained_on, up_score, up_params, down_score, down_params) VALUES ($1, $2, $3, $4, $5)")
+        sqlx::query("INSERT INTO signal_calculator (trained_on, up_score, up_params, down_score, down_params, train_time_ms) VALUES ($1, $2, $3, $4, $5, $6)")
             .bind(log.trained_on)
             .bind(log.up_score)
             .bind(log.up_params.clone())
             .bind(log.down_score)
             .bind(log.down_params.clone())
+            .bind(log.train_time_ms)
+            .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn insert_calculator_log2(&self, log: &SignalCalculatorLog) -> EmptyResult {
+        sqlx::query("INSERT INTO signal_calculator2 (trained_on, up_score, up_params, down_score, down_params, train_time_ms) VALUES ($1, $2, $3, $4, $5, $6)")
+            .bind(log.trained_on)
+            .bind(log.up_score)
+            .bind(log.up_params.clone())
+            .bind(log.down_score)
+            .bind(log.down_params.clone())
+            .bind(log.train_time_ms)
             .execute(&self.pool).await?;
         Ok(())
     }
 
     pub async fn get_signal_calculators(&self, diapason: TimeDiapason) -> Result<Vec<SignalCalculatorLog>, CommonError> {
-        let rows = sqlx::query("SELECT trained_on, up_score, up_params, down_score, down_params FROM signal_calculator WHERE trained_on BETWEEN $1 AND $2")
+        let rows = sqlx::query("SELECT trained_on, up_score, up_params, down_score, down_params, train_time_ms FROM signal_calculator WHERE trained_on BETWEEN $1 AND $2")
             .bind(diapason.from)
             .bind(diapason.to)
             .fetch_all(&self.pool).await?;
@@ -489,6 +563,7 @@ impl Db {
             up_params: row.get(2),
             down_score: row.get(3),
             down_params: row.get(4),
+            train_time_ms: row.get(5),
         }).collect())
     }
 

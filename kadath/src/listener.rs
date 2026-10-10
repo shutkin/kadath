@@ -2,25 +2,21 @@ use crate::queue::Queue;
 use abstract_broker::{AbstractBroker, BrokerBox};
 use chrono::Utc;
 use db::Db;
-use log::{debug, error, warn};
+use log::{debug, error};
 use model::common::EmptyResult;
-use model::events::{OrderBookDeltaEvent, OrderBookEvent};
-use model::utils::handle_delta;
-use model::{Instrument, OrderBook, Trade};
+use model::events::OrderBookEvent;
+use model::{Instrument, Trade};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
-
-const FULL_ORDER_BOOK_QUANT_MINUTES: i64 = 10;
 
 #[derive(Clone)]
 struct ListenerHandler {
     db: Db,
     instruments: HashMap<i32, Instrument>,
-    order_books: Arc<Mutex<HashMap<i32, OrderBook>>>,
     ticker: Arc<AtomicI64>,
     order_book_queue: Arc<Queue<OrderBookEvent>>,
 }
@@ -32,58 +28,9 @@ impl ListenerHandler {
             self.order_book_queue.push(event.clone());
 
             debug!("Save snapshot order book {:?}", event.order_book);
-            if let Err(err) = self.db.insert_order_book_full(&event.order_book, instrument).await {
+            if let Err(err) = self.db.insert_order_book_compact(&event.order_book, instrument).await {
                 error!("Failed to save order book: {}", err);
             }
-            if let Ok(mut lock) = self.order_books.lock() {
-                lock.insert(event.instrument_id, event.order_book);
-            } else {
-                error!("Failed to lock order books on snapshot");
-            }
-        }
-    }
-
-    async fn on_order_book_delta(&self, event: OrderBookDeltaEvent) {
-        self.ticker.store(Utc::now().timestamp(), Relaxed);
-        if let Some(instrument) = self.instruments.get(&event.instrument_id) {
-            let mut updated_order_book = None;
-            let mut save_full = false;
-
-            if let Ok(mut lock) = self.order_books.lock()
-                && let Some(order_book) = lock.get_mut(&event.instrument_id) {
-                let prev_timestamp_quant = order_book.timestamp.timestamp_micros() / (FULL_ORDER_BOOK_QUANT_MINUTES * 60 * 1000 * 1000);
-                order_book.timestamp = event.timestamp;
-                handle_delta(&event.asks, &mut order_book.asks);
-                handle_delta(&event.bids, &mut order_book.bids);
-                updated_order_book = Some(order_book.clone());
-                let cur_timestamp_quant = order_book.timestamp.timestamp_micros() / (FULL_ORDER_BOOK_QUANT_MINUTES * 60 * 1000 * 1000);
-                if cur_timestamp_quant > prev_timestamp_quant {
-                    save_full = true;
-                }
-            } else {
-                error!("Failed to lock order books on delta");
-            }
-
-            if let Some(order_book) = updated_order_book {
-                self.order_book_queue.push(OrderBookEvent {
-                    instrument_id: event.instrument_id,
-                    order_book: order_book.clone(),
-                });
-
-                if save_full {
-                    debug!("Save full order book {order_book:?}");
-                    if let Err(err) = self.db.insert_order_book_full(&order_book, instrument).await {
-                        error!("Failed to save order book: {}", err);
-                    }
-                } else {
-                    debug!("Save order book delta asks {:?}, bids {:?}", event.asks, event.bids);
-                    if let Err(err) = self.db.insert_order_book_delta(instrument, event.timestamp, &event.asks, &event.bids).await {
-                        error!("Failed to save order book delta: {}", err);
-                    }
-                }
-            }
-        } else {
-            warn!("Skipping order book for unknown instrument {}", event.instrument_id);
         }
     }
 }
@@ -158,12 +105,9 @@ fn start_listener(
 ) {
     let (order_book_sender,
         mut order_book_receiver) = mpsc::channel::<OrderBookEvent>(64);
-    let (order_book_delta_sender,
-        mut order_book_delta_receiver) = mpsc::channel::<OrderBookDeltaEvent>(64);
     let listener_handler = ListenerHandler {
         db: db.clone(),
         instruments: instruments.clone(),
-        order_books: Arc::new(Mutex::new(HashMap::new())),
         ticker: ticker.clone(),
         order_book_queue,
     };
@@ -173,18 +117,12 @@ fn start_listener(
             listener_handler_clone.on_order_book(event).await;
         }
     });
-    tokio::spawn(async move {
-        while let Some(event) = order_book_delta_receiver.recv().await {
-            listener_handler.on_order_book_delta(event).await;
-        }
-    });
 
     let instruments = instruments.values().cloned().collect::<Vec<_>>();
     tokio::spawn(async move {
         if let Err(err) = broker.listen_order_books(
             &instruments,
             order_book_sender,
-            order_book_delta_sender,
         ).await {
             error!("Listener error: {}", err);
         }

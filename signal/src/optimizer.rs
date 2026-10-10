@@ -4,7 +4,7 @@ use crate::signal_calculator::{CalculatorsPair, SignalCalculator, SignalPerforma
 use crate::simulation::run_simulation;
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use model::common::CommonError;
 use ndarray::Array1;
 

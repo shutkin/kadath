@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use model::common::{CommonError, EmptyResult};
 use model::{Instrument, OrderData, Trade, TradeDirection};
-use model::events::{OrderBookDeltaEvent, OrderBookEvent};
+use model::events::OrderBookEvent;
 
 pub type BrokerBox = Arc<Box<dyn AbstractBroker + Send + Sync>>;
 
@@ -15,7 +15,6 @@ pub trait AbstractBroker {
         &self,
         instruments: &[Instrument],
         order_book_sender: mpsc::Sender<OrderBookEvent>,
-        order_book_delta_sender: mpsc::Sender<OrderBookDeltaEvent>,
     ) -> EmptyResult;
 
     async fn make_order(&self, internal_id: &str, instrument: &Instrument, direction: TradeDirection, quantity: u16) -> Result<String, CommonError>;
