@@ -127,11 +127,11 @@ impl KadathExecutor {
             cur_deal.replace(deal.clone());
         }
 
-        /*let deal = self.make_orders(deal, true).await;
+        let deal = self.make_orders(deal, true).await;
         if let Ok(cur_deal) = self.cur_deal.lock().as_mut() {
             cur_deal.replace(deal.clone());
         }
-        self.db.update_deal(&deal).await?;*/
+        self.db.update_deal(&deal).await?;
 
         Ok(())
     }
@@ -154,10 +154,9 @@ impl KadathExecutor {
                 deal.leg1_close_price_expected = Some(leg1_price);
                 deal.leg2_close_price_expected = Some(leg2_price);
 
-                //let deal = self.make_orders(deal, false).await;
+                let deal = self.make_orders(deal, false).await;
                 if let Ok(mut cur_deal) = self.cur_deal.lock() {
-                    //cur_deal.replace(deal.clone());
-                    *cur_deal = None;
+                    cur_deal.replace(deal.clone());
                 }
                 if let Err(err) = self.db.update_deal(&deal).await {
                     error!("Error updating deal: {err:?}");
