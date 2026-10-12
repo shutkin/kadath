@@ -151,18 +151,16 @@ impl WalkForwardModel {
 
         self.shrink_buffer();
 
-        let performances = if let Ok(read) = self.calculator.read() {
-            read.map(|calc| calc.get_performances())
-        } else {
-            None
-        };
+        let prev_calc = self.calculator.read().ok().map(|c| c.clone()).flatten();
         let mut response = CalibrationResponse {
-            prev_cycle_performances: performances,
+            prev_cycle_performances: prev_calc.map(|c| c.get_performances()),
             ..Default::default()
         };
 
         let buf_clone = self.buffer.lock().map(|b| b.clone()).unwrap_or_default();
-        let calibration_result = calibrate_signal_calculator(&buf_clone, self.is_buying, self.config.decay_time, self.config.hold_time_ms);
+        let calibration_result = calibrate_signal_calculator(
+            &prev_calc, &buf_clone, self.is_buying, self.config.decay_time, self.config.hold_time_ms
+        );
         self.set_calculator(calibration_result);
 
         response.calculator = calibration_result;

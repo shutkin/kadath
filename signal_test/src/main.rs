@@ -1,3 +1,4 @@
+use std::time::Instant;
 use chrono::{DateTime, Datelike, TimeDelta, Timelike, Utc};
 use db::Db;
 use log::{debug, info, LevelFilter};
@@ -8,6 +9,7 @@ use rust_decimal::Decimal;
 use signal::strategy_optimizer::StrategyOptimizer;
 use signal::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use simplelog::SimpleLogger;
+use model::math_util::{mean, median, p10_p90};
 
 #[derive(Copy, Clone)]
 struct TestDeal {
@@ -118,20 +120,20 @@ async fn main() -> EmptyResult {
 
     let config_sell = ModelConfig {
         hold_time_ms: 1000,
-        derivatives_normalize_diapason_s: 325.0,
-        trend_tau_s: 195.0,
-        train_data_minutes: 40,
+        derivatives_normalize_diapason_s: 200.0,
+        trend_tau_s: 175.0,
+        train_data_minutes: 60,
         train_interval_minutes: 1,
-        decay_time: 60.0,
+        decay_time: 360.0,
     };
     let model_sell = WalkForwardModel::new_selling(inst_id, config_sell);
     let mut window_data_sell = WindowData::new();
 
     let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-09T14:19:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-09T05:00:00Z")?.to_utc(),
         DateTime::parse_from_rfc3339("2026-10-09T20:00:00Z")?.to_utc(),
     );
-    let end = DateTime::parse_from_rfc3339("2026-10-10T00:00:00Z")?.to_utc();
+    let end = DateTime::parse_from_rfc3339("2026-10-13T00:00:00Z")?.to_utc();
 
     let (mut total_income, mut total_outcome, mut total_commission) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
     let mut active_deal = Option::<TestDeal>::None;
@@ -143,10 +145,15 @@ async fn main() -> EmptyResult {
             let mut daily_deals = 0;
 
             let order_books = get_order_books(ticker, inst_id, diapason, Some(&db)).await?;
+            if order_books.is_empty() {
+                continue;
+            }
             info!("{} {} order books", order_books.len(), ticker);
 
             let events = merge_events(&[inst_id], &[order_books]);
             debug!("Total events: {}", events.len());
+
+            let mut process_delays = Vec::new();
 
             let mut prev_hour = events[0].order_book.timestamp.hour();
             for (i, event) in events.iter().enumerate() {
@@ -155,30 +162,34 @@ async fn main() -> EmptyResult {
                     debug!("Hour {prev_hour} PnL {}", daily_income - daily_outcome);
                 }
 
-                let started = Utc::now();
+                let started = Instant::now();
                 let resp = model_buy.calibrate(true);
                 if let Some(calc) = &resp.calculator {
-                    let elapsed = Utc::now().signed_duration_since(started).as_seconds_f64();
+                    let elapsed = Instant::now().duration_since(started).as_millis();
                     let pref = calc.get_performances();
                     info!(
-                        "Calibration takes {elapsed}s. Predictions inside training interval {:?}: {} correct, {} incorrect, score {}",
+                        "Calibration takes {elapsed}ms. Predictions inside training interval {:?}: {} correct, {} incorrect, score {}",
                         pref.train_diapason,
                         pref.training_correct_predictions,
                         pref.training_incorrect_predictions,
                         pref.training_score
                     );
+
+                    if !process_delays.is_empty() {
+                        info!(
+                            "Process delay mean {}, median {}, p10-p90 {:?}, max {}",
+                            mean(&process_delays), median(&process_delays), p10_p90(&process_delays),
+                            process_delays.iter().copied().reduce(f64::max).unwrap_or_default(),
+                        );
+                        process_delays.clear();
+                    }
                 }
 
-                /*let started = Utc::now();
-                let resp = model_sell.calibrate(true);
-                if resp.calculator.is_some() {
-                    let elapsed = Utc::now().signed_duration_since(started).as_seconds_f64();
-                    debug!("Sell calibration takes {elapsed}s");
-                }*/
-
+                let started = Instant::now();
                 let signal_buy = model_buy.process(&mut window_data_buy, event);
-                let signal_sell = model_sell.process(&mut window_data_sell, event);
-                
+                let elapsed = Instant::now().duration_since(started).as_micros() as f64;
+                process_delays.push(elapsed);
+
                 if let Some(deal) = active_deal.as_mut() {
                     if event.order_book.timestamp > deal.close_time {
                         if let Some((income, outcome)) = deal.close(&event.order_book) {
@@ -189,7 +200,7 @@ async fn main() -> EmptyResult {
                             active_deal = None;
                         }
                     } else {
-                        match signal_sell {
+                        /*match signal_sell {
                             TradeSignal::Sell(_) => {
                                 let cur_sell_price = get_best_bid(&event.order_book);
                                 if cur_sell_price > deal.open_price {
@@ -203,12 +214,12 @@ async fn main() -> EmptyResult {
                                 }
                             }
                             _ => {}
-                        }
+                        }*/
                     }
                 } else {
                     match signal_buy {
                         TradeSignal::Buy(hold) => {
-                            let deal = TestDeal::open(&event.order_book, hold);
+                            let deal = TestDeal::open(&event.order_book, hold.min(25000));
                             active_deal = Some(deal);
                             daily_deals += 1;
                         }
@@ -217,11 +228,9 @@ async fn main() -> EmptyResult {
                 }
             }
             info!("Day {} net {} on {} deals with commission {}", diapason.from.date_naive(), daily_income - daily_outcome - daily_commission, daily_deals, daily_commission);
-
-            diapason.from += TimeDelta::days(1);
-            diapason.to += TimeDelta::days(1);
         }
-        //info!("Net profit {}", total_income - total_outcome - total_commission);
+        diapason.from += TimeDelta::days(1);
+        diapason.to += TimeDelta::days(1);
     }
     Ok(())
 }

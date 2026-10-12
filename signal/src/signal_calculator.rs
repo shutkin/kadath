@@ -48,6 +48,16 @@ impl SignalCalculator {
             performance: SignalPerformance::default(),
         }
     }
+    
+    pub fn to_optimizer_param(&self) -> Array1<f64> {
+        Array1::from_vec(vec![
+            self.threshold,
+            self.imbalance_weights[0], self.imbalance_weights[1], self.imbalance_weights[2], self.imbalance_weights[3], self.imbalance_weights[4],
+            self.imbalance_derivative_weights[0], self.imbalance_derivative_weights[1], self.imbalance_derivative_weights[2],
+            self.imbalance_derivative_weights[3], self.imbalance_derivative_weights[4],
+            self.trend_weight,
+        ])
+    }
 
     pub fn set_performance(&mut self, performance: SignalPerformance) {
         self.performance = performance;

@@ -1,18 +1,39 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 use crate::orderbook_values::OrderBookValues;
 use crate::signal_calculator::{SignalCalculator, SignalPerformance};
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
 use chrono::{DateTime, TimeDelta, Utc};
-use log::{debug, error, info};
+use log::{debug, error};
 use model::common::{CommonError, TimeDiapason};
 use ndarray::Array1;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 const HOLD_TIME_TO_SCORE_PENALTY_RATIO: f64 = 1.0 / 15_000.0;
 
-struct HorizonProblem<'a> {
-    values: &'a [OrderBookValues],
+
+enum ProblemKind { HORIZON, TRADING }
+
+trait ScoreProvider {
+    fn score(&self, param: &Array1<f64>) -> f64;
+}
+
+struct ProblemWrapper {
+    provider: Box<dyn ScoreProvider>,
+}
+
+impl CostFunction for ProblemWrapper {
+    type Param = Array1<f64>;
+    type Output = f64;
+
+    fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
+        let score = self.provider.score(param);
+        Ok(-score)
+    }
+}
+
+struct HorizonProblem {
+    values: Vec<OrderBookValues>,
     horizons: Vec<f64>,
     hold_time: u16,
     is_positive: bool,
@@ -20,11 +41,8 @@ struct HorizonProblem<'a> {
     correctness: Option<Rc<RefCell<(i32, i32)>>>,
 }
 
-impl CostFunction for HorizonProblem<'_> {
-    type Param = Array1<f64>;
-    type Output = f64;
-
-    fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
+impl ScoreProvider for HorizonProblem {
+    fn score(&self, param: &Array1<f64>) -> f64 {
         let last_time = self.values[self.values.len() - 1].time;
         let calculator = SignalCalculator::from_optimizer_param(last_time, self.hold_time, param);
 
@@ -53,23 +71,20 @@ impl CostFunction for HorizonProblem<'_> {
         if let Some(correctness) = self.correctness.as_ref() {
             correctness.replace((correct, incorrect));
         }
-        Ok(-sum)
+        sum
     }
 }
 
-struct TradingProblem<'a> {
-    values: &'a [OrderBookValues],
+struct TradingProblem {
+    values: Vec<OrderBookValues>,
     hold_time: u16,
     is_positive: bool,
     decay_time: f64,
     correctness: Option<Rc<RefCell<(i32, i32)>>>,
 }
 
-impl CostFunction for TradingProblem<'_> {
-    type Param = Array1<f64>;
-    type Output = f64;
-
-    fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
+impl ScoreProvider for TradingProblem {
+    fn score(&self, param: &Array1<f64>) -> f64 {
         struct Deal {
             closing_at: DateTime<Utc>,
             open_price: f64,
@@ -115,13 +130,15 @@ impl CostFunction for TradingProblem<'_> {
         if let Some(correctness) = self.correctness.as_ref() {
             correctness.replace((correct, incorrect));
         }
-        Ok(-pnl)
+
+        pnl
     }
 }
 
-pub fn calibrate_signal_calculator(values: &[OrderBookValues], is_buying: bool, decay_time: f64, hold_time: u16) -> Option<SignalCalculator> {
-    //let horizons = build_horizon(values, hold_time);
-    match execute_optimization(values, hold_time, is_buying, decay_time) {
+pub fn calibrate_signal_calculator(prev: &Option<SignalCalculator>, values: &[OrderBookValues], is_buying: bool,
+                                   decay_time: f64, hold_time: u16) -> Option<SignalCalculator> {
+    let initial = prev.map(|calc| calc.to_optimizer_param()).unwrap_or(Array1::from_vec(vec![0.0; 12]));
+    match execute_optimization(initial, values, hold_time, is_buying, decay_time, ProblemKind::TRADING) {
         Ok(result) => {
             if let Some(calculator) = &result {
                 debug!("{} calibration score: {}", calculator.get_created_on(), calculator.get_train_score());
@@ -139,7 +156,7 @@ fn build_horizon(values: &[OrderBookValues], hold: u16) -> Vec<f64> {
     let mut result = Vec::with_capacity(values.len());
 
     for (i, v) in values.iter().enumerate() {
-        let target_time = values[i].time + TimeDelta::milliseconds(hold as i64);
+        let target_time = v.time + TimeDelta::milliseconds(hold as i64);
         let horizon = if let Some(h) = find_value_on_horizon(values, i, target_time) {
             h.mid - values[i].mid
         } else {
@@ -163,13 +180,25 @@ fn find_value_on_horizon(values: &[OrderBookValues], index: usize, target_time: 
 }
 
 fn execute_optimization(
+    initial: Array1<f64>,
     values: &[OrderBookValues],
-    //horizons: &[f64],
     hold_time: u16,
     is_positive: bool,
     decay_time: f64,
+    problem_kind: ProblemKind,
 ) -> Result<Option<SignalCalculator>, CommonError> {
-    let initial = Array1::from_vec(vec![0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let values = values.to_vec();
+    let horizons = build_horizon(&values, hold_time);
+    let problem = match problem_kind {
+        ProblemKind::HORIZON => ProblemWrapper { provider: Box::new(HorizonProblem {
+                values: values.clone(), horizons: horizons.clone(), is_positive, decay_time, hold_time, correctness: None,
+            })
+        },
+        ProblemKind::TRADING => ProblemWrapper { provider: Box::new(TradingProblem {
+                values: values.clone(), is_positive, decay_time, hold_time, correctness: None,
+            })
+        }
+    };
 
     let mut simplex = Vec::with_capacity(initial.len() + 1);
 
@@ -182,29 +211,29 @@ fn execute_optimization(
     }
 
     let solver = NelderMead::<Array1<f64>, f64>::new(simplex.clone());
-    let result = Executor::new(
-        TradingProblem {
-            values, is_positive, decay_time, hold_time, correctness: None
-        },
-        solver,
-    ).configure(|state| state.max_iters(512))
+    let result = Executor::new(problem, solver, )
+        .configure(|state| state.max_iters(64))
         .run()?;
-    
-    let last_time = values[values.len() - 1].time;
+
+    let (first_time, last_time) = (values[0].time, values[values.len() - 1].time);
     let best_score = -result.state().get_best_cost();
     let best_param = result.state().get_best_param().ok_or("Failed to get best param from executor state")?;
     
     let correctness = Rc::new(RefCell::new((0, 0)));
-    let problem = TradingProblem {
-        values, is_positive, decay_time, hold_time, correctness: Some(correctness.clone())
+    match problem_kind {
+        ProblemKind::HORIZON => HorizonProblem {
+            values, horizons, is_positive, decay_time, hold_time, correctness: Some(correctness.clone()),
+        }.score(best_param),
+        ProblemKind::TRADING => TradingProblem {
+            values, is_positive, decay_time, hold_time, correctness: Some(correctness.clone()),
+        }.score(best_param)
     };
-    let _ = problem.cost(best_param);
-    
+
     let mut calculator = SignalCalculator::from_optimizer_param(last_time, hold_time, best_param);
 
     let correctness = correctness.take();
     calculator.set_performance(SignalPerformance {
-        train_diapason: TimeDiapason::new(values[0].time, last_time),
+        train_diapason: TimeDiapason::new(first_time, last_time),
         hold_time,
         training_score: best_score,
         training_correct_predictions: correctness.0,
