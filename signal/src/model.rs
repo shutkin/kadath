@@ -1,18 +1,16 @@
+extern crate core;
+
 mod orderbook_values;
 pub mod signal_calculator;
 mod optimizer;
-mod simulation;
 pub mod strategy_optimizer;
 
 use crate::optimizer::calibrate_signal_calculator;
-use crate::orderbook_values::{Leg, OrderBookValues, WindowValuesCalculator};
-use crate::signal_calculator::{CalculatorsPair, PairPerformance, SignalCalculator};
-use chrono::{TimeDelta, Utc};
-use log::{debug, error, info};
+use crate::orderbook_values::{OrderBookValues, WindowValuesCalculator};
+use crate::signal_calculator::{SignalCalculator, SignalPerformance};
+use chrono::TimeDelta;
 use model::events::OrderBookEvent;
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
-use model::common::EmptyResult;
 
 const MAX_WINDOW_LENGTH_S: i64 = 2000;
 const TRAIN_DATA_MINUTES: u16 = 45;
@@ -25,109 +23,82 @@ pub const HOLD_TIME_VARIANTS: [u16; 6] = [200, 300, 500, 750, 1000, 1500];
 #[derive(Copy, Clone)]
 pub enum TradeSignal {
     None,
-    Sell1Buy2(u16),
-    Buy1Sell2(u16),
+    Sell(u16),
+    Buy(u16),
 }
 
 #[derive(Copy, Clone, Debug)]
 pub struct ModelConfig {
-    pub std_diapason_s: u16,
+    pub derivatives_normalize_diapason_s: f64,
+    pub trend_tau_s: f64,
     pub train_data_minutes: u16,
     pub train_interval_minutes: u16,
     pub decay_time: f64,
-    pub fixed_hold_time: Option<u16>,
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            std_diapason_s: STD_DIAPASON_SECONDS,
-            train_data_minutes: TRAIN_DATA_MINUTES,
-            train_interval_minutes: TRAIN_INTERVAL_MINUTES,
-            decay_time: DEFAULT_DECAY_TIME,
-            fixed_hold_time: None,
-        }
-    }
+    pub hold_time_ms: u16,
 }
 
 pub struct WindowData {
-    values1_calculator: WindowValuesCalculator,
-    values2_calculator: WindowValuesCalculator,
+    values_calculator: WindowValuesCalculator,
 }
 
 impl WindowData {
     pub fn new() -> Self {
         Self {
-            values1_calculator: WindowValuesCalculator::new(Leg::First),
-            values2_calculator: WindowValuesCalculator::new(Leg::Second),
+            values_calculator: WindowValuesCalculator::new(),
         }
     }
 }
 
 #[derive(Clone)]
 pub struct WalkForwardModel {
-    instrument1_id: i32,
-    instrument2_id: i32,
-
+    instrument_id: i32,
     config: ModelConfig,
-    calculator: Arc<RwLock<Option<CalculatorsPair>>>,
+    is_buying: bool,
+    calculator: Arc<RwLock<Option<SignalCalculator>>>,
     buffer: Arc<Mutex<Vec<OrderBookValues>>>,
 }
 
 #[derive(Copy, Clone, Default)]
 pub struct CalibrationResponse {
-    pub prev_cycle_performances: Option<PairPerformance>,
-    pub up: Option<SignalCalculator>,
-    pub down: Option<SignalCalculator>,
+    pub prev_cycle_performances: Option<SignalPerformance>,
+    pub calculator: Option<SignalCalculator>,
 }
 
 impl WalkForwardModel {
-    pub fn new(instrument1_id: i32, instrument2_id: i32) -> Self {
+    pub fn new_buying(instrument_id: i32, config: ModelConfig) -> Self {
         Self {
-            instrument1_id,
-            instrument2_id,
-            config: ModelConfig::default(),
-            calculator: Arc::new(RwLock::new(None)),
-            buffer: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    pub fn new_with_config(instrument1_id: i32, instrument2_id: i32, config: ModelConfig) -> Self {
-        Self {
-            instrument1_id,
-            instrument2_id,
+            instrument_id,
             config,
+            is_buying: true,
             calculator: Arc::new(RwLock::new(None)),
             buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn get_last_values(&self) -> Option<(OrderBookValues, OrderBookValues)> {
-        let (mut v1, mut v2) = (None, None);
+    pub fn new_selling(instrument_id: i32, config: ModelConfig) -> Self {
+        Self {
+            instrument_id,
+            config,
+            is_buying: false,
+            calculator: Arc::new(RwLock::new(None)),
+            buffer: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 
+    fn get_last_value(&self) -> Option<OrderBookValues> {
+        let mut v = None;
         if let Ok(lock) = self.buffer.lock() {
-            let mut i = lock.len() - 1;
-            while i > 0 && (v1.is_none() || v2.is_none()) {
-                match lock[i].leg {
-                    Leg::First => if v1.is_none() { v1 = Some(lock[i]) },
-                    Leg::Second => if v2.is_none() { v2 = Some(lock[i]) },
-                }
-                i -= 1;
-            }
+            v = lock.last().copied();
         }
-
-        if let Some(v1) = v1 && let Some(v2) = v2 {
-            Some((v1, v2))
-        } else {
-            None
-        }
+        v
     }
 
     pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {
-        let v = if self.instrument1_id == event.instrument_id {
-            window_data.values1_calculator.calculate(&event.order_book, self.config.std_diapason_s)
-        } else if self.instrument2_id == event.instrument_id {
-            window_data.values2_calculator.calculate(&event.order_book, self.config.std_diapason_s)
+        let v = if self.instrument_id == event.instrument_id {
+            window_data.values_calculator.calculate(
+                &event.order_book,
+                self.config.derivatives_normalize_diapason_s,
+                self.config.trend_tau_s)
         } else {
             return TradeSignal::None;
         };
@@ -137,17 +108,23 @@ impl WalkForwardModel {
 
         if let Ok(read) = self.calculator.read()
             && let Some(calculator) = read.as_ref()
-            && let Some((v1, v2)) = self.get_last_values() {
-            calculator.calculate(v1, v2)
-        } else {
-            TradeSignal::None
+            && let Some(v) = self.get_last_value() {
+            let signal_score = calculator.calculate(&v);
+            if signal_score.abs() > f64::MIN_POSITIVE {
+                if self.is_buying && signal_score > 0.0 {
+                    return TradeSignal::Buy(calculator.get_hold_time_ms())
+                } else if !self.is_buying && signal_score < 0.0 {
+                    return TradeSignal::Sell(calculator.get_hold_time_ms())
+                }
+            }
         }
+        TradeSignal::None
     }
     
-    pub fn inform_deal_result(&self, trade_signal: TradeSignal, profit: f64) {
+    pub fn inform_deal_result(&self, profit: f64) {
         if let Ok(mut write) = self.calculator.write()
             && let Some(calc) = write.as_mut() {
-            calc.deal_performance(trade_signal, profit);
+            calc.deal_performance(profit);
         }
     }
     
@@ -184,43 +161,15 @@ impl WalkForwardModel {
             ..Default::default()
         };
 
-        let decay_time = self.config.decay_time;
-        let fixed_hold_time = self.config.fixed_hold_time;
+        let buf_clone = self.buffer.lock().map(|b| b.clone()).unwrap_or_default();
+        let calibration_result = calibrate_signal_calculator(&buf_clone, self.is_buying, self.config.decay_time, self.config.hold_time_ms);
+        self.set_calculator(calibration_result);
 
-        let buf_up = self.buffer.lock().map(|b| b.clone()).unwrap_or_default();
-        let buf_down = buf_up.clone();
-        let leg1_size = buf_up.iter().filter(|event| matches!(event.leg, Leg::First)).count();
-        let leg2_size = buf_up.iter().filter(|event| matches!(event.leg, Leg::Second)).count();
-        debug!("Calibrate on {} events ({leg1_size}, {leg2_size}) from {} to {}", buf_up.len(), buf_up[0].time, buf_up[buf_up.len() - 1].time);
-        //if let Err(err) = Self::save_buf_csv(&buf_up) {
-        //    error!("Failed to save calibration buffer csv: {err}");
-        //}
-        let thread_up = thread::spawn(move || {
-            calibrate_signal_calculator(&buf_up, true, decay_time, fixed_hold_time)
-        });
-
-        let thread_down = thread::spawn(move || {
-            calibrate_signal_calculator(&buf_down, false, decay_time, fixed_hold_time)
-        });
-
-        if let Ok(up) = thread_up.join()
-            && let Ok(down) = thread_down.join() {
-            let last_time = self.buffer.lock()
-                .map(|buf| buf[buf.len() - 1].time).unwrap_or(Utc::now());
-            let calc = CalculatorsPair::new(up, down, last_time);
-            response.up = up;
-            response.down = down;
-
-            debug!("{calc:?}");
-            if let Ok(mut write) = self.calculator.write() {
-                *write = Some(calc);
-            }
-        }
-
+        response.calculator = calibration_result;
         response
     }
     
-    pub fn set_calculator(&self, calculator: Option<CalculatorsPair>) {
+    pub fn set_calculator(&self, calculator: Option<SignalCalculator>) {
         if let Ok(mut write) = self.calculator.write() {
             *write = calculator;
         }
@@ -238,38 +187,5 @@ impl WalkForwardModel {
                 buffer.drain(0..to_delete);
             }
         }
-    }
-
-    fn save_buf_csv(buf: &[OrderBookValues]) -> EmptyResult {
-        let mut csv = Vec::new();
-        csv.push("time, leg1 mid, leg1 derivative, leg1 i3, leg1 i5, leg1 i10, leg1 i20, leg1 i50, leg2 mid, leg2 derivative, leg2 i3, leg2 i5, leg2 i10, leg2 i20, leg2 i50".to_string());
-        for v in buf {
-            if matches!(v.leg, Leg::First) {
-                csv.push(format!("{}, {}, {}, {}, {}, {}, {}, {},,,,,,,",
-                                 v.time,
-                                 v.mid(),
-                                 v.normal_derivative,
-                                 v.imbalances[0],
-                                 v.imbalances[1],
-                                 v.imbalances[2],
-                                 v.imbalances[3],
-                                 v.imbalances[4],
-                ));
-            } else {
-                csv.push(format!("{},,,,,,,,{}, {}, {}, {}, {}, {}, {}",
-                                 v.time,
-                                 v.mid(),
-                                 v.normal_derivative,
-                                 v.imbalances[0],
-                                 v.imbalances[1],
-                                 v.imbalances[2],
-                                 v.imbalances[3],
-                                 v.imbalances[4],
-                ));
-            }
-        }
-        let filename = format!("h_buf_{}.csv", buf[0].time.timestamp());
-        std::fs::write(&filename, csv.join("\n"))?;
-        Ok(())
     }
 }

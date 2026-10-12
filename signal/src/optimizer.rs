@@ -1,78 +1,175 @@
-use crate::HOLD_TIME_VARIANTS;
+use std::cell::RefCell;
+use std::rc::Rc;
 use crate::orderbook_values::OrderBookValues;
-use crate::signal_calculator::{CalculatorsPair, SignalCalculator, SignalPerformance};
-use crate::simulation::run_simulation;
+use crate::signal_calculator::{SignalCalculator, SignalPerformance};
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
-use log::{debug, error, warn};
-use model::common::CommonError;
+use chrono::{DateTime, TimeDelta, Utc};
+use log::{debug, error, info};
+use model::common::{CommonError, TimeDiapason};
 use ndarray::Array1;
 
-struct TradeSimProblem<'a> {
+const HOLD_TIME_TO_SCORE_PENALTY_RATIO: f64 = 1.0 / 15_000.0;
+
+struct HorizonProblem<'a> {
     values: &'a [OrderBookValues],
-    is_up: bool,
-    hold_time_ms: u16,
-    tau_time: f64,
+    horizons: Vec<f64>,
+    hold_time: u16,
+    is_positive: bool,
+    decay_time: f64,
+    correctness: Option<Rc<RefCell<(i32, i32)>>>,
 }
 
-impl CostFunction for TradeSimProblem<'_> {
+impl CostFunction for HorizonProblem<'_> {
     type Param = Array1<f64>;
     type Output = f64;
 
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
         let last_time = self.values[self.values.len() - 1].time;
-        let calculator = SignalCalculator::from_optimizer_param(self.hold_time_ms, param);
-        let pair = if self.is_up {
-            CalculatorsPair::new_up(calculator, last_time)
+        let calculator = SignalCalculator::from_optimizer_param(last_time, self.hold_time, param);
+
+        let penalty = self.hold_time as f64 * HOLD_TIME_TO_SCORE_PENALTY_RATIO;
+        let (mut correct, mut incorrect) = (0, 0);
+        let sum = self.values.iter().zip(self.horizons.iter())
+            .map(|(v, &horizon)| {
+                let signal = calculator.calculate(v);
+                let weight = (-(last_time - v.time).as_seconds_f64() / self.decay_time).exp();
+                if signal < -f64::MIN_POSITIVE && !self.is_positive {
+                    if horizon < -f64::MIN_POSITIVE {
+                        correct += 1;
+                    } else {
+                        incorrect += 1;
+                    }
+                    (-horizon - penalty) * weight
+                } else if signal > f64::MIN_POSITIVE && self.is_positive {
+                    if horizon > f64::MIN_POSITIVE {
+                        correct += 1;
+                    } else {
+                        incorrect += 1;
+                    }
+                    (horizon - penalty) * weight
+                } else { 0.0 }
+            }).sum::<f64>();
+        if let Some(correctness) = self.correctness.as_ref() {
+            correctness.replace((correct, incorrect));
+        }
+        Ok(-sum)
+    }
+}
+
+struct TradingProblem<'a> {
+    values: &'a [OrderBookValues],
+    hold_time: u16,
+    is_positive: bool,
+    decay_time: f64,
+    correctness: Option<Rc<RefCell<(i32, i32)>>>,
+}
+
+impl CostFunction for TradingProblem<'_> {
+    type Param = Array1<f64>;
+    type Output = f64;
+
+    fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
+        struct Deal {
+            closing_at: DateTime<Utc>,
+            open_price: f64,
+        }
+
+        let last_time = self.values[self.values.len() - 1].time;
+        let calculator = SignalCalculator::from_optimizer_param(last_time, self.hold_time, param);
+
+        let (mut correct, mut incorrect) = (0, 0);
+
+        let mut cur_deal = Option::<Deal>::None;
+        let mut pnl = 0.0;
+        self.values.iter()
+            .for_each(|v| {
+                if let Some(deal) = &cur_deal {
+                    if v.time >= deal.closing_at {
+                        let price_delta = v.mid - deal.open_price;
+                        let weight = (-(last_time - v.time).as_seconds_f64() / self.decay_time).exp();
+                        if self.is_positive {
+                            if price_delta > 0.0 {
+                                correct += 1;
+                            } else {
+                                incorrect += 1;
+                            }
+                            pnl += weight * price_delta;
+                        } else {
+                            if price_delta > 0.0 {
+                                incorrect += 1;
+                            } else {
+                                correct += 1;
+                            }
+                            pnl -= weight * price_delta;
+                        }
+                        cur_deal = None;
+                    }
+                } else {
+                    let signal = calculator.calculate(v);
+                    if signal > f64::MIN_POSITIVE && self.is_positive || signal < -f64::MIN_POSITIVE && !self.is_positive {
+                        cur_deal = Some(Deal {open_price: v.mid, closing_at: v.time + TimeDelta::milliseconds(self.hold_time as i64)});
+                    }
+                }
+            });
+        if let Some(correctness) = self.correctness.as_ref() {
+            correctness.replace((correct, incorrect));
+        }
+        Ok(-pnl)
+    }
+}
+
+pub fn calibrate_signal_calculator(values: &[OrderBookValues], is_buying: bool, decay_time: f64, hold_time: u16) -> Option<SignalCalculator> {
+    //let horizons = build_horizon(values, hold_time);
+    match execute_optimization(values, hold_time, is_buying, decay_time) {
+        Ok(result) => {
+            if let Some(calculator) = &result {
+                debug!("{} calibration score: {}", calculator.get_created_on(), calculator.get_train_score());
+            }
+            result
+        },
+        Err(err) => {
+            error!("Failed to optimize {} calculator: {err}", if is_buying { "buying" } else { "selling" });
+            None
+        }
+    }
+}
+
+fn build_horizon(values: &[OrderBookValues], hold: u16) -> Vec<f64> {
+    let mut result = Vec::with_capacity(values.len());
+
+    for (i, v) in values.iter().enumerate() {
+        let target_time = values[i].time + TimeDelta::milliseconds(hold as i64);
+        let horizon = if let Some(h) = find_value_on_horizon(values, i, target_time) {
+            h.mid - values[i].mid
         } else {
-            CalculatorsPair::new_down(calculator, last_time)
+            0.0
         };
-
-        let (_, profit) = run_simulation(self.values, &pair, self.tau_time);
-        Ok(-profit)
-    }
-}
-
-pub fn calibrate_signal_calculator(values: &[OrderBookValues], is_up: bool, decay_time: f64, fixed_hold_time: Option<u16>) -> Option<SignalCalculator> {
-    let mut best_profit = 0.0;
-    let mut best_calculator = None;
-    
-    for hold_time_ms in HOLD_TIME_VARIANTS {
-        if let Some(fixed_hold) = fixed_hold_time && hold_time_ms != fixed_hold {
-            continue;
-        }
-
-        let calc = match calibrate_signal_calculator_on_hold_time(values, is_up, hold_time_ms, decay_time) {
-            Ok(calc) => calc,
-            Err(err) => {
-                error!("Failed to optimize {} calculator: {err}", if is_up { "up" } else { "down" });
-                None
-            }
-        };
-        if let Some(calc) = calc {
-            let profit = calc.get_train_profit();
-            if profit > best_profit {
-                best_profit = profit;
-                best_calculator = Some(calc);
-            }
-        }
+        result.push(horizon);
     }
 
-    debug!("{} {}: best score {best_profit} with {best_calculator:?}",
-        values[values.len() - 1].time, if is_up { "Up" } else { "Down" });
-    best_calculator
+    result
 }
 
-fn calibrate_signal_calculator_on_hold_time(
+fn find_value_on_horizon(values: &[OrderBookValues], index: usize, target_time: DateTime<Utc>) -> Option<OrderBookValues> {
+    let mut i = index;
+    while i < values.len() {
+        if values[i].time >= target_time {
+            return Some(values[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn execute_optimization(
     values: &[OrderBookValues],
-    is_up: bool,
-    hold_time_ms: u16,
+    //horizons: &[f64],
+    hold_time: u16,
+    is_positive: bool,
     decay_time: f64,
 ) -> Result<Option<SignalCalculator>, CommonError> {
-    let initial = Array1::from_vec(
-        //      A    D1   D2   I3   I5   I10  I20  I50  I3   I5   I10  I20  I50
-        vec![3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    );
+    let initial = Array1::from_vec(vec![0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]);
 
     let mut simplex = Vec::with_capacity(initial.len() + 1);
 
@@ -80,58 +177,45 @@ fn calibrate_signal_calculator_on_hold_time(
 
     for i in 0..initial.len() {
         let mut point = initial.clone();
-        point[i] += match i {
-            0 => 1.0,      // A
-            1 | 2 => 0.2,  // D1, D2
-            _ => 0.1,      // Imbalance
-        };
+        point[i] += 0.12;
         simplex.push(point);
     }
 
     let solver = NelderMead::<Array1<f64>, f64>::new(simplex.clone());
-
-    /*let solver = ParticleSwarm::new(
-        (Array1::from_vec(vec![0.0, 0.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]),
-        Array1::from_vec(vec![10.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])),
-        72
-    );*/
-
-    let problem = TradeSimProblem { values, is_up, hold_time_ms, tau_time: decay_time };
-
-    debug!("Start optimization {} on events {} - {}",
-        if is_up {"UP"} else {"DOWN"}, values[0].time, values[values.len() - 1].time);
-    let result = Executor::new(problem, solver)
-        .configure(|state| state.max_iters(4096))
+    let result = Executor::new(
+        TradingProblem {
+            values, is_positive, decay_time, hold_time, correctness: None
+        },
+        solver,
+    ).configure(|state| state.max_iters(512))
         .run()?;
-    let optimized_profit = -result.state().get_best_cost();
-    let param = result.state().get_best_param().ok_or("Failed to get best param")?;
-
-    debug!("{} opt profit {optimized_profit} with {param:?} and hold {hold_time_ms}", if is_up {"UP"} else {"DOWN"});
-
-    let mut calc = SignalCalculator::from_optimizer_param(hold_time_ms, param);
-    let pair = if is_up {
-        CalculatorsPair::new_up(calc, values[values.len() - 1].time)
-    } else {
-        CalculatorsPair::new_down(calc, values[values.len() - 1].time)
+    
+    let last_time = values[values.len() - 1].time;
+    let best_score = -result.state().get_best_cost();
+    let best_param = result.state().get_best_param().ok_or("Failed to get best param from executor state")?;
+    
+    let correctness = Rc::new(RefCell::new((0, 0)));
+    let problem = TradingProblem {
+        values, is_positive, decay_time, hold_time, correctness: Some(correctness.clone())
     };
+    let _ = problem.cost(best_param);
+    
+    let mut calculator = SignalCalculator::from_optimizer_param(last_time, hold_time, best_param);
 
-    let (deals, profit) = run_simulation(values, &pair, decay_time);
-    if profit != optimized_profit {
-        warn!("{} opt profit {optimized_profit} but verified is {profit}", if is_up {"UP"} else {"DOWN"});
-    }
-
-    calc.set_performance(SignalPerformance {
-        chosen_hold_time: calc.get_hold_time_ms(),
-        training_total_pnl: profit,
-        training_deals: deals,
+    let correctness = correctness.take();
+    calculator.set_performance(SignalPerformance {
+        train_diapason: TimeDiapason::new(values[0].time, last_time),
+        hold_time,
+        training_score: best_score,
+        training_correct_predictions: correctness.0,
+        training_incorrect_predictions: correctness.1,
         actual_total_pnl: 0.0,
         actual_deals: 0,
         actual_wins: 0,
     });
 
-    //Ok(Some(calc))
-    if profit > 0.0 {
-        Ok(Some(calc))
+    if best_score > 0.0 {
+        Ok(Some(calculator))
     } else {
         Ok(None)
     }

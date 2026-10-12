@@ -1,4 +1,4 @@
-use crate::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
+use crate::{ModelConfig, WalkForwardModel, WindowData};
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
 use chrono::Datelike;
@@ -7,22 +7,19 @@ use model::events::OrderBookEvent;
 use ndarray::Array1;
 use model::common::CommonError;
 use model::math_util::standard_deviation;
-use crate::simulation::SimDeal;
 
 pub struct StrategyOptimizer {
-    instrument1_id: i32,
-    instrument2_id: i32,
+    instrument_id: i32,
 }
 
 impl StrategyOptimizer {
-    pub fn new(instrument1_id: i32, instrument2_id: i32) -> Self {
+    pub fn new(instrument_id: i32) -> Self {
         Self {
-            instrument1_id,
-            instrument2_id,
+            instrument_id,
         }
     }
 
-    pub fn optimize(&self, events: &[OrderBookEvent]) -> Result<ModelConfig, CommonError> {
+    pub fn optimize(&self, events: &[OrderBookEvent], hold_time: u16) -> Result<ModelConfig, CommonError> {
         let initial = Array1::from(
             // train_size, decay, stddiv_window
             vec![60.0, 15.0, 1200.0]
@@ -42,13 +39,13 @@ impl StrategyOptimizer {
         }
 
         let solver = NelderMead::<Array1<f64>, f64>::new(simplex.clone());
-        let problem = GlobalProblem { events, instrument1_id: self.instrument1_id, instrument2_id: self.instrument2_id };
+        let problem = GlobalProblem { events, instrument_id: self.instrument_id, hold_time };
         let result = Executor::new(problem, solver)
             .configure(|state| state.max_iters(128))
             .run()?;
         let optimized_score = -result.state().get_best_cost();
         let param = result.state().get_best_param().ok_or("Failed to get best param")?;
-        let config = config_from_param(param);
+        let config = config_from_param(param, hold_time);
         info!("Best score {optimized_score} with {config:?}");
 
         Ok(config)
@@ -57,8 +54,8 @@ impl StrategyOptimizer {
 
 struct GlobalProblem<'a> {
     events: &'a [OrderBookEvent],
-    instrument1_id: i32,
-    instrument2_id: i32,
+    instrument_id: i32,
+    hold_time: u16,
 }
 
 impl CostFunction for GlobalProblem<'_> {
@@ -66,16 +63,15 @@ impl CostFunction for GlobalProblem<'_> {
     type Output = f64;
 
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
-        let config = config_from_param(param);
+        let config = config_from_param(param, self.hold_time);
         info!("Check {config:?}");
-        let model = WalkForwardModel::new_with_config(
-            self.instrument1_id, self.instrument2_id, config,
+        let model = WalkForwardModel::new_buying(
+            self.instrument_id, config,
         );
         let mut window_data = WindowData::new();
 
         let mut daily_pnl = Vec::new();
         let (mut daily_revenue, mut daily_cost) = (0.0, 0.0);
-        let mut active_deal = Option::<SimDeal>::None;
 
         let mut prev_event_time = self.events[0].order_book.timestamp;
 
@@ -88,28 +84,7 @@ impl CostFunction for GlobalProblem<'_> {
             prev_event_time = event.order_book.timestamp;
 
             model.calibrate(true);
-            let signal = model.process(&mut window_data, event);
-            if let Some((v1, v2)) = model.get_last_values() {
-                if let Some(deal) = active_deal.as_mut() {
-                    deal.close1(&v1, &v2);
-                    deal.close2(&v1, &v2);
-                    if let Some((revenue, cost)) = deal.try_finish() {
-                        daily_revenue += revenue;
-                        daily_cost += cost;
-                        active_deal = None;
-                    }
-                } else {
-                    match signal {
-                        TradeSignal::None => {}
-                        TradeSignal::Sell1Buy2(hold) => {
-                            active_deal = Some(SimDeal::sell1_buy2(&v1, &v2, signal, hold));
-                        }
-                        TradeSignal::Buy1Sell2(hold) => {
-                            active_deal = Some(SimDeal::buy1_sell2(&v1, &v2, signal, hold));
-                        }
-                    }
-                }
-            }
+            let _signal = model.process(&mut window_data, event);
         }
         if daily_revenue > 0.0 || daily_cost > 0.0 {
             daily_pnl.push(daily_revenue - daily_cost);
@@ -124,11 +99,13 @@ impl CostFunction for GlobalProblem<'_> {
     }
 }
 
-fn config_from_param(param: &Array1<f64>) -> ModelConfig {
+fn config_from_param(param: &Array1<f64>, hold_time_ms: u16) -> ModelConfig {
     ModelConfig {
         train_data_minutes: param[0].abs().round() as u16,
         decay_time: param[1].abs(),
-        std_diapason_s: param[2].abs().round() as u16,
-        ..ModelConfig::default()
+        derivatives_normalize_diapason_s: (0.021 * param[0] + 3.9).exp(),
+        trend_tau_s: (0.021 * param[1] + 3.9).exp(),
+        train_interval_minutes: 1,
+        hold_time_ms,
     }
 }

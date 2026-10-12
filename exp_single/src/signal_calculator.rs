@@ -6,11 +6,11 @@ use ndarray::Array1;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SignalCalculator {
-    pub threshold_positive: f64,
-    pub threshold_negative: f64,
+    pub threshold: f64,
     pub imbalance_weights: [f64; IMBALANCE_LEVELS.len()],
     pub imbalance_derivative_weights: [f64; IMBALANCE_LEVELS.len()],
     pub trend_weight: f64,
+    pub mid_derivative_weight: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -22,16 +22,16 @@ pub struct OptimizationResult {
 impl SignalCalculator {
     fn from_param(param: &Array1<f64>) -> Self {
         Self {
-            threshold_positive: 0.0001 + param[0].abs(),
-            threshold_negative: -0.0001 - param[1].abs(),
-            imbalance_weights: [param[2], param[3], param[4], param[5], param[6]],
-            imbalance_derivative_weights: [param[7], param[8], param[9], param[10], param[11]],
-            trend_weight: param[12],
+            threshold: 0.0001 + param[0].abs(),
+            imbalance_weights: [param[1], param[2], param[3], param[4], param[5]],
+            imbalance_derivative_weights: [param[6], param[7], param[8], param[9], param[10]],
+            trend_weight: param[11],
+            mid_derivative_weight: param[12],
         }
     }
 
     pub fn calculate(&self, v: &OrderBookValues) -> f64 {
-        let mut score = 0.0;
+        let mut score = v.mid_derivative * self.mid_derivative_weight;
 
         for (i, w) in self.imbalance_weights.iter().enumerate() {
             score += v.imbalances[i] * w
@@ -44,13 +44,13 @@ impl SignalCalculator {
         score += (v.trend - v.mid) * self.trend_weight;
 
         if score >= 0.0 {
-            if score > self.threshold_positive {
+            if score > self.threshold {
                 score
             } else {
                 0.0
             }
         } else {
-            if score < self.threshold_negative {
+            if score < -self.threshold {
                 score
             } else {
                 0.0
@@ -58,8 +58,8 @@ impl SignalCalculator {
         }
     }
 
-    pub fn optimize(values: &[OrderBookValues], horizons: &[f64], penalty: f64) -> Option<OptimizationResult> {
-        let initial = Array1::from_vec(vec![0.1, -0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.1]);
+    pub fn optimize(values: &[OrderBookValues], horizons: &[f64], is_positive: bool, penalty: f64) -> Option<OptimizationResult> {
+        let initial = Array1::from_vec(vec![0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
 
         let mut simplex = Vec::with_capacity(initial.len() + 1);
 
@@ -67,13 +67,13 @@ impl SignalCalculator {
 
         for i in 0..initial.len() {
             let mut point = initial.clone();
-            point[i] += 0.1;
+            point[i] += 0.12;
             simplex.push(point);
         }
 
         let solver = NelderMead::<Array1<f64>, f64>::new(simplex.clone());
         match Executor::new(
-            NaivePnLProblem { values, horizons: horizons.to_vec(), penalty },
+            NaivePnLProblem { values, horizons: horizons.to_vec(), is_positive, penalty },
             solver,
         )
         .configure(|state| state.max_iters(512))
@@ -100,6 +100,7 @@ impl SignalCalculator {
 struct NaivePnLProblem<'a> {
     values: &'a [OrderBookValues],
     horizons: Vec<f64>,
+    is_positive: bool,
     penalty: f64,
 }
 
@@ -113,9 +114,9 @@ impl CostFunction for NaivePnLProblem<'_> {
         let sum = self.values.iter().zip(self.horizons.iter()).enumerate()
             .map(|(i, (v, horizon))| {
                 let signal = if i > 500 { calculator.calculate(v) } else { 0.0 };
-                if signal < -f64::MIN_POSITIVE {
+                if signal < -f64::MIN_POSITIVE && !self.is_positive {
                     -*horizon - self.penalty
-                } else if signal > f64::MIN_POSITIVE {
+                } else if signal > f64::MIN_POSITIVE && self.is_positive {
                     *horizon - self.penalty
                 } else { 0.0 }
             }).sum::<f64>();

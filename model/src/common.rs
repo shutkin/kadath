@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 pub type CommonError = Box<dyn std::error::Error + Send + Sync>;
 pub type EmptyResult = Result<(), CommonError>;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub struct TimeDiapason {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,

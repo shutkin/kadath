@@ -14,6 +14,7 @@ pub struct OrderBookValues {
     pub imbalances: [f64; IMBALANCE_LEVELS.len()],
     pub imbalances_derivative: [f64; IMBALANCE_LEVELS.len()],
     pub trend: f64,
+    pub mid_derivative: f64,
 }
 
 impl OrderBookValues {
@@ -55,11 +56,12 @@ impl OrderBookValues {
             imbalances,
             imbalances_derivative: [0.0; IMBALANCE_LEVELS.len()],
             trend: mid,
+            mid_derivative: 0.0,
         })
     }
 
     pub fn calculate_window_values(values: &mut [OrderBookValues], normalize_seconds: f64, trend_tau_seconds: f64) {
-        // Calculate absolute derivatives
+        // Calculate absolute imbalances derivatives
         let mut derivatives = vec![Vec::with_capacity(values.len()); IMBALANCE_LEVELS.len()];
         for i in 0..values.len() {
             let mut id = [0.0; IMBALANCE_LEVELS.len()];
@@ -77,7 +79,7 @@ impl OrderBookValues {
             }
         }
 
-        // Normalize derivatives
+        // Normalize imbalances derivatives
         for i in 1..values.len() {
             if normalize_seconds > 0.1 {
                 let start_time = values[i].time - TimeDelta::milliseconds((normalize_seconds * 1000.0) as i64);
@@ -96,6 +98,38 @@ impl OrderBookValues {
                 for imbalance_index in 0..IMBALANCE_LEVELS.len() {
                     values[i].imbalances_derivative[imbalance_index] = derivatives[imbalance_index][i];
                 }
+            }
+        }
+
+        // Calculate absolute mid derivatives
+        let mut derivatives = Vec::with_capacity(values.len());
+        for i in 0..values.len() {
+            let mut derivative = 0.0;
+            if i > 0 {
+                let delta_time = values[i].time.timestamp_millis() - values[i - 1].time.timestamp_millis();
+                if delta_time > 0 {
+                    let d = values[i].mid - values[i - 1].mid;
+                    derivative = d / delta_time as f64;
+                }
+            }
+            derivatives.push(derivative);
+        }
+
+        // Normalize imbalances derivatives
+        for i in 1..values.len() {
+            if normalize_seconds > 0.1 {
+                let start_time = values[i].time - TimeDelta::milliseconds((normalize_seconds * 1000.0) as i64);
+                let mut window_start = i - 1;
+                while window_start > 0 && values[window_start].time > start_time {
+                    window_start -= 1;
+                }
+                if let Some(std) = standard_deviation(&derivatives[window_start .. i]) && std > f64::MIN_POSITIVE {
+                    values[i].mid_derivative = derivatives[i] / std;
+                } else {
+                    values[i].mid_derivative = derivatives[i];
+                }
+            } else {
+                values[i].mid_derivative = derivatives[i];
             }
         }
 
