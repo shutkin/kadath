@@ -6,7 +6,7 @@ create table instrument
     lot_size smallint
 );
 create index on instrument (ticker);
-
+/*
 create table order_book
 (
     id            bigserial,
@@ -17,7 +17,7 @@ create table order_book
 );
 create index on order_book (created);
 create index on order_book (instrument_id);
-
+*/
 create table order_book_full
 (
     id            bigserial,
@@ -28,7 +28,7 @@ create table order_book_full
 );
 create index on order_book_full (created);
 create index on order_book_full (instrument_id);
-
+/*
 create table order_book_ask
 (
     order_book_id bigint,
@@ -44,13 +44,13 @@ create table order_book_bid
     size          integer
 );
 create index on order_book_bid (order_book_id);
-
+*/
 create table price
 (
     id    serial,
     price numeric
 );
-
+/*
 create table spread_deal
 (
     id serial,
@@ -85,7 +85,7 @@ create table deal
     leg2_close_order_id varchar
 );
 create index on deal (started);
-
+*/
 create table trade
 (
     id serial,
@@ -116,7 +116,7 @@ comment on column instrument.source is 'A - Alor, T - T-Invest';
 alter table instrument add column external_id varchar;
 
 alter table signal_calculator add column train_time_ms int;
-
+/*
 create table signal_calculator2
 (
     id serial primary key,
@@ -128,3 +128,4 @@ create table signal_calculator2
     train_time_ms int
 );
 create index on signal_calculator2 (trained_on);
+*/

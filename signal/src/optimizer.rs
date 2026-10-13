@@ -11,6 +11,8 @@ use std::rc::Rc;
 
 const HOLD_TIME_TO_SCORE_PENALTY_RATIO: f64 = 1.0 / 15_000.0;
 
+const COMMISSION: f64 = 0.0;
+
 
 enum ProblemKind { HORIZON, TRADING }
 
@@ -109,14 +111,14 @@ impl ScoreProvider for TradingProblem {
                             } else {
                                 incorrect += 1;
                             }
-                            pnl += weight * price_delta;
+                            pnl += weight * price_delta - weight * COMMISSION;
                         } else {
                             if price_delta > 0.0 {
                                 incorrect += 1;
                             } else {
                                 correct += 1;
                             }
-                            pnl -= weight * price_delta;
+                            pnl += weight * -price_delta - weight * COMMISSION;
                         }
                         cur_deal = None;
                     }
