@@ -23,8 +23,8 @@ pub const HOLD_TIME_VARIANTS: [u16; 6] = [200, 300, 500, 750, 1000, 1500];
 #[derive(Copy, Clone)]
 pub enum TradeSignal {
     None,
-    Sell(u16),
-    Buy(u16),
+    Sell(i32),
+    Buy(i32),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -34,7 +34,7 @@ pub struct ModelConfig {
     pub train_data_minutes: u16,
     pub train_interval_minutes: u16,
     pub decay_time: f64,
-    pub hold_time_ms: u16,
+    pub hold_time_ms: i32,
 }
 
 pub struct WindowData {

@@ -28,7 +28,7 @@ impl ListenerHandler {
             self.order_book_queue.push(event.clone());
 
             debug!("Save snapshot order book {:?}", event.order_book);
-            if let Err(err) = self.db.insert_order_book_compact(&event.order_book, instrument).await {
+            if let Err(err) = self.db.insert_order_book(&event.order_book, instrument).await {
                 error!("Failed to save order book: {}", err);
             }
         }

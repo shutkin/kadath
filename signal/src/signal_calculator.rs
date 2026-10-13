@@ -1,14 +1,14 @@
 use crate::orderbook_values::{IMBALANCE_LEVELS, OrderBookValues};
 use chrono::{DateTime, Utc};
+use model::common::TimeDiapason;
 use ndarray::Array1;
 use std::collections::HashMap;
-use model::common::TimeDiapason;
 
 #[derive(Copy, Clone, Debug)]
 pub struct SignalCalculator {
     created_on: DateTime<Utc>,
     
-    hold_time_ms: u16,
+    hold_time_ms: i32,
     threshold: f64,
     imbalance_weights: [f64; IMBALANCE_LEVELS.len()],
     imbalance_derivative_weights: [f64; IMBALANCE_LEVELS.len()],
@@ -22,7 +22,7 @@ pub struct SignalCalculator {
 pub struct SignalPerformance {
     pub train_diapason: TimeDiapason,
 
-    pub hold_time: u16,
+    pub hold_time: i32,
 
     pub training_score: f64,
     pub training_correct_predictions: i32,
@@ -34,16 +34,16 @@ pub struct SignalPerformance {
 }
 
 impl SignalCalculator {
-    pub fn from_optimizer_param(time: DateTime<Utc>, hold_time_ms: u16, param: &Array1<f64>) -> Self {
+    pub fn from_optimizer_param(time: DateTime<Utc>, hold_time_ms: i32, param: &Array1<f64>) -> Self {
         Self {
             created_on: time,
             hold_time_ms,
 
             threshold: 0.0001 + param[0].abs(),
             imbalance_weights: [param[1], param[2], param[3], param[4], param[5]],
-            imbalance_derivative_weights: [param[6], param[7], param[8], param[9], param[10]],
+            imbalance_derivative_weights: [0.0; 5],
             trend_weight: param[11],
-            mid_derivative_weight: 0.0,// param[12],
+            mid_derivative_weight: 0.0,
             
             performance: SignalPerformance::default(),
         }
@@ -56,6 +56,7 @@ impl SignalCalculator {
             self.imbalance_derivative_weights[0], self.imbalance_derivative_weights[1], self.imbalance_derivative_weights[2],
             self.imbalance_derivative_weights[3], self.imbalance_derivative_weights[4],
             self.trend_weight,
+            self.mid_derivative_weight,
         ])
     }
 
@@ -67,7 +68,7 @@ impl SignalCalculator {
         self.performance.training_score
     }
     
-    pub fn get_hold_time_ms(&self) -> u16 {
+    pub fn get_hold_time_ms(&self) -> i32 {
         self.hold_time_ms
     }
     
@@ -84,14 +85,14 @@ impl SignalCalculator {
     }
 
     pub fn calculate(&self, v: &OrderBookValues) -> f64 {
-        let mut score = 0.0;
+        let mut score = v.mid_derivative * self.mid_derivative_weight;
 
         for (i, w) in self.imbalance_weights.iter().enumerate() {
             score += v.imbalances[i] * w
         }
 
         for (i, w) in self.imbalance_derivative_weights.iter().enumerate() {
-            score += v.imbalances_derivative[i] * w
+            score += v.imbalances_derivatives[i] * w
         }
 
         score += (v.trend - v.mid) * self.trend_weight;

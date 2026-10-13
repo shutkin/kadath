@@ -66,43 +66,9 @@ pub struct OrderDataSlice {
     pub order_data: Vec<OrderData>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TradeDirection {
     Buy, Sell,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum DealStatus {
-    Opening,
-    OpenConfirmed,
-    Closing,
-    CloseConfirmed,
-    OpenFailed,
-    CloseFailed,
-}
-
-impl DealStatus {
-    pub fn get_code(&self) -> &str {
-        match self {
-            DealStatus::Opening => "0",
-            DealStatus::OpenConfirmed => "1",
-            DealStatus::Closing => "2",
-            DealStatus::CloseConfirmed => "3",
-            DealStatus::OpenFailed => "8",
-            DealStatus::CloseFailed => "9",
-        }
-    }
-    
-    pub fn from_code (code: &str) -> DealStatus {
-        match code { 
-            "0" => DealStatus::Opening,
-            "1" => DealStatus::OpenConfirmed,
-            "2" => DealStatus::Closing,
-            "3" => DealStatus::CloseConfirmed,
-            "4" => DealStatus::OpenFailed,
-            _ => DealStatus::CloseFailed,
-        }
-    }
 }
 
 impl TradeDirection {
@@ -128,37 +94,39 @@ impl TradeDirection {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct SpreadDeal {
-    pub id: i32,
-    pub instrument_id: i32,
-    pub started: DateTime<Utc>,
-    pub direction: TradeDirection,
-    pub hold: u16,
-    pub open_price_expected: Option<Decimal>,
-    pub close_price_expected: Option<Decimal>,
-    pub open_order_id: Option<String>,
-    pub close_order_id: Option<String>,
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OrderStatus {
+    NotStarted, Started, Executed, Failed,
+}
+
+impl OrderStatus {
+    pub fn to_short_string(&self) -> String {
+        match self {
+            OrderStatus::NotStarted => "n".to_string(),
+            OrderStatus::Started => "s".to_string(),
+            OrderStatus::Executed => "e".to_string(),
+            OrderStatus::Failed => "f".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Deal {
     pub id: i32,
-    pub started: DateTime<Utc>,
-    pub leg1_instrument_id: i32,
-    pub leg2_instrument_id: i32,
+    pub instrument_id: i32,
+    pub lots: u16,
     pub direction: TradeDirection,
-    pub hold: u16,
-    pub leg1_status: DealStatus,
-    pub leg2_status: DealStatus,
-    pub leg1_open_price_expected: Decimal,
-    pub leg2_open_price_expected: Decimal,
-    pub leg1_close_price_expected: Option<Decimal>,
-    pub leg2_close_price_expected: Option<Decimal>,
-    pub leg1_open_order_id: Option<String>,
-    pub leg2_open_order_id: Option<String>,
-    pub leg1_close_order_id: Option<String>,
-    pub leg2_close_order_id: Option<String>,
+    pub max_hold: i32,
+
+    pub open_time: DateTime<Utc>,
+    pub expected_open_price: Decimal,
+    pub open_order_id: Option<String>,
+    pub open_status: OrderStatus,
+
+    pub close_time: Option<DateTime<Utc>>,
+    pub expected_close_price: Option<Decimal>,
+    pub close_order_id: Option<String>,
+    pub close_status: OrderStatus,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

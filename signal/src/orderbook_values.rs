@@ -11,14 +11,17 @@ pub struct OrderBookValues {
     pub ask: f64,
     pub bid: f64,
     pub mid: f64,
+    pub mid_derivative: f64,
     pub imbalances: [f64; IMBALANCE_LEVELS.len()],
-    pub imbalances_derivative: [f64; IMBALANCE_LEVELS.len()],
+    pub imbalances_derivatives: [f64; IMBALANCE_LEVELS.len()],
     pub trend: f64,
 }
 
 pub struct WindowValuesCalculator {
+    window_mids: Vec<f64>,
+    window_mids_derivatives: Vec<f64>,
     window_imbalances: Vec<Vec<f64>>,
-    window_derivatives: Vec<Vec<f64>>,
+    window_imbalances_derivatives: Vec<Vec<f64>>,
     window_times: Vec<DateTime<Utc>>,
     trend: f64,
 }
@@ -26,8 +29,10 @@ pub struct WindowValuesCalculator {
 impl WindowValuesCalculator {
     pub fn new() -> Self {
         Self {
+            window_mids: Vec::new(),
+            window_mids_derivatives: Vec::new(),
             window_imbalances: vec![Vec::new(); IMBALANCE_LEVELS.len()],
-            window_derivatives: vec![Vec::new(); IMBALANCE_LEVELS.len()],
+            window_imbalances_derivatives: vec![Vec::new(); IMBALANCE_LEVELS.len()],
             window_times: Vec::new(),
             trend: 0.0,
         }
@@ -60,8 +65,9 @@ impl WindowValuesCalculator {
         }
 
         let trend = self.calculate_trend(order_book.timestamp, mid, trend_tau_s);
-        let normalized_derivatives = self.calculate_derivatives_and_move(
+        let (mid_derivative, imbalances_derivatives) = self.calculate_derivatives_and_move(
             order_book.timestamp,
+            mid,
             imbalances,
             derivative_diapason_s,
         );
@@ -70,27 +76,36 @@ impl WindowValuesCalculator {
             ask: best_ask,
             bid: best_bid,
             mid,
+            mid_derivative,
             imbalances,
-            imbalances_derivative: normalized_derivatives,
+            imbalances_derivatives,
             trend,
         }
     }
 
-    fn calculate_derivatives_and_move(&mut self, time: DateTime<Utc>, imbalances: [f64; IMBALANCE_LEVELS.len()], diapason_s: f64) -> [f64; IMBALANCE_LEVELS.len()] {
+    fn calculate_derivatives_and_move(
+        &mut self,
+        time: DateTime<Utc>,
+        mid: f64,
+        imbalances: [f64; IMBALANCE_LEVELS.len()],
+        diapason_s: f64,
+    ) -> (f64, [f64; IMBALANCE_LEVELS.len()]) {
         let window_start = time - TimeDelta::seconds(MAX_WINDOW_LENGTH_S);
         while !self.window_times.is_empty() && self.window_times[0] < window_start {
             self.window_times.remove(0);
             for imbalance_index in 0..IMBALANCE_LEVELS.len() {
                 self.window_imbalances[imbalance_index].remove(0);
-                self.window_derivatives[imbalance_index].remove(0);
+                self.window_imbalances_derivatives[imbalance_index].remove(0);
             }
         }
 
+        let mut mid_derivative = 0.0;
         let mut derivatives = [0.0; IMBALANCE_LEVELS.len()];
         let prev_index = self.window_times.len() as i32 - 1;
         if prev_index >= 0 {
             let dt = (time.timestamp_millis() - self.window_times[prev_index as usize].timestamp_millis()) as f64;
             if dt > f64::MIN_POSITIVE {
+                mid_derivative = (mid - self.window_mids[prev_index as usize]) / dt;
                 for imbalance_index in 0..IMBALANCE_LEVELS.len() {
                     derivatives[imbalance_index] = (imbalances[imbalance_index] - self.window_imbalances[imbalance_index][prev_index as usize]) / dt;
                 }
@@ -102,22 +117,30 @@ impl WindowValuesCalculator {
         while start_index < self.window_times.len() && self.window_times[start_index] < data_start {
             start_index += 1;
         }
+        
+        let mut mid_derivative_normalized = 0.0;
+        let deviation = standard_deviation(&self.window_mids_derivatives[start_index..]).unwrap_or(0.0);
+        if deviation > f64::MIN_POSITIVE {
+            mid_derivative_normalized = mid_derivative / deviation;
+        }
 
         let mut derivatives_normalized = [0.0; IMBALANCE_LEVELS.len()];
         for imbalance_index in 0..IMBALANCE_LEVELS.len() {
-            let deviation = standard_deviation(&self.window_derivatives[imbalance_index][start_index..]).unwrap_or(0.0);
+            let deviation = standard_deviation(&self.window_imbalances_derivatives[imbalance_index][start_index..]).unwrap_or(0.0);
             if deviation > f64::MIN_POSITIVE {
                 derivatives_normalized[imbalance_index] = derivatives[imbalance_index] / deviation;
             }
         }
 
+        self.window_mids.push(mid);
+        self.window_mids_derivatives.push(mid_derivative);
         for imbalance_index in 0..IMBALANCE_LEVELS.len() {
             self.window_imbalances[imbalance_index].push(imbalances[imbalance_index]);
-            self.window_derivatives[imbalance_index].push(derivatives[imbalance_index]);
+            self.window_imbalances_derivatives[imbalance_index].push(derivatives[imbalance_index]);
         }
         self.window_times.push(time);
 
-        derivatives_normalized
+        (mid_derivative_normalized, derivatives_normalized)
     }
 
     fn calculate_trend(&mut self, time: DateTime<Utc>, mid: f64, tau_s: f64) -> f64 {

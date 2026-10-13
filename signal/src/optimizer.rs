@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 const HOLD_TIME_TO_SCORE_PENALTY_RATIO: f64 = 1.0 / 15_000.0;
 
-const COMMISSION: f64 = 0.0;
+const COMMISSION: f64 = 0.5;
 
 
 enum ProblemKind { HORIZON, TRADING }
@@ -37,7 +37,7 @@ impl CostFunction for ProblemWrapper {
 struct HorizonProblem {
     values: Vec<OrderBookValues>,
     horizons: Vec<f64>,
-    hold_time: u16,
+    hold_time: i32,
     is_positive: bool,
     decay_time: f64,
     correctness: Option<Rc<RefCell<(i32, i32)>>>,
@@ -79,7 +79,7 @@ impl ScoreProvider for HorizonProblem {
 
 struct TradingProblem {
     values: Vec<OrderBookValues>,
-    hold_time: u16,
+    hold_time: i32,
     is_positive: bool,
     decay_time: f64,
     correctness: Option<Rc<RefCell<(i32, i32)>>>,
@@ -138,8 +138,8 @@ impl ScoreProvider for TradingProblem {
 }
 
 pub fn calibrate_signal_calculator(prev: &Option<SignalCalculator>, values: &[OrderBookValues], is_buying: bool,
-                                   decay_time: f64, hold_time: u16) -> Option<SignalCalculator> {
-    let initial = prev.map(|calc| calc.to_optimizer_param()).unwrap_or(Array1::from_vec(vec![0.0; 12]));
+                                   decay_time: f64, hold_time: i32) -> Option<SignalCalculator> {
+    let initial = prev.map(|calc| calc.to_optimizer_param()).unwrap_or(Array1::from_vec(vec![0.0; 13]));
     match execute_optimization(initial, values, hold_time, is_buying, decay_time, ProblemKind::TRADING) {
         Ok(result) => {
             if let Some(calculator) = &result {
@@ -154,7 +154,7 @@ pub fn calibrate_signal_calculator(prev: &Option<SignalCalculator>, values: &[Or
     }
 }
 
-fn build_horizon(values: &[OrderBookValues], hold: u16) -> Vec<f64> {
+fn build_horizon(values: &[OrderBookValues], hold: i32) -> Vec<f64> {
     let mut result = Vec::with_capacity(values.len());
 
     for (i, v) in values.iter().enumerate() {
@@ -184,7 +184,7 @@ fn find_value_on_horizon(values: &[OrderBookValues], index: usize, target_time: 
 fn execute_optimization(
     initial: Array1<f64>,
     values: &[OrderBookValues],
-    hold_time: u16,
+    hold_time: i32,
     is_positive: bool,
     decay_time: f64,
     problem_kind: ProblemKind,

@@ -2,7 +2,7 @@ use crate::executor::{KadathExecutor, LastPrices};
 use crate::queue::Queue;
 use abstract_broker::BrokerBox;
 use chrono::{DateTime, TimeDelta, Utc};
-use db::{Db, QueryAsksOrBids};
+use db::Db;
 use log::{error, info, warn};
 use model::common::{EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
@@ -15,7 +15,7 @@ use serde::Serialize;
 
 pub struct KadathTrader {
     queue: Arc<Queue<OrderBookEvent>>,
-    instruments: Vec<Instrument>,
+    instrument: Instrument,
     model: WalkForwardModel,
     db: Db,
     executor: KadathExecutor,
@@ -26,19 +26,26 @@ impl KadathTrader {
     pub fn new(
         broker: BrokerBox,
         queue: Arc<Queue<OrderBookEvent>>,
-        instruments: Vec<Instrument>,
+        instrument: Instrument,
         db: Db,
         trades: Arc<Queue<Trade>>,
     ) -> Self {
-        let config = ModelConfig { std_diapason_s: 1211, train_data_minutes: 42, train_interval_minutes: 1, decay_time: 12.406388913778208, fixed_hold_time: None };
-        let model = WalkForwardModel::new_with_config(instruments[0].id.unwrap(), instruments[1].id.unwrap(), config);
+        let config = ModelConfig {
+            hold_time_ms: 25000,
+            derivatives_normalize_diapason_s: 325.0,
+            trend_tau_s: 176.0,
+            train_data_minutes: 45,
+            train_interval_minutes: 1,
+            decay_time: 360.0,
+        };
+        let model = WalkForwardModel::new_buying(instrument.id.unwrap(), config);
         
         let last_prices = Arc::new(Mutex::new(LastPrices::default()));
-        let executor = KadathExecutor::new(broker, &instruments, trades, last_prices.clone(), db.clone());
+        let executor = KadathExecutor::new(broker, instrument.clone(), trades, last_prices.clone(), db.clone());
         
         Self {
             queue,
-            instruments,
+            instrument,
             model,
             db,
             executor,
@@ -47,19 +54,14 @@ impl KadathTrader {
     }
     
     #[inline]
-    fn inst1_id(&self) -> i32 {
-        self.instruments[0].id.unwrap_or_default()
+    fn inst_id(&self) -> i32 {
+        self.instrument.id.unwrap_or_default()
     }
 
-    #[inline]
-    fn inst2_id(&self) -> i32 {
-        self.instruments[1].id.unwrap_or_default()
-    }
-    
     pub async fn run(&self) -> EmptyResult {
-        //if let Err(err) = self.run_calibration() {
-        //    error!("Failed to run calibration task: {err}");
-        //}
+        if let Err(err) = self.run_calibration() {
+            error!("Failed to run calibration task: {err}");
+        }
 
         let mut window_data = WindowData::new();
         self.consume_history(&mut window_data).await?;
@@ -92,14 +94,10 @@ impl KadathTrader {
 
             let mut last_prices_copy = None;
             if let Ok(last_prices) = self.last_prices.lock().as_mut() {
-                if event.instrument_id == self.inst1_id() {
-                    last_prices.leg1_time = event.order_book.timestamp;
-                    last_prices.leg1_ask = lowest_price(&event.order_book.asks);
-                    last_prices.leg1_bid = highest_price(&event.order_book.bids);
-                } else if event.instrument_id == self.inst2_id() {
-                    last_prices.leg2_time = event.order_book.timestamp;
-                    last_prices.leg2_ask = lowest_price(&event.order_book.asks);
-                    last_prices.leg2_bid = highest_price(&event.order_book.bids);
+                if event.instrument_id == self.inst_id() {
+                    last_prices.time = event.order_book.timestamp;
+                    last_prices.ask = lowest_price(&event.order_book.asks);
+                    last_prices.bid = highest_price(&event.order_book.bids);
                 }
                 last_prices_copy = Some(last_prices.clone());
             }
@@ -108,15 +106,14 @@ impl KadathTrader {
             let resp = self.model.calibrate(true);
             let elapsed = Utc::now().signed_duration_since(started);
 
-            let up_map = resp.up.map(|calc| calc.to_params_map()).unwrap_or_default();
-            let down_map = resp.down.map(|calc| calc.to_params_map()).unwrap_or_default();
+            let down_map = resp.calculator.map(|calc| calc.to_params_map()).unwrap_or_default();
 
-            if !up_map.is_empty() || !down_map.is_empty() {
+            if !down_map.is_empty() {
                 let calculator_log = SignalCalculatorLog {
                     trained_on: event.order_book.timestamp,
-                    up_score: up_map.get("score").map(|s| *s as f32),
+                    up_score: None,
                     down_score: down_map.get("score").map(|s| *s as f32),
-                    up_params: if up_map.is_empty() { None } else { serde_json::to_string(&up_map).ok() },
+                    up_params: None,
                     down_params: if down_map.is_empty() { None } else { serde_json::to_string(&down_map).ok() },
                     train_time_ms: elapsed.num_milliseconds() as i32,
                 };
@@ -136,8 +133,8 @@ impl KadathTrader {
                 if !self.executor.has_active_deal() {
                     match signal {
                         TradeSignal::None => {}
-                        TradeSignal::Sell1Buy2(hold) => {
-                            info!("Sell1 Buy2 hold: {hold:?}");
+                        TradeSignal::Buy(hold) => {
+                            info!("Sell hold: {hold:?}");
                             if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold).await {
                                 error!("error opening deal: {err}");
                             } else {
@@ -145,14 +142,8 @@ impl KadathTrader {
                                 info!("Deals: {deals}");
                             }
                         }
-                        TradeSignal::Buy1Sell2(hold) => {
-                            info!("Buy1 Sell2 hold: {hold:?}");
-                            if let Err(err) = self.executor.open_deal(TradeDirection::Buy, hold).await {
-                                error!("error opening deal: {err}");
-                            } else {
-                                deals += 1;
-                                info!("Deals: {deals}");
-                            }
+                        TradeSignal::Sell(hold) => {
+                            info!("Buy hold: {hold:?}");
                         }
                     }
                 } else if let Some(last_prices) = last_prices_copy {
@@ -183,9 +174,8 @@ impl KadathTrader {
             Utc::now() - TimeDelta::hours(8),
             Utc::now(),
         );
-        let ob1 = self.db.get_order_books(Some(self.inst1_id()), diapason, QueryAsksOrBids::BOTH).await?;
-        let ob2 = self.db.get_order_books(Some(self.inst2_id()), diapason, QueryAsksOrBids::BOTH).await?;
-        let events = merge_events(&[self.inst1_id(), self.inst2_id()], &[ob1, ob2]);
+        let ob = self.db.get_order_books(self.inst_id(), diapason).await?;
+        let events = merge_events(&[self.inst_id()], &[ob]);
         info!("Got {} history events", events.len());
         for event in events {
             if !event.order_book.asks.is_empty() && !event.order_book.bids.is_empty() {
@@ -208,15 +198,14 @@ impl KadathTrader {
             async move {
                 let resp = model_clone.calibrate(false);
 
-                let up_map = resp.up.map(|calc| calc.to_params_map()).unwrap_or_default();
-                let down_map = resp.down.map(|calc| calc.to_params_map()).unwrap_or_default();
+                let down_map = resp.calculator.map(|calc| calc.to_params_map()).unwrap_or_default();
 
-                if !up_map.is_empty() || !down_map.is_empty() {
+                if !down_map.is_empty() {
                     let calculator_log = SignalCalculatorLog {
                         trained_on: Utc::now(),
-                        up_score: up_map.get("score").map(|s| *s as f32),
+                        up_score: None,
                         down_score: down_map.get("score").map(|s| *s as f32),
-                        up_params: if up_map.is_empty() { None } else { serde_json::to_string(&up_map).ok() },
+                        up_params: None,
                         down_params: if down_map.is_empty() { None } else { serde_json::to_string(&down_map).ok() },
                         train_time_ms: 0,
                     };

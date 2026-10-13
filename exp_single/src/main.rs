@@ -178,8 +178,8 @@ async fn get_order_books(
     if let Some(order_books1) = order_book_cache::read(ticker, diapason, true)? {
         Ok(order_books1)
     } else {
-        let order_books1 = db.get_order_books_compact(id, diapason).await?;
-        order_book_cache::write(ticker, diapason, &order_books1, true)?;
-        Ok(order_books1)
+        let order_books = db.get_order_books(id, diapason).await?;
+        order_book_cache::write(ticker, diapason, &order_books, true)?;
+        Ok(order_books)
     }
 }

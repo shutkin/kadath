@@ -1,37 +1,12 @@
 use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
-use model::utils::handle_delta;
-use model::{DataSource, SpreadDeal, Instrument, OrderBook, OrderData, OrderDataCompact, SignalCalculatorLog, Trade, TradeDirection, Deal, DealStatus};
+use model::{DataSource, Deal, Instrument, OrderBook, OrderData, OrderDataCompact, OrderStatus, SignalCalculatorLog, Trade, TradeDirection};
 use rust_decimal::Decimal;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, Row};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-
-pub enum QueryAsksOrBids {
-    ASKS,
-    BIDS,
-    BOTH,
-}
-
-impl QueryAsksOrBids {
-    fn is_asks(&self) -> bool {
-        match self {
-            QueryAsksOrBids::ASKS => true,
-            QueryAsksOrBids::BIDS => false,
-            QueryAsksOrBids::BOTH => true,
-        }
-    }
-
-    fn is_bids(&self) -> bool {
-        match self {
-            QueryAsksOrBids::ASKS => false,
-            QueryAsksOrBids::BIDS => true,
-            QueryAsksOrBids::BOTH => true,
-        }
-    }
-}
 
 #[derive(Clone)]
 struct Prices {
@@ -153,148 +128,9 @@ impl Db {
         Ok(res)
     }
 
-    fn deserialize_and_handle(data: &[u8], cur_data: &mut Vec<OrderData>, prices_map: &HashMap<i32, Decimal>) -> Result<bool, CommonError> {
-        let (delta_vec, _): (Vec<OrderDataCompact>, usize) = bincode::serde::decode_from_slice(data, bincode::config::standard())?;
-        let mut deltas = Vec::with_capacity(delta_vec.len());
-        for delta in delta_vec {
-            if let Some(price) = prices_map.get(&delta.price_id).copied() {
-                deltas.push(OrderData { price, size: delta.size });
-            } else {
-                warn!("Price ID {} not found in map", delta.price_id);
-                return Ok(false);
-            }
-        }
-        handle_delta(&deltas, cur_data);
-        Ok(true)
-    }
-
-    pub async fn get_order_books(
-        &self,
-        instrument_id: Option<i32>,
-        diapason: TimeDiapason,
-        ab: QueryAsksOrBids,
-    ) -> Result<Vec<OrderBook>, CommonError> {
-        let instrument_id = instrument_id.ok_or::<CommonError>("Instrument has no id".into())?;
-
+    pub async fn get_order_books(&self, instrument_id: i32, diapason: TimeDiapason) -> Result<Vec<OrderBook>, CommonError> {
         info!("Query order books instrument {instrument_id} {diapason:?}");
-        let rows = sqlx::query("SELECT id, created, ask_delta, bid_delta FROM order_book WHERE instrument_id = $1 AND created BETWEEN $2 AND $3 ORDER BY created")
-            .bind(instrument_id)
-            .bind(diapason.from)
-            .bind(diapason.to)
-            .fetch_all(&self.pool).await?;
-
-        let full_ids = rows
-            .iter()
-            .filter(|row| {
-                let v: Option<&[u8]> = row.get(2);
-                v.is_none()
-            })
-            .map(|row| {
-                let id: i64 = row.get(0);
-                id
-            })
-            .collect::<Vec<i64>>();
-        let mut full_asks = if ab.is_asks() {
-            self.get_order_data(&full_ids, "order_book_ask").await?
-        } else {
-            HashMap::default()
-        };
-        let mut full_bids = if ab.is_bids() {
-            self.get_order_data(&full_ids, "order_book_bid").await?
-        } else {
-            HashMap::default()
-        };
-
-        let mut prices_map = HashMap::new();
-        self.prices.get_prices(&mut prices_map);
-        let mut cur_asks = Vec::new();
-        let mut cur_bids = Vec::new();
-
-        let mut result = Vec::new();
-        let mut prev_percentage = 0;
-        for (i, row) in rows.iter().enumerate() {
-            let id = row.get(0);
-            let asks_encoded: Option<Vec<u8>> = row.get(2);
-            let bids_encoded: Option<Vec<u8>> = row.get(3);
-            let mut order_book = OrderBook {
-                id: Some(id),
-                timestamp: row.get(1),
-                asks: Vec::default(),
-                bids: Vec::default(),
-            };
-
-            if ab.is_asks() {
-                if let Some(asks) = full_asks.remove(&id) {
-                    cur_asks = asks.clone();
-                    order_book.asks = asks;
-                } else if let Some(asks_encoded) = asks_encoded {
-                    loop {
-                        if Self::deserialize_and_handle(&asks_encoded, &mut cur_asks, &prices_map)? {
-                            break;
-                        }
-                        self.prices.init(&self.pool).await?;
-                        self.prices.get_prices(&mut prices_map);
-                    }
-                    order_book.asks = cur_asks.clone();
-                }
-            }
-            if ab.is_bids() {
-                if let Some(bids) = full_bids.remove(&id) {
-                    cur_bids = bids.clone();
-                    order_book.bids = bids;
-                } else if let Some(bids_encoded) = bids_encoded {
-                    loop {
-                        if Self::deserialize_and_handle(&bids_encoded, &mut cur_bids, &prices_map)? {
-                            break;
-                        }
-                        self.prices.init(&self.pool).await?;
-                        self.prices.get_prices(&mut prices_map);
-                    }
-                    order_book.bids = cur_bids.clone();
-                }
-            }
-
-            if !order_book.asks.is_empty() || !order_book.bids.is_empty() {
-                result.push(order_book);
-            }
-
-            let percentage = i * 100 / rows.len();
-            if percentage > prev_percentage {
-                debug!("Process {percentage}%");
-                prev_percentage = percentage;
-            }
-        }
-        Ok(result)
-    }
-
-    async fn get_order_data(
-        &self,
-        order_book_ids: &[i64],
-        table_name: &str,
-    ) -> Result<HashMap<i64, Vec<OrderData>>, CommonError> {
-        let rows = sqlx::query(
-            &format!("SELECT o.order_book_id, p.price, o.size FROM {table_name} o JOIN price p ON o.price_id = p.id WHERE order_book_id IN (SELECT * FROM unnest($1))"))
-            .bind(order_book_ids)
-            .fetch_all(&self.pool).await?;
-        let mut result: HashMap<i64, Vec<OrderData>> = HashMap::with_capacity(order_book_ids.len());
-        for row in rows {
-            let order_book_id = row.get(0);
-            let data = OrderData {
-                price: row.get(1),
-                size: row.get(2),
-            };
-            if let Some(vec) = result.get_mut(&order_book_id) {
-                vec.push(data);
-            } else {
-                result.insert(order_book_id, vec![data]);
-            }
-        }
-        Ok(result)
-    }
-
-    pub async fn get_order_books_compact(&self, instrument_id: i32, diapason: TimeDiapason) -> Result<Vec<OrderBook>, CommonError> {
-        info!("Query order books instrument {instrument_id} {diapason:?}");
-        let rows = sqlx::query("SELECT id, created, ask, bid FROM order_book_full WHERE instrument_id = $1 AND created BETWEEN $2 AND $3 ORDER BY id")
+        let rows = sqlx::query("SELECT id, created, ask, bid FROM order_book WHERE instrument_id = $1 AND created BETWEEN $2 AND $3 ORDER BY id")
             .bind(instrument_id)
             .bind(diapason.from)
             .bind(diapason.to)
@@ -333,7 +169,7 @@ impl Db {
         Ok(result)
     }
 
-    pub async fn insert_order_book_compact(&self, order_book: &OrderBook, instrument: &Instrument) -> Result<(), CommonError> {
+    pub async fn insert_order_book(&self, order_book: &OrderBook, instrument: &Instrument) -> Result<(), CommonError> {
         let instrument_id = instrument
             .id
             .ok_or::<CommonError>(format!("Instrument {} has no id", instrument.ticker).into())?;
@@ -342,7 +178,7 @@ impl Db {
         let bid_serialized = self.serialize_compact(&order_book.bids).await?;
 
         sqlx::query(
-            "INSERT INTO order_book_full (created, instrument_id, ask, bid) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO order_book (created, instrument_id, ask, bid) VALUES ($1, $2, $3, $4)",
         )
             .bind(order_book.timestamp)
             .bind(instrument_id)
@@ -353,167 +189,54 @@ impl Db {
         Ok(())
     }
 
-    async fn insert_order_book(
-        &self,
-        order_book: &OrderBook,
-        instrument: &Instrument,
-    ) -> Result<i64, CommonError> {
-        let instrument_id = instrument
-            .id
-            .ok_or::<CommonError>(format!("Instrument {} has no id", instrument.ticker).into())?;
-        let res = sqlx::query(
-            "INSERT INTO order_book (created, instrument_id) VALUES ($1, $2) RETURNING id",
-        )
-        .bind(order_book.timestamp)
-        .bind(instrument_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(res.get(0))
-    }
+    pub async fn start_deal(&self, instrument_id: i32, lots: u16, direction: TradeDirection, hold: i32, cur_price: Decimal) -> Result<Deal, CommonError> {
+        let open_time = Utc::now();
 
-    pub async fn insert_order_book_delta(
-        &self,
-        instrument: &Instrument,
-        timestamp: DateTime<Utc>,
-        ask_delta: &[OrderData],
-        bid_delta: &[OrderData],
-    ) -> Result<(), CommonError> {
-        let instrument_id = instrument
-            .id
-            .ok_or::<CommonError>(format!("Instrument {} has no id", instrument.ticker).into())?;
-
-        let ask_serialized = self.serialize_compact(ask_delta).await?;
-        let bid_serialized = self.serialize_compact(bid_delta).await?;
-
-        sqlx::query("INSERT INTO order_book (created, instrument_id, ask_delta, bid_delta) VALUES ($1, $2, $3, $4)")
-            .bind(timestamp)
+        let id_row = sqlx::query("INSERT INTO deal (instrument_id, lots, direction, max_hold, open_time, expected_open_price, open_status, close_status) values ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id")
             .bind(instrument_id)
-            .bind(ask_serialized)
-            .bind(bid_serialized)
-            .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    pub async fn insert_order_book_full(
-        &self,
-        order_book: &OrderBook,
-        instrument: &Instrument,
-    ) -> Result<(), CommonError> {
-        let id = self.insert_order_book(order_book, instrument).await?;
-
-        let mut asks_ids = Vec::with_capacity(order_book.asks.len());
-        let mut asks_sizes = Vec::with_capacity(order_book.asks.len());
-        for ask in &order_book.asks {
-            let price_id = self.prices.get_id(ask.price, &self.pool).await?;
-            asks_ids.push(price_id);
-            asks_sizes.push(ask.size);
-        }
-        let mut bids_ids = Vec::with_capacity(order_book.bids.len());
-        let mut bids_sizes = Vec::with_capacity(order_book.bids.len());
-        for bid in &order_book.bids {
-            let price_id = self.prices.get_id(bid.price, &self.pool).await?;
-            bids_ids.push(price_id);
-            bids_sizes.push(bid.size);
-        }
-
-        sqlx::query("INSERT INTO order_book_ask (order_book_id, price_id, size) SELECT * FROM unnest($1, $2, $3)")
-            .bind(vec![id; order_book.asks.len()])
-            .bind(asks_ids)
-            .bind(asks_sizes)
-            .execute(&self.pool).await?;
-
-        sqlx::query("INSERT INTO order_book_bid (order_book_id, price_id, size) SELECT * FROM unnest($1, $2, $3)")
-            .bind(vec![id; order_book.bids.len()])
-            .bind(bids_ids)
-            .bind(bids_sizes)
-            .execute(&self.pool).await?;
-
-        Ok(())
-    }
-    
-    pub async fn start_spread_deal(&self, instrument_id: i32, direction: TradeDirection, hold: u16, open_price_expected: Option<Decimal>) -> Result<SpreadDeal, CommonError> {
-        let started = Utc::now();
-        let id_row = sqlx::query("INSERT INTO spread_deal (started, instrument_id, direction, hold, open_price_expected) VALUES ($1, $2, $3, $4, $5)")
-            .bind(started)
-            .bind(instrument_id)
+            .bind(lots as i16)
             .bind(direction.to_short_string())
-            .bind(hold as i16)
-            .bind(open_price_expected)
+            .bind(hold)
+            .bind(open_time)
+            .bind(cur_price)
+            .bind(OrderStatus::NotStarted.to_short_string())
+            .bind(OrderStatus::NotStarted.to_short_string())
             .fetch_one(&self.pool).await?;
         let id = id_row.get(0);
-        Ok(SpreadDeal {
+
+        Ok(Deal {
             id,
             instrument_id,
-            started,
+            lots,
             direction,
-            hold: 0,
-            open_price_expected,
-            close_price_expected: None,
+            max_hold: hold,
+
+            open_time,
+            open_status: OrderStatus::NotStarted,
+            expected_open_price: cur_price,
             open_order_id: None,
+
+            close_time: None,
+            close_status: OrderStatus::NotStarted,
+            expected_close_price: None,
             close_order_id: None,
         })
     }
 
-    pub async fn start_deal(
-        &self,
-        leg1_instrument_id: i32,
-        leg2_instrument_id: i32,
-        direction: TradeDirection,
-        hold: u16,
-        leg1_open_price_expected: Decimal,
-        leg2_open_price_expected: Decimal,
-    ) -> Result<Deal, CommonError> {
-        let started = Utc::now();
-        let leg1_status = DealStatus::Opening;
-        let leg2_status = DealStatus::Opening;
-        let id_row = sqlx::query(
-            "INSERT INTO deal (started, leg1_instrument_id, leg2_instrument_id, direction, hold, leg1_status, leg2_status, leg1_open_price_expected, leg2_open_price_expected) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",)
-            .bind(started)
-            .bind(leg1_instrument_id)
-            .bind(leg2_instrument_id)
-            .bind(direction.to_short_string())
-            .bind(hold as i16)
-            .bind(leg1_status.get_code())
-            .bind(leg2_status.get_code())
-            .bind(leg1_open_price_expected)
-            .bind(leg2_open_price_expected)
-            .fetch_one(&self.pool).await?;
-        let id = id_row.get(0);
-        Ok(Deal {
-            id,
-            started,
-            leg1_instrument_id,
-            leg2_instrument_id,
-            direction,
-            hold,
-            leg1_status,
-            leg2_status,
-            leg1_open_price_expected,
-            leg2_open_price_expected,
-            leg1_close_price_expected: None,
-            leg2_close_price_expected: None,
-            leg1_open_order_id: None,
-            leg2_open_order_id: None,
-            leg1_close_order_id: None,
-            leg2_close_order_id: None,
-        })
-    }
-    
     pub async fn update_deal(&self, deal: &Deal) -> EmptyResult {
-            sqlx::query("UPDATE deal SET leg1_close_price_expected = $1, leg2_close_price_expected = $2, leg1_open_order_id = $3, leg2_open_order_id = $4, leg1_close_order_id = $5, leg2_close_order_id = $6, leg1_status = $7, leg2_status = $8 WHERE id = $9")
-                .bind(deal.leg1_close_price_expected)
-                .bind(deal.leg2_close_price_expected)
-                .bind(deal.leg1_open_order_id.clone())
-                .bind(deal.leg2_open_order_id.clone())
-                .bind(deal.leg1_close_order_id.clone())
-                .bind(deal.leg2_close_order_id.clone())
-                .bind(deal.leg1_status.get_code())
-                .bind(deal.leg2_status.get_code())
-                .bind(deal.id)
-                .execute(&self.pool).await?;
+        sqlx::query("UPDATE deal SET open_order_id = $2, open_status = $3, close_time = $4, expected_close_price = $5, close_order_id = $6, close_status = $7  WHERE id = $1")
+            .bind(deal.id)
+            .bind(deal.open_order_id.clone())
+            .bind(deal.open_status.to_short_string())
+            .bind(deal.close_time)
+            .bind(deal.expected_close_price)
+            .bind(deal.close_order_id.clone())
+            .bind(deal.close_status.to_short_string())
+            .execute(&self.pool).await?;
+
         Ok(())
     }
-    
+
     pub async fn insert_trade(&self, trade: &mut Trade) -> EmptyResult {
         let id_row = sqlx::query("INSERT INTO trade (order_id, executed, direction, price, quantity, json) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id")
             .bind(trade.order_id.clone())
@@ -530,18 +253,6 @@ impl Db {
     
     pub async fn insert_calculator_log(&self, log: &SignalCalculatorLog) -> EmptyResult {
         sqlx::query("INSERT INTO signal_calculator (trained_on, up_score, up_params, down_score, down_params, train_time_ms) VALUES ($1, $2, $3, $4, $5, $6)")
-            .bind(log.trained_on)
-            .bind(log.up_score)
-            .bind(log.up_params.clone())
-            .bind(log.down_score)
-            .bind(log.down_params.clone())
-            .bind(log.train_time_ms)
-            .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    pub async fn insert_calculator_log2(&self, log: &SignalCalculatorLog) -> EmptyResult {
-        sqlx::query("INSERT INTO signal_calculator2 (trained_on, up_score, up_params, down_score, down_params, train_time_ms) VALUES ($1, $2, $3, $4, $5, $6)")
             .bind(log.trained_on)
             .bind(log.up_score)
             .bind(log.up_params.clone())
@@ -588,16 +299,6 @@ impl Db {
     }
 
     pub async fn remove_order_books(&self, ids: &[i64], to: DateTime<Utc>) -> Result<(), CommonError> {
-        let res = sqlx::query("DELETE FROM order_book_ask WHERE order_book_id IN (SELECT * FROM unnest($1))")
-            .bind(ids)
-            .execute(&self.pool).await?;
-        info!("removed order books asks {}", res.rows_affected());
-
-        let res = sqlx::query("DELETE FROM order_book_bid WHERE order_book_id IN (SELECT * FROM unnest($1))")
-            .bind(ids)
-            .execute(&self.pool).await?;
-        info!("removed order books bids {}", res.rows_affected());
-
         let res = sqlx::query("DELETE FROM order_book WHERE id IN (SELECT * FROM unnest($1)) AND created < $2")
             .bind(ids)
             .bind(to)

@@ -28,7 +28,7 @@ struct TestDeal {
 }
 
 impl TestDeal {
-    fn open(index: usize, ob: &OrderBook, hold: u16) -> Self {
+    fn open(index: usize, ob: &OrderBook, hold: i32) -> Self {
         TestDeal {
             open_index: index,
             open_time: ob.timestamp,
@@ -138,10 +138,10 @@ async fn main() -> EmptyResult {
     let mut window_data_sell = WindowData::new();
 
     let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-09T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-09T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-13T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-13T20:00:00Z")?.to_utc(),
     );
-    let end = DateTime::parse_from_rfc3339("2026-10-13T00:00:00Z")?.to_utc();
+    let end = DateTime::parse_from_rfc3339("2026-10-14T00:00:00Z")?.to_utc();
 
     let (mut total_income, mut total_outcome, mut total_commission) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
     let mut active_deal = Option::<TestDeal>::None;
@@ -179,7 +179,7 @@ async fn main() -> EmptyResult {
                 if let Some(calc) = &resp.calculator {
                     let elapsed = Instant::now().duration_since(started).as_millis();
                     let pref = calc.get_performances();
-                    info!(
+                    debug!(
                         "Calibration takes {elapsed}ms. Predictions inside training interval {:?}: {} correct, {} incorrect, score {}",
                         pref.train_diapason,
                         pref.training_correct_predictions,
@@ -188,7 +188,7 @@ async fn main() -> EmptyResult {
                     );
 
                     if !process_delays.is_empty() {
-                        info!(
+                        debug!(
                             "Process delay mean {}, median {}, p10-p90 {:?}, max {}",
                             mean(&process_delays), median(&process_delays), p10_p90(&process_delays),
                             process_delays.iter().copied().reduce(f64::max).unwrap_or_default(),
@@ -203,9 +203,20 @@ async fn main() -> EmptyResult {
                 process_delays.push(elapsed);
 
                 if let Some(deal) = active_deal.as_mut() {
+                    let mut close_deal = false;
                     if event.order_book.timestamp > deal.close_time {
-                        if let Some((income, outcome)) = deal.close(i, &event.order_book) {
+                        close_deal = true;
+                    } else {
+                        let cur_price = get_best_bid(&event.order_book);
+                        if cur_price < deal.open_price - Decimal::TWO {
+                            close_deal = true;
+                        } else if cur_price > deal.open_price && event.order_book.timestamp > deal.open_time + TimeDelta::milliseconds(500) {
+                            close_deal = true;
+                        }
+                    }
 
+                    if close_deal {
+                        if let Some((income, outcome)) = deal.close(i, &event.order_book) {
                             if let Some(visualization) = build_deal_visualization(&events, &deal) {
                                 deals_visualisations.push(visualization);
                             }
@@ -216,22 +227,6 @@ async fn main() -> EmptyResult {
                             daily_outcome += outcome;
                             active_deal = None;
                         }
-                    } else {
-                        /*match signal_sell {
-                            TradeSignal::Sell(_) => {
-                                let cur_sell_price = get_best_bid(&event.order_book);
-                                if cur_sell_price > deal.open_price {
-                                    if let Some((income, outcome)) = deal.close(&event.order_book) {
-                                        total_income += income;
-                                        total_outcome += outcome;
-                                        daily_income += income;
-                                        daily_outcome += outcome;
-                                        active_deal = None;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }*/
                     }
                 } else {
                     match signal_buy {
@@ -410,7 +405,7 @@ async fn get_order_books(ticker: &str, id: i32, diapason: TimeDiapason, db: Opti
     if let Some(order_books) = order_book_cache::read(ticker, diapason, true)? {
         Ok(order_books)
     } else {
-        let order_books = db.unwrap().get_order_books_compact(id, diapason).await?;
+        let order_books = db.unwrap().get_order_books(id, diapason).await?;
         order_book_cache::write(ticker, diapason, &order_books, true)?;
         Ok(order_books)
     }

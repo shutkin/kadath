@@ -19,7 +19,7 @@ impl StrategyOptimizer {
         }
     }
 
-    pub fn optimize(&self, events: &[OrderBookEvent], hold_time: u16) -> Result<ModelConfig, CommonError> {
+    pub fn optimize(&self, events: &[OrderBookEvent], hold_time: i32) -> Result<ModelConfig, CommonError> {
         let initial = Array1::from(
             // train_size, decay, stddiv_window
             vec![60.0, 15.0, 1200.0]
@@ -55,7 +55,7 @@ impl StrategyOptimizer {
 struct GlobalProblem<'a> {
     events: &'a [OrderBookEvent],
     instrument_id: i32,
-    hold_time: u16,
+    hold_time: i32,
 }
 
 impl CostFunction for GlobalProblem<'_> {
@@ -99,7 +99,7 @@ impl CostFunction for GlobalProblem<'_> {
     }
 }
 
-fn config_from_param(param: &Array1<f64>, hold_time_ms: u16) -> ModelConfig {
+fn config_from_param(param: &Array1<f64>, hold_time_ms: i32) -> ModelConfig {
     ModelConfig {
         train_data_minutes: param[0].abs().round() as u16,
         decay_time: param[1].abs(),
