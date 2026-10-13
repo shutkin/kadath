@@ -10,13 +10,13 @@ use crate::signal_optimization::{CostFunctionImpl, SignalParams, calibrate_param
 use crate::simulation::run_simulation;
 use crate::stats_collector::future_spreads_correlations;
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
-use db::{Db, QueryAsksOrBids};
 use log::{info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::math_util::standard_deviation;
 use model::{order_book_cache, DataSource, Instrument, OrderBook};
 use simplelog::{LevelFilter, SimpleLogger};
 use std::thread;
+use db::Db;
 
 pub const IMBALANCE_LEVELS: [usize; 5] = [3, 5, 10, 20, 50];
 pub const DEFAULT_HOLD_MS: u16 = 1100;
@@ -46,8 +46,8 @@ async fn get_order_books(tickers: &[&str], ids: &[i32], diapason: TimeDiapason, 
         Ok((order_books1, order_books2))
     } else {
         let (order_books1, order_books2) =
-            (db.unwrap().get_order_books(Some(ids[0]), diapason, QueryAsksOrBids::BOTH).await?,
-             db.unwrap().get_order_books(Some(ids[1]), diapason, QueryAsksOrBids::BOTH).await?);
+            (db.unwrap().get_order_books(ids[0], diapason).await?,
+             db.unwrap().get_order_books(ids[1], diapason).await?);
         order_book_cache::write(tickers[0], diapason, &order_books1, true)?;
         order_book_cache::write(tickers[1], diapason, &order_books2, true)?;
         Ok((order_books1, order_books2))

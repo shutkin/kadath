@@ -70,27 +70,8 @@ impl KadathTrader {
         let mut online_events = 0;
         let mut deals = 0;
 
-        //let mut order_books1 = Vec::new();
-        //let mut order_books2 = Vec::new();
-        //let (mut start_time, mut end_time) = (None, None);
-
         loop {
             let event = self.queue.pop().await;
-
-            /*if let Some(start_time) = start_time {
-                if event.order_book.timestamp > start_time + TimeDelta::minutes(15) {
-                    end_time = Some(event.order_book.timestamp);
-                    break;
-                }
-            } else {
-                start_time = Some(event.order_book.timestamp);
-            }
-
-            if event.instrument_id == self.inst1_id() {
-                order_books1.push(event.order_book.clone());
-            } else if event.instrument_id == self.inst2_id() {
-                order_books2.push(event.order_book.clone());
-            }*/
 
             let mut last_prices_copy = None;
             if let Ok(last_prices) = self.last_prices.lock().as_mut() {
@@ -100,26 +81,6 @@ impl KadathTrader {
                     last_prices.bid = highest_price(&event.order_book.bids);
                 }
                 last_prices_copy = Some(last_prices.clone());
-            }
-
-            let started = Utc::now();
-            let resp = self.model.calibrate(true);
-            let elapsed = Utc::now().signed_duration_since(started);
-
-            let down_map = resp.calculator.map(|calc| calc.to_params_map()).unwrap_or_default();
-
-            if !down_map.is_empty() {
-                let calculator_log = SignalCalculatorLog {
-                    trained_on: event.order_book.timestamp,
-                    up_score: None,
-                    down_score: down_map.get("score").map(|s| *s as f32),
-                    up_params: None,
-                    down_params: if down_map.is_empty() { None } else { serde_json::to_string(&down_map).ok() },
-                    train_time_ms: elapsed.num_milliseconds() as i32,
-                };
-                if let Err(err) = self.db.insert_calculator_log(&calculator_log).await {
-                    error!("Failed to insert calculator log: {err}");
-                }
             }
 
             let signal = self.model.process(&mut window_data, &event);
@@ -135,7 +96,7 @@ impl KadathTrader {
                         TradeSignal::None => {}
                         TradeSignal::Buy(hold) => {
                             info!("Sell hold: {hold:?}");
-                            if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold).await {
+                            if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold.max(35000)).await {
                                 error!("error opening deal: {err}");
                             } else {
                                 deals += 1;
@@ -143,7 +104,7 @@ impl KadathTrader {
                             }
                         }
                         TradeSignal::Sell(hold) => {
-                            info!("Buy hold: {hold:?}");
+                            info!("Sell hold: {hold:?}");
                         }
                     }
                 } else if let Some(last_prices) = last_prices_copy {
@@ -171,7 +132,7 @@ impl KadathTrader {
 
     async fn consume_history(&self, window_data: &mut WindowData) -> EmptyResult {
         let diapason = TimeDiapason::new(
-            Utc::now() - TimeDelta::hours(8),
+            Utc::now() - TimeDelta::hours(1),
             Utc::now(),
         );
         let ob = self.db.get_order_books(self.inst_id(), diapason).await?;

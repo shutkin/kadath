@@ -130,7 +130,7 @@ impl KadathExecutor {
         } else {
             None
         };
-        
+
         if let Some(mut deal) = deal {
             let price = match deal.direction {
                 TradeDirection::Buy => last_prices.bid,
@@ -140,15 +140,28 @@ impl KadathExecutor {
             let mut close = false;
             if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64) {
                 close = true;
-            } else if price < deal.expected_open_price - Decimal::TWO {
-                close = true;
-            } else if price > deal.expected_open_price && last_prices.time > deal.open_time + TimeDelta::milliseconds(500) {
-                close = true;
+            }
+            match deal.direction {
+                TradeDirection::Buy => {
+                    if price > deal.expected_open_price + Decimal::TWO {
+                        close = true;
+                    } else if price < deal.expected_open_price && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
+                        close = true;
+                    }
+                }
+                TradeDirection::Sell => {
+                    if price < deal.expected_open_price - Decimal::TWO {
+                        close = true;
+                    } else if price > deal.expected_open_price && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
+                        close = true;
+                    }
+                }
             }
 
             if close {
                 info!("Closing deal");
                 deal.expected_close_price = Some(price);
+                deal.close_time = Some(Utc::now());
 
                 //let deal = self.make_orders(deal, false).await;
                 if let Ok(mut cur_deal) = self.cur_deal.lock() {

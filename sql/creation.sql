@@ -7,7 +7,7 @@ create table instrument
 );
 create index on instrument (ticker);
 
-create table order_book_full
+create table order_book
 (
     id            bigserial,
     created       timestamp with time zone default now() not null,
@@ -15,8 +15,8 @@ create table order_book_full
     ask     bytea,
     bid     bytea
 );
-create index on order_book_full (created);
-create index on order_book_full (instrument_id);
+create index on order_book (created);
+create index on order_book (instrument_id);
 
 create table price
 (
@@ -30,7 +30,7 @@ create table deal
     instrument_id integer not null,
     lots smallint not null,
     direction char not null,
-    max_hold integer,
+    max_hold integer not null,
 
     open_time timestamp with time zone not null,
     expected_open_price numeric not null,
@@ -44,8 +44,6 @@ create table deal
 );
 create index on deal (instrument_id);
 create index on deal (open_time);
-
-alter table deal alter column max_hold set not null;
 
 create table trade
 (
@@ -77,5 +75,3 @@ comment on column instrument.source is 'A - Alor, T - T-Invest';
 alter table instrument add column external_id varchar;
 
 alter table signal_calculator add column train_time_ms int;
-
-alter table order_book_full rename to order_book;
