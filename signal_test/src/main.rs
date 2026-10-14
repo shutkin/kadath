@@ -138,10 +138,10 @@ async fn main() -> EmptyResult {
     let mut window_data_sell = WindowData::new();
 
     let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-13T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-13T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-14T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-14T20:00:00Z")?.to_utc(),
     );
-    let end = DateTime::parse_from_rfc3339("2026-10-14T00:00:00Z")?.to_utc();
+    let end = DateTime::parse_from_rfc3339("2026-10-15T00:00:00Z")?.to_utc();
 
     let (mut total_income, mut total_outcome, mut total_commission) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
     let mut active_deal = Option::<TestDeal>::None;

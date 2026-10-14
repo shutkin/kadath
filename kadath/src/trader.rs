@@ -1,3 +1,4 @@
+use chrono::Datelike;
 use crate::executor::{KadathExecutor, LastPrices};
 use crate::queue::Queue;
 use abstract_broker::BrokerBox;
@@ -70,8 +71,24 @@ impl KadathTrader {
         let mut online_events = 0;
         let mut deals = 0;
 
+        let (mut start_time, mut end_time) = (None, None);
+        let mut order_books = Vec::new();
+
         loop {
             let event = self.queue.pop().await;
+            if matches!(event.order_book.timestamp.weekday().number_from_monday(), 6 | 7) {
+                // ignore weekends
+                continue;
+            }
+
+            if event.instrument_id == self.inst_id() {
+                order_books.push(event.order_book.clone());
+                if start_time.is_none() {
+                    start_time = Some(event.order_book.timestamp);
+                }
+            }
+
+            let signal = self.model.process(&mut window_data, &event);
 
             let mut last_prices_copy = None;
             if let Ok(last_prices) = self.last_prices.lock().as_mut() {
@@ -79,23 +96,25 @@ impl KadathTrader {
                     last_prices.time = event.order_book.timestamp;
                     last_prices.ask = lowest_price(&event.order_book.asks);
                     last_prices.bid = highest_price(&event.order_book.bids);
+                    last_prices.signal = signal;
                 }
                 last_prices_copy = Some(last_prices.clone());
             }
 
-            let signal = self.model.process(&mut window_data, &event);
             if online_events < 1024 {
                 online_events += 1;
             } else {
                 if online_events == 1024 {
                     info!("Start trading");
                     online_events += 1;
+
+                    end_time = Some(event.order_book.timestamp);
+                    break;
                 }
                 if !self.executor.has_active_deal() {
                     match signal {
                         TradeSignal::None => {}
                         TradeSignal::Buy(hold) => {
-                            info!("Sell hold: {hold:?}");
                             if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold.max(35000)).await {
                                 error!("error opening deal: {err}");
                             } else {
@@ -113,21 +132,16 @@ impl KadathTrader {
             }
         }
 
-        /*if let Some(start_time) = start_time && let Some(end_time) = end_time {
-            let diapason = TimeDiapason::new(start_time - TimeDelta::milliseconds(1), end_time - TimeDelta::milliseconds(1));
-            let db_order_books1 = self.db.get_order_books_compact(self.inst1_id(), diapason).await?;
-            let db_order_books2 = self.db.get_order_books_compact(self.inst2_id(), diapason).await?;
+        if let Some(start_time) = start_time && let Some(end_time) = end_time {
+            let diapason = TimeDiapason::new(start_time - TimeDelta::milliseconds(1), end_time + TimeDelta::milliseconds(1));
+            let db_order_books = self.db.get_order_books(self.inst_id(), diapason).await?;
 
-            if let Err(err) = compare_order_books(&order_books1, &db_order_books1, "order_books1_diffs.json") {
-                error!("Failed to compare order books: {err}");
-            }
-
-            if let Err(err) = compare_order_books(&order_books2, &db_order_books2, "order_books2_diffs.json") {
+            if let Err(err) = compare_order_books(&order_books, &db_order_books, "order_books_diffs.json") {
                 error!("Failed to compare order books: {err}");
             }
         }
 
-        Ok(())*/
+        Ok(())
     }
 
     async fn consume_history(&self, window_data: &mut WindowData) -> EmptyResult {

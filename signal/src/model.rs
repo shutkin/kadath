@@ -27,6 +27,12 @@ pub enum TradeSignal {
     Buy(i32),
 }
 
+impl Default for TradeSignal {
+    fn default() -> Self {
+        TradeSignal::None
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct ModelConfig {
     pub derivatives_normalize_diapason_s: f64,

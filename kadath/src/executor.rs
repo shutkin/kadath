@@ -8,12 +8,14 @@ use model::{Deal, Instrument, OrderStatus, Trade, TradeDirection, TradeStatus};
 use rust_decimal::Decimal;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+use signal::TradeSignal;
 
 #[derive(Copy, Clone, Default)]
 pub struct LastPrices {
     pub time: DateTime<Utc>,
     pub ask: Decimal,
     pub bid: Decimal,
+    pub signal: TradeSignal,
 }
 
 #[derive(Clone)]
@@ -138,22 +140,30 @@ impl KadathExecutor {
             };
 
             let mut close = false;
-            if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64) {
-                close = true;
-            }
+            
             match deal.direction {
                 TradeDirection::Buy => {
-                    if price > deal.expected_open_price + Decimal::TWO {
+                    if price < deal.expected_open_price && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
                         close = true;
-                    } else if price < deal.expected_open_price && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
-                        close = true;
+                    } else {
+                        if !matches!(last_prices.signal, TradeSignal::Buy(_)) {
+                            if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64)
+                                || price > deal.expected_open_price + Decimal::TWO {
+                                close = true;
+                            }
+                        }
                     }
                 }
                 TradeDirection::Sell => {
-                    if price < deal.expected_open_price - Decimal::TWO {
+                    if price > deal.expected_open_price && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
                         close = true;
-                    } else if price > deal.expected_open_price && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
-                        close = true;
+                    } else {
+                        if !matches!(last_prices.signal, TradeSignal::Sell(_)) {
+                            if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64)
+                                || price < deal.expected_open_price - Decimal::TWO {
+                                close = true;
+                            }
+                        }
                     }
                 }
             }
