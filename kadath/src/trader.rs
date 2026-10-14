@@ -1,18 +1,17 @@
-use chrono::Datelike;
 use crate::executor::{KadathExecutor, LastPrices};
 use crate::queue::Queue;
 use abstract_broker::BrokerBox;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::Datelike;
+use chrono::{TimeDelta, Utc};
 use db::Db;
 use log::{error, info, warn};
 use model::common::{EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
-use model::{Instrument, OrderBook, OrderData, SignalCalculatorLog, Trade, TradeDirection};
+use model::{Instrument, OrderData, SignalCalculatorLog, Trade, TradeDirection};
 use rust_decimal::Decimal;
 use signal::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use std::sync::{Arc, Mutex};
 use tokio_schedule::Job;
-use serde::Serialize;
 
 pub struct KadathTrader {
     queue: Arc<Queue<OrderBookEvent>>,
@@ -71,21 +70,11 @@ impl KadathTrader {
         let mut online_events = 0;
         let mut deals = 0;
 
-        let (mut start_time, mut end_time) = (None, None);
-        let mut order_books = Vec::new();
-
         loop {
             let event = self.queue.pop().await;
             if matches!(event.order_book.timestamp.weekday().number_from_monday(), 6 | 7) {
                 // ignore weekends
                 continue;
-            }
-
-            if event.instrument_id == self.inst_id() {
-                order_books.push(event.order_book.clone());
-                if start_time.is_none() {
-                    start_time = Some(event.order_book.timestamp);
-                }
             }
 
             let signal = self.model.process(&mut window_data, &event);
@@ -107,9 +96,6 @@ impl KadathTrader {
                 if online_events == 1024 {
                     info!("Start trading");
                     online_events += 1;
-
-                    end_time = Some(event.order_book.timestamp);
-                    break;
                 }
                 if !self.executor.has_active_deal() {
                     match signal {
@@ -131,17 +117,6 @@ impl KadathTrader {
                 }
             }
         }
-
-        if let Some(start_time) = start_time && let Some(end_time) = end_time {
-            let diapason = TimeDiapason::new(start_time - TimeDelta::milliseconds(1), end_time + TimeDelta::milliseconds(1));
-            let db_order_books = self.db.get_order_books(self.inst_id(), diapason).await?;
-
-            if let Err(err) = compare_order_books(&order_books, &db_order_books, "order_books_diffs.json") {
-                error!("Failed to compare order books: {err}");
-            }
-        }
-
-        Ok(())
     }
 
     async fn consume_history(&self, window_data: &mut WindowData) -> EmptyResult {
@@ -213,85 +188,4 @@ fn lowest_price(data: &[OrderData]) -> Decimal {
         warn!("Can't find lowest price: {data:?}");
     }
     min.unwrap_or_default()
-}
-
-fn compare_order_books(obs1: &[OrderBook], obs2: &[OrderBook], filename: &str) -> EmptyResult {
-    let mut diffs = Vec::new();
-    for (i, ob1) in obs1.iter().enumerate() {
-        let j_from = ((i as i32) - 100).max(0) as usize;
-        let j_to = ((i as i32) + 100).min(obs2.len() as i32 - 1) as usize;
-        let mut nearest_distance = 5000;
-        let mut nearest_j = i;
-        for j in j_from..j_to {
-            let distance = (ob1.timestamp.timestamp_millis() - obs1[j].timestamp.timestamp_millis()).abs();
-            if distance < nearest_distance {
-                nearest_distance = distance;
-                nearest_j = j;
-            }
-        }
-        let asks_diff = compare_data(&ob1.asks, &obs2[nearest_j].asks);
-        let bids_diff = compare_data(&ob1.asks, &obs2[nearest_j].asks);
-        if !asks_diff.is_empty() || !bids_diff.is_empty() {
-            diffs.push(OrderBookDiff {
-                time1: ob1.timestamp,
-                time2: obs2[nearest_j].timestamp,
-                asks: asks_diff,
-                bids: bids_diff,
-            })
-        }
-    }
-    let json = serde_json::to_string(&diffs)?;
-    std::fs::write(filename, json)?;
-
-    Ok(())
-}
-
-fn compare_data(vec1: &[OrderData], vec2: &[OrderData]) -> Vec<OrderDataDiff> {
-    let mut diffs = Vec::new();
-
-    for d1 in vec1 {
-        let d2 = vec2.iter().find(|d| d.price == d1.price);
-        if let Some(d2) = d2 {
-            if d1.size != d2.size {
-                diffs.push(OrderDataDiff {
-                    price: d1.price,
-                    size1: d1.size,
-                    size2: d2.size,
-                });
-            }
-        } else {
-            diffs.push(OrderDataDiff {
-                price: d1.price,
-                size1: d1.size,
-                size2: 0,
-            })
-        }
-    }
-
-    for d2 in vec2 {
-        if !vec1.iter().any(|d| d.price == d2.price) {
-            diffs.push(OrderDataDiff {
-                price: d2.price,
-                size1: 0,
-                size2: d2.size,
-            })
-        }
-    }
-
-    diffs
-}
-
-#[derive(Serialize)]
-struct OrderBookDiff {
-    time1: DateTime<Utc>,
-    time2: DateTime<Utc>,
-    asks: Vec<OrderDataDiff>,
-    bids: Vec<OrderDataDiff>,
-}
-
-#[derive(Serialize)]
-struct OrderDataDiff {
-    price: Decimal,
-    size1: i32,
-    size2: i32,
 }
