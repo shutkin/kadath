@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 const HOLD_TIME_TO_SCORE_PENALTY_RATIO: f64 = 1.0 / 15_000.0;
 
-const COMMISSION: f64 = 0.5;
+const COMMISSION: f64 = 1.5;
 
 
 enum ProblemKind { HORIZON, TRADING }
@@ -132,7 +132,6 @@ impl ScoreProvider for TradingProblem {
         if let Some(correctness) = self.correctness.as_ref() {
             correctness.replace((correct, incorrect));
         }
-
         pnl
     }
 }

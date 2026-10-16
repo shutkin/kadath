@@ -79,7 +79,7 @@ impl KadathExecutor {
     pub fn has_active_deal(&self) -> bool {
         let (is_some, is_expired) = if let Ok(cur_deal) = self.cur_deal.lock() {
             let is_expired = cur_deal.as_ref().map(|deal| {
-                deal.open_time < Utc::now() - TimeDelta::seconds(10)
+                deal.open_time < Utc::now() - TimeDelta::seconds(60)
             }).unwrap_or(false);
             (cur_deal.is_some(), is_expired)
         } else {
@@ -143,26 +143,22 @@ impl KadathExecutor {
             
             match deal.direction {
                 TradeDirection::Buy => {
-                    if price < deal.expected_open_price && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
+                    if price < deal.expected_open_price - Decimal::ONE && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
                         close = true;
                     } else {
-                        if !matches!(last_prices.signal, TradeSignal::Buy(_)) {
-                            if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64)
-                                || price > deal.expected_open_price + Decimal::TWO {
-                                close = true;
-                            }
+                        if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64)
+                            || price > deal.expected_open_price + Decimal::TWO {
+                            close = true;
                         }
                     }
                 }
                 TradeDirection::Sell => {
-                    if price > deal.expected_open_price && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
+                    if price > deal.expected_open_price + Decimal::ONE && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
                         close = true;
                     } else {
-                        if !matches!(last_prices.signal, TradeSignal::Sell(_)) {
-                            if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64)
-                                || price < deal.expected_open_price - Decimal::TWO {
-                                close = true;
-                            }
+                        if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64)
+                            || price < deal.expected_open_price - Decimal::TWO {
+                            close = true;
                         }
                     }
                 }

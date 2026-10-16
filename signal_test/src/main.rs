@@ -6,57 +6,65 @@ use linfa_clustering::KMeans;
 use log::{LevelFilter, debug, error, info};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
-use model::math_util::{mean, median, p10_p90};
+use model::math_util::{mean, median, p05_p95, p10_p90};
 use model::{DataSource, Instrument, OrderBook, order_book_cache};
 use ndarray::Array2;
 use plotters::prelude::*;
 use rust_decimal::Decimal;
+use signal::kernel_prediction::KernelPrediction;
 use signal::strategy_optimizer::StrategyOptimizer;
 use signal::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use simplelog::SimpleLogger;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
 struct TestDeal {
+    prediction: KernelPrediction,
     open_index: usize,
     close_index: Option<usize>,
     open_time: DateTime<Utc>,
     close_time: DateTime<Utc>,
-    open_price: Decimal,
-    close_price: Option<Decimal>,
+    open_price: f64,
+    close_price: Option<f64>,
 }
 
 impl TestDeal {
-    fn open(index: usize, ob: &OrderBook, hold: i32) -> Self {
+    fn open(prediction: KernelPrediction, index: usize, ob: &OrderBook, hold: i32) -> Self {
         TestDeal {
+            prediction,
             open_index: index,
             open_time: ob.timestamp,
             close_time: ob.timestamp + TimeDelta::milliseconds(hold as i64),
-            open_price: get_best_ask(ob),
+            open_price: get_mid_price(ob),
             close_price: None,
             close_index: None,
         }
     }
 
-    fn close(&mut self, index: usize, ob: &OrderBook) -> Option<(Decimal, Decimal)> {
+    fn close(&mut self, index: usize, ob: &OrderBook) {
         if self.close_price.is_some() {
-            return None;
+            return;
         }
 
         self.close_index = Some(index);
         self.close_time = ob.timestamp;
-        let close_price = get_best_bid(ob);
+        let close_price = get_mid_price(ob);
         self.close_price = Some(close_price);
 
-        info!("{} Buy @ {} => {} Sell @ {}", self.open_time, self.open_price, ob.timestamp, close_price);
-        
-        Some((close_price, self.open_price))
+        debug!(
+            "{} Buy @ {} => {} Sell @ {} {:?}",
+            self.open_time.time(),
+            self.open_price,
+            ob.timestamp.time(),
+            close_price,
+            self.prediction
+        );
     }
 }
 
 #[tokio::main]
-async fn _main() -> EmptyResult {
+async fn __main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
@@ -95,12 +103,147 @@ async fn _main() -> EmptyResult {
     Ok(())
 }
 
+fn get_mid_price(order_book: &OrderBook) -> f64 {
+    (get_best_ask(order_book).as_f64() + get_best_bid(order_book).as_f64()) * 0.5
+}
+
 fn get_best_ask(order_book: &OrderBook) -> Decimal {
     order_book.asks.iter().map(|data| data.price).min().unwrap()
 }
 
 fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
+}
+
+#[tokio::main]
+async fn _main() -> EmptyResult {
+    dotenv::dotenv().ok();
+    SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
+    let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
+    let db = Db::new(&db_url).await?;
+
+    let ticker = "GLZ6";
+
+    let all_instruments = db.get_instruments(DataSource::TInvest).await?;
+    let inst_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to fins instrument")?;
+
+    let config_buy = ModelConfig {
+        hold_time_ms: 15000,
+        derivatives_normalize_diapason_s: 325.0,
+        trend_tau_s: 176.0,
+        train_data_minutes: 120,
+        train_interval_minutes: 1,
+        decay_time: 360.0,
+    };
+    let model_buy = WalkForwardModel::new_buying(inst_id, config_buy);
+    let mut window_data_buy = WindowData::new();
+
+    let mut diapason = TimeDiapason::new(
+        DateTime::parse_from_rfc3339("2026-10-14T08:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-14T15:00:00Z")?.to_utc(),
+    );
+
+    let mut prediction_to_real_change = Vec::new();
+
+    let order_books = get_order_books(ticker, inst_id, diapason, Some(&db)).await?;
+    if order_books.is_empty() {
+        diapason.from += TimeDelta::days(1);
+        diapason.to += TimeDelta::days(1);
+        return Ok(());
+    }
+    info!("{} {} order books", order_books.len(), ticker);
+
+    let events = merge_events(&[inst_id], &[order_books]);
+    debug!("Total events: {}", events.len());
+
+    let mut prev_minute = events[0].order_book.timestamp.minute();
+    for (i, event) in events.iter().enumerate() {
+        if event.order_book.timestamp.minute() != prev_minute {
+            prev_minute = event.order_book.timestamp.minute();
+            info!("{}:{prev_minute}", event.order_book.timestamp.hour());
+        }
+
+        //let resp = model_buy.calibrate(true);
+        let _ = model_buy.process(&mut window_data_buy, event);
+        if let Some(prediction) = model_buy.predict(1000) {
+            if let Some(future) = find_value_on_horizon(&events, i, inst_id, event.order_book.timestamp + TimeDelta::milliseconds(1000)) {
+                prediction_to_real_change.push((prediction, get_mid_price(&future) - get_mid_price(&event.order_book)));
+            }
+        }
+    }
+
+    let predictions = prediction_to_real_change.iter()
+        .map(|(prediction, _)| prediction.predicted_change)
+        .collect::<Vec<_>>();
+    let (min, max) = p05_p95(&predictions);
+    for i in 0..4 {
+        let p_from = max * i as f64 / 4.0;
+        let p_to = max * (i + 1) as f64 / 4.0;
+        let changes = prediction_to_real_change.iter()
+            .filter(|(p, _)| p.predicted_change > p_from && p.predicted_change <= p_to)
+            .map(|(_, change)| *change)
+            .collect::<Vec<_>>();
+        let correct = changes.iter().filter(|&c| *c > 0.0).count();
+        info!(
+            "Predicted changes {p_from} - {p_to}: {} real changes with mean {} and median {}. Direction correctness {}",
+            changes.len(), mean(&changes), median(&changes), correct as f64 / changes.len() as f64,
+        );
+    }
+
+    for i in 0..4 {
+        let p_from = min * i as f64 / 4.0;
+        let p_to = min * (i + 1) as f64 / 4.0;
+        let changes = prediction_to_real_change.iter()
+            .filter(|(p, _)| p.predicted_change < p_from && p.predicted_change >= p_to)
+            .map(|(_, change)| *change)
+            .collect::<Vec<_>>();
+        let correct = changes.iter().filter(|&c| *c < 0.0).count();
+        info!(
+            "Predicted changes {p_from} - {p_to}: {} real changes with mean {} and median {}. Direction correctness {}",
+            changes.len(), mean(&changes), median(&changes), correct as f64 / changes.len() as f64,
+        );
+    }
+
+    let strengths = prediction_to_real_change.iter()
+        .map(|(p, _)| p.strength)
+        .collect::<Vec<_>>();
+    let max_strength = strengths.iter().copied().reduce(|a, b| a.max(b)).unwrap_or(0.0);
+    for i in 0..8 {
+        let strength_from = i as f64 * max_strength / 8.0;
+        let strength_to = (i + 1) as f64 * max_strength / 8.0;
+        let errors = prediction_to_real_change.iter()
+            .filter(|(p, _)| p.strength >= strength_from && p.strength <= strength_to)
+            .map(|(p, change)| (p.predicted_change - change).abs())
+            .collect::<Vec<_>>();
+        info!(
+            "Strength {strength_from} - {strength_to}: {} real changes, mean error {}, median error {}",
+            errors.len(), mean(&errors), median(&errors),
+        );
+
+        let correct_by_probabilities = prediction_to_real_change.iter()
+            .filter(|(p, _)| p.strength >= strength_from && p.strength <= strength_to)
+            .map(|(p, change)| {
+                if *change >= 0.0 {
+                    if p.probability_up > p.probability_down {
+                        1_u64
+                    } else {
+                        0_u64
+                    }
+                } else {
+                    if p.probability_down > p.probability_up {
+                        1_u64
+                    } else {
+                        0_u64
+                    }
+                }
+            }).sum::<u64>();
+        info!(
+            "Strength {strength_from} - {strength_to}: prediction by probability {}",
+            correct_by_probabilities as f64 / errors.len() as f64,
+        )
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -116,43 +259,30 @@ async fn main() -> EmptyResult {
     let inst_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to fins instrument")?;
     
     let config_buy = ModelConfig {
-        hold_time_ms: 25000,
+        hold_time_ms: 15000,
         derivatives_normalize_diapason_s: 325.0,
         trend_tau_s: 176.0,
-        train_data_minutes: 45,
+        train_data_minutes: 120,
         train_interval_minutes: 1,
         decay_time: 360.0,
     };
     let model_buy = WalkForwardModel::new_buying(inst_id, config_buy);
     let mut window_data_buy = WindowData::new();
 
-    let config_sell = ModelConfig {
-        hold_time_ms: 1000,
-        derivatives_normalize_diapason_s: 200.0,
-        trend_tau_s: 175.0,
-        train_data_minutes: 60,
-        train_interval_minutes: 1,
-        decay_time: 360.0,
-    };
-    let model_sell = WalkForwardModel::new_selling(inst_id, config_sell);
-    let mut window_data_sell = WindowData::new();
-
     let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-14T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-14T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-16T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-16T20:00:00Z")?.to_utc(),
     );
-    let end = DateTime::parse_from_rfc3339("2026-10-15T00:00:00Z")?.to_utc();
+    let end = DateTime::parse_from_rfc3339("2026-10-17T00:00:00Z")?.to_utc();
 
-    let (mut total_income, mut total_outcome, mut total_commission) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
     let mut active_deal = Option::<TestDeal>::None;
 
+    let mut deals = Vec::new();
     let mut deals_visualisations = Vec::new();
 
     while diapason.from < end {
         if !matches!(diapason.from.weekday().number_from_monday(), 6 | 7) {
             info!("DAY {}", diapason.from.date_naive());
-            let (mut daily_income, mut daily_outcome, mut daily_commission) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
-            let mut daily_deals = 0;
 
             let order_books = get_order_books(ticker, inst_id, diapason, Some(&db)).await?;
             if order_books.is_empty() {
@@ -171,7 +301,7 @@ async fn main() -> EmptyResult {
             for (i, event) in events.iter().enumerate() {
                 if event.order_book.timestamp.hour() != prev_hour {
                     prev_hour = event.order_book.timestamp.hour();
-                    debug!("Hour {prev_hour} PnL {}", daily_income - daily_outcome);
+                    info!("Hour {prev_hour}");
                 }
 
                 let started = Instant::now();
@@ -205,51 +335,146 @@ async fn main() -> EmptyResult {
                 if let Some(deal) = active_deal.as_mut() {
                     let mut close_deal = false;
                     if event.order_book.timestamp > deal.close_time {
-                        close_deal = true;
+                        if let Some(prediction) = model_buy.predict(1000) {
+                            if prediction.predicted_change < 0.0 && prediction.probability_down > prediction.probability_up {
+                                close_deal = true;
+                            }
+                        } else {
+                            close_deal = true;
+                        }
                     } else {
                         let cur_price = get_best_bid(&event.order_book);
-                        if cur_price < deal.open_price - Decimal::TWO {
-                            close_deal = true;
-                        } else if cur_price > deal.open_price && event.order_book.timestamp > deal.open_time + TimeDelta::milliseconds(500) {
+                        if cur_price.as_f64() < deal.open_price - 1.0 && event.order_book.timestamp > deal.open_time + TimeDelta::milliseconds(500) {
                             close_deal = true;
                         }
                     }
 
                     if close_deal {
-                        if let Some((income, outcome)) = deal.close(i, &event.order_book) {
-                            if let Some(visualization) = build_deal_visualization(&events, &deal) {
-                                deals_visualisations.push(visualization);
-                            }
-
-                            total_income += income;
-                            total_outcome += outcome;
-                            daily_income += income;
-                            daily_outcome += outcome;
-                            active_deal = None;
+                    deal.close(i, &event.order_book);
+                        if let Some(visualization) = build_deal_visualization(&events, &deal) {
+                            deals_visualisations.push(visualization);
                         }
+                        deals.push(deal.clone());
+                        active_deal = None;
                     }
                 } else {
                     match signal_buy {
                         TradeSignal::Buy(hold) => {
-                            let deal = TestDeal::open(i, &event.order_book, hold.max(35000));
-                            active_deal = Some(deal);
-                            daily_deals += 1;
+                            if let Some(price_change) = model_buy.get_price_change_from_past(5000)
+                                && price_change > 0.0 {
+                                if let Some(prediction) = model_buy.predict(5000) {
+                                    if prediction.strength > 0.0035
+                                        && prediction.predicted_change > 0.2
+                                        && prediction.probability_up - prediction.probability_flat > -0.65
+                                        && prediction.probability_up - prediction.probability_down > 0.056 {
+                                        let deal = TestDeal::open(prediction, i, &event.order_book, hold);
+                                        active_deal = Some(deal);
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
                 }
             }
-            info!("Day {} net {} on {} deals with commission {}", diapason.from.date_naive(), daily_income - daily_outcome - daily_commission, daily_deals, daily_commission);
         }
         diapason.from += TimeDelta::days(1);
         diapason.to += TimeDelta::days(1);
     }
-    info!("Average deal PnL {}", (total_income.as_f64() - total_outcome.as_f64()) / deals_visualisations.len() as f64);
 
-    let average_deal = average_deal_visual(&deals_visualisations)?;
-    for (i, (cnt, avg)) in average_deal.iter().enumerate() {
-        if let Err(err) = visualize_deal(avg, &format!("{} deals", cnt), &format!("average_deal_{i}.png")) {
-            error!("Can't visualize deal: {err}");
+    let mut pnl = 0.0;
+    let mut positive_predictions = Vec::new();
+    let mut neutral_predictions = Vec::new();
+    let mut negative_predictions = Vec::new();
+    let (mut neutrals, mut positives, mut negatives) = (0, 0, 0);
+    for deal in &deals {
+        if let Some(close_price) = deal.close_price {
+            pnl += close_price - deal.open_price;
+            if close_price >= deal.open_price + 1.5 {
+                positive_predictions.push(deal.prediction);
+                positives += 1;
+            } else if close_price < deal.open_price - 1.5 {
+                negative_predictions.push(deal.prediction);
+                negatives += 1;
+            } else {
+                neutral_predictions.push(deal.prediction);
+                neutrals += 1;
+            }
+        }
+    }
+    info!("Positives {positives}, negatives {negatives}, neutrals {neutrals}");
+    info!("Total PnL {pnl}, PnL per deal {}", pnl / deals.len() as f64);
+
+    if positives > 10 && negatives > 5 && neutrals > 10 {
+        let predictions_changes = positive_predictions.iter().map(|p| p.predicted_change).collect::<Vec<_>>();
+        info!(
+            "Positive predictions changes: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+        let predictions_changes = negative_predictions.iter().map(|p| p.predicted_change).collect::<Vec<_>>();
+        info!(
+            "Negative predictions changes: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+        let predictions_changes = neutral_predictions.iter().map(|p| p.predicted_change).collect::<Vec<_>>();
+        info!(
+            "Neutral predictions changes: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+
+        let predictions_changes = positive_predictions.iter().map(|p| p.strength).collect::<Vec<_>>();
+        info!(
+            "Positive predictions strength: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+        let predictions_changes = negative_predictions.iter().map(|p| p.strength).collect::<Vec<_>>();
+        info!(
+            "Negative predictions strength: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+        let predictions_changes = neutral_predictions.iter().map(|p| p.strength).collect::<Vec<_>>();
+        info!(
+            "Neutral predictions strength: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+
+        let predictions_changes = positive_predictions.iter().map(|p| p.probability_up - p.probability_down).collect::<Vec<_>>();
+        info!(
+            "Positive predictions up - down: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+        let predictions_changes = negative_predictions.iter().map(|p| p.probability_up - p.probability_down).collect::<Vec<_>>();
+        info!(
+            "Negative predictions up - down: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+        let predictions_changes = neutral_predictions.iter().map(|p| p.probability_up - p.probability_down).collect::<Vec<_>>();
+        info!(
+            "Neutral predictions up - down: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+
+        let predictions_changes = positive_predictions.iter().map(|p| p.probability_up - p.probability_flat).collect::<Vec<_>>();
+        info!(
+            "Positive predictions up - flat: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+        let predictions_changes = negative_predictions.iter().map(|p| p.probability_up - p.probability_flat).collect::<Vec<_>>();
+        info!(
+            "Negative predictions up - flat: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+        let predictions_changes = neutral_predictions.iter().map(|p| p.probability_up - p.probability_flat).collect::<Vec<_>>();
+        info!(
+            "Neutral predictions up - flat: mean {}, median {}, p10-p90 {:?}",
+            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
+        );
+
+        let average_deal = average_deal_visual(&deals_visualisations)?;
+        for (i, (cnt, avg)) in average_deal.iter().enumerate() {
+            if let Err(err) = visualize_deal(avg, &format!("{} deals", cnt), &format!("average_deal_{i}.png")) {
+                error!("Can't visualize deal: {err}");
+            }
         }
     }
 
@@ -309,7 +534,7 @@ fn build_deal_visualization(events: &[OrderBookEvent], deal: &TestDeal) -> Optio
         let end = (close_index + 500).min(events.len() - 1);
 
         let start_timestamp = (deal.open_time - TimeDelta::seconds(20)).timestamp_millis() / 500;
-        let end_timestamp = (deal.close_time + TimeDelta::seconds(20)).timestamp_millis() / 500;
+        let end_timestamp = (deal.close_time + TimeDelta::seconds(40)).timestamp_millis() / 500;
 
         let mut half_second_map = HashMap::new();
         for i in start..=end {
@@ -361,7 +586,7 @@ fn visualize_deal(prices: &[f64], title: &str, filename: &str) -> EmptyResult {
 
     chart
         .draw_series(AreaSeries::new(
-            times.iter().map(|&t| (t, if t == 0 || t == 25 {10.0 * max_price} else {0.0})),
+            times.iter().map(|&t| (t, if t == 0 || t == 15 {10.0 * max_price} else {0.0})),
             0.0,
             RED.mix(0.5),
         ))?

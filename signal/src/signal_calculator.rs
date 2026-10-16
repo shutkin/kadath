@@ -41,9 +41,9 @@ impl SignalCalculator {
 
             threshold: 0.0001 + param[0].abs(),
             imbalance_weights: [param[1], param[2], param[3], param[4], param[5]],
-            imbalance_derivative_weights: [0.0; 5],
+            imbalance_derivative_weights: [param[6], param[7], param[8], param[9], param[10]],
             trend_weight: param[11],
-            mid_derivative_weight: 0.0,
+            mid_derivative_weight: param[12],
             
             performance: SignalPerformance::default(),
         }

@@ -1,9 +1,10 @@
 extern crate core;
 
-mod orderbook_values;
+pub mod orderbook_values;
 pub mod signal_calculator;
 mod optimizer;
 pub mod strategy_optimizer;
+pub mod kernel_prediction;
 
 use crate::optimizer::calibrate_signal_calculator;
 use crate::orderbook_values::{OrderBookValues, WindowValuesCalculator};
@@ -11,6 +12,7 @@ use crate::signal_calculator::{SignalCalculator, SignalPerformance};
 use chrono::TimeDelta;
 use model::events::OrderBookEvent;
 use std::sync::{Arc, Mutex, RwLock};
+use crate::kernel_prediction::{predict_kernel, KernelPrediction, KernelConfig};
 
 const MAX_WINDOW_LENGTH_S: i64 = 2000;
 const TRAIN_DATA_MINUTES: u16 = 45;
@@ -97,6 +99,40 @@ impl WalkForwardModel {
             v = lock.last().copied();
         }
         v
+    }
+
+    pub fn get_price_change_from_past(&self, time_ms: i64) -> Option<f64> {
+        if let Ok(buf) = self.buffer.lock() && buf.len() > 3 {
+            let mut i = buf.len() - 1;
+            let last_value = &buf[i];
+            let target_time = last_value.time - TimeDelta::milliseconds(time_ms);
+            while i > 0 && buf[i].time > target_time {
+                i -= 1;
+            }
+            if i > 0 {
+                Some(last_value.mid - buf[i].mid)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn predict(&self, time_ms: i32) -> Option<KernelPrediction> {
+        let buf: Vec<OrderBookValues> = self.buffer.lock()
+            .map(|vec| vec.to_vec())
+            .unwrap_or_default();
+        if let Some(v) = self.get_last_value() {
+            let kernel_config = KernelConfig {
+                bandwidth: 0.2,
+                epsilon: 1.5,
+                min_effective_samples: 1024.0,
+            };
+            predict_kernel(&buf, &v, kernel_config, time_ms)
+        } else {
+            None
+        }
     }
 
     pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {

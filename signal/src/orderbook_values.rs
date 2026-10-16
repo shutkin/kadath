@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use chrono::{DateTime, TimeDelta, Utc};
 use model::math_util::standard_deviation;
 use model::OrderBook;
@@ -15,6 +16,25 @@ pub struct OrderBookValues {
     pub imbalances: [f64; IMBALANCE_LEVELS.len()],
     pub imbalances_derivatives: [f64; IMBALANCE_LEVELS.len()],
     pub trend: f64,
+}
+
+impl OrderBookValues {
+    pub fn to_map(&self) -> HashMap<String, f64> {
+        let mut map = HashMap::new();
+
+        map.insert("ask".to_string(), self.ask);
+        map.insert("bid".to_string(), self.bid);
+        map.insert("mid".to_string(), self.mid);
+        map.insert("mid_derivative".to_string(), self.mid_derivative);
+        for i in 0..IMBALANCE_LEVELS.len() {
+            map.insert(format!("i{}", IMBALANCE_LEVELS[i]), self.imbalances[i]);
+            map.insert(format!("di{}", IMBALANCE_LEVELS[i]), self.imbalances_derivatives[i]);
+        }
+        map.insert("trend".to_string(), self.mid - self.trend);
+
+        map
+    }
+
 }
 
 pub struct WindowValuesCalculator {

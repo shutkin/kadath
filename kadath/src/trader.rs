@@ -31,10 +31,10 @@ impl KadathTrader {
         trades: Arc<Queue<Trade>>,
     ) -> Self {
         let config = ModelConfig {
-            hold_time_ms: 25000,
+            hold_time_ms: 15000,
             derivatives_normalize_diapason_s: 325.0,
             trend_tau_s: 176.0,
-            train_data_minutes: 45,
+            train_data_minutes: 120,
             train_interval_minutes: 1,
             decay_time: 360.0,
         };
@@ -101,11 +101,24 @@ impl KadathTrader {
                     match signal {
                         TradeSignal::None => {}
                         TradeSignal::Buy(hold) => {
-                            if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold.max(35000)).await {
-                                error!("error opening deal: {err}");
-                            } else {
-                                deals += 1;
-                                info!("Deals: {deals}");
+                            if let Some(prediction) = self.model.predict(hold)
+                                && prediction.probability_up > prediction.probability_down
+                                && prediction.strength > 0.0025 {
+                                if prediction.predicted_change > 0.3 && prediction.probability_up > prediction.probability_down {
+                                    if let Err(err) = self.executor.open_deal(TradeDirection::Buy, hold).await {
+                                        error!("error opening UP deal: {err}");
+                                    } else {
+                                        deals += 1;
+                                        info!("Deals: {deals}");
+                                    }
+                                } else if prediction.predicted_change < -0.25 && prediction.probability_down > prediction.probability_up {
+                                    if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold).await {
+                                        error!("error opening DOWN deal: {err}");
+                                    } else {
+                                        deals += 1;
+                                        info!("Deals: {deals}");
+                                    }
+                                }
                             }
                         }
                         TradeSignal::Sell(hold) => {
@@ -121,7 +134,7 @@ impl KadathTrader {
 
     async fn consume_history(&self, window_data: &mut WindowData) -> EmptyResult {
         let diapason = TimeDiapason::new(
-            Utc::now() - TimeDelta::hours(1),
+            Utc::now() - TimeDelta::hours(2),
             Utc::now(),
         );
         let ob = self.db.get_order_books(self.inst_id(), diapason).await?;
