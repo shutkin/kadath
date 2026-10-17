@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 const HOLD_TIME_TO_SCORE_PENALTY_RATIO: f64 = 1.0 / 15_000.0;
 
-const COMMISSION: f64 = 1.5;
+const COMMISSION: f64 = 1.0;
 
 
 enum ProblemKind { HORIZON, TRADING }

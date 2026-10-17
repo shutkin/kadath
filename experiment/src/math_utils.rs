@@ -17,12 +17,6 @@ pub fn median(data: &[f64]) -> f64 {
     }
 }
 
-pub fn p05_p95(data: &[f64]) -> (f64, f64) {
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    (sorted[sorted.len() / 20], sorted[sorted.len() - 1 - sorted.len() / 20])
-}
-
 pub fn positive_percentile(data: &[f64]) -> f64 {
     let positive = data.iter().filter(|x| **x > 0.0).count() as f64;
     100.0 * positive / data.len() as f64

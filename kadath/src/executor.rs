@@ -20,23 +20,22 @@ pub struct LastPrices {
 
 #[derive(Clone)]
 pub struct KadathExecutor {
-    instrument: Arc<Instrument>,
     broker: BrokerBox,
-    cur_deal: Arc<Mutex<Option<Deal>>>,
+    cur_deal: Arc<Mutex<Option<(Instrument, Deal)>>>,
     last_prices: Arc<Mutex<LastPrices>>,
     db: Db,
 }
 
 impl KadathExecutor {
-    pub fn new(broker: BrokerBox, instrument: Instrument, trades: Arc<Queue<Trade>>, last_prices: Arc<Mutex<LastPrices>>, db: Db) -> Self {
-        let cur_deal = Arc::new(Mutex::new(Option::<Deal>::None));
+    pub fn new(broker: BrokerBox, trades: Arc<Queue<Trade>>, last_prices: Arc<Mutex<LastPrices>>, db: Db) -> Self {
+        let cur_deal = Arc::new(Mutex::new(Option::<(Instrument, Deal)>::None));
 
         let cur_deal_clone = cur_deal.clone();
         let db_clone = db.clone();
         tokio::spawn(async move {
             loop {
                 let trade = trades.pop().await;
-                if let Some(mut deal) = if let Ok(lock) = cur_deal_clone.lock() {
+                if let Some((_instrument, mut deal)) = if let Ok(lock) = cur_deal_clone.lock() {
                     lock.clone()
                 } else {
                     None
@@ -70,7 +69,6 @@ impl KadathExecutor {
         Self {
             broker,
             cur_deal,
-            instrument: Arc::new(instrument),
             db,
             last_prices,
         }
@@ -78,7 +76,7 @@ impl KadathExecutor {
 
     pub fn has_active_deal(&self) -> bool {
         let (is_some, is_expired) = if let Ok(cur_deal) = self.cur_deal.lock() {
-            let is_expired = cur_deal.as_ref().map(|deal| {
+            let is_expired = cur_deal.as_ref().map(|(_, deal)| {
                 deal.open_time < Utc::now() - TimeDelta::seconds(60)
             }).unwrap_or(false);
             (cur_deal.is_some(), is_expired)
@@ -95,7 +93,7 @@ impl KadathExecutor {
         is_some
     }
 
-    pub async fn open_deal(&self, direction: TradeDirection, hold: i32) -> EmptyResult {
+    pub async fn open_deal(&self, instrument: Instrument, direction: TradeDirection, hold: i32) -> EmptyResult {
         info!("Opening deal: {direction:?} with hold {hold}");
 
         let last_prices = self.last_prices.lock()
@@ -107,14 +105,14 @@ impl KadathExecutor {
         drop(last_prices);
 
         let deal = self.db.start_deal(
-            self.instrument.id.unwrap_or_default(),
+            instrument.id.unwrap_or_default(),
             1,
             direction,
             hold,
             price,
         ).await?;
         if let Ok(cur_deal) = self.cur_deal.lock().as_mut() {
-            cur_deal.replace(deal.clone());
+            cur_deal.replace((instrument, deal.clone()));
         }
 
         /*let deal = self.make_orders(deal, true).await;
@@ -127,13 +125,13 @@ impl KadathExecutor {
     }
 
     pub async fn try_close_deal(&self, last_prices: LastPrices) {
-        let deal = if let Ok(lock) = self.cur_deal.lock() {
+        let option = if let Ok(lock) = self.cur_deal.lock() {
             lock.clone()
         } else {
             None
         };
 
-        if let Some(mut deal) = deal {
+        if let Some((instrument, mut deal)) = option {
             let price = match deal.direction {
                 TradeDirection::Buy => last_prices.bid,
                 TradeDirection::Sell => last_prices.ask,
@@ -146,8 +144,7 @@ impl KadathExecutor {
                     if price < deal.expected_open_price - Decimal::ONE && last_prices.time > deal.open_time + TimeDelta::milliseconds(300) {
                         close = true;
                     } else {
-                        if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64)
-                            || price > deal.expected_open_price + Decimal::TWO {
+                        if last_prices.time > deal.open_time + TimeDelta::milliseconds(deal.max_hold as i64) {
                             close = true;
                         }
                     }
@@ -183,7 +180,7 @@ impl KadathExecutor {
         }
     }
 
-    async fn make_orders(&self, mut deal: Deal, is_opening: bool) -> Deal {
+    async fn make_orders(&self, instrument: &Instrument, mut deal: Deal, is_opening: bool) -> Deal {
         let direction = if is_opening {deal.direction} else {deal.direction.reverse()};
 
         let id = Uuid::new_v4().to_string();
@@ -201,7 +198,7 @@ impl KadathExecutor {
 
         if is_opening && deal.open_status == OrderStatus::NotStarted
             || !is_opening && deal.close_status == OrderStatus::NotStarted {
-            match self.broker.make_order(&id, &self.instrument, direction, 1).await {
+            match self.broker.make_order(&id, instrument, direction, 1).await {
                 Ok(order_id) => {
                     if is_opening {
                         deal.open_status = OrderStatus::Started;

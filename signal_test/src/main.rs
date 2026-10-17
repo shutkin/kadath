@@ -63,10 +63,32 @@ impl TestDeal {
     }
 }
 
+fn setup_logging(log_filename: &str) -> Result<(), fern::InitError> {
+    fern::Dispatch::new()
+        // Format the log output: [Year-Month-Day Hour:Minute:Second][Level] Message
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{}[{}][{}] {}",
+                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
+                record.target(),
+                record.level(),
+                message
+            ))
+        })
+        // Set the minimum log level to filter messages
+        .level(LevelFilter::Info)
+        // Direct the logs to a file
+        .chain(fern::log_file(log_filename)?)
+        .chain(std::io::stdout())
+        .apply()?;
+    Ok(())
+}
+
+
 #[tokio::main]
-async fn __main() -> EmptyResult {
+async fn main() -> EmptyResult {
     dotenv::dotenv().ok();
-    SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
+    setup_logging("strategy_optimize.log")?;
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
     let db = Db::new(&db_url).await?;
 
@@ -75,10 +97,10 @@ async fn __main() -> EmptyResult {
     let all_instruments = db.get_instruments(DataSource::TInvest).await?;
     let inst_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to fins instrument")?;
     let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-09T14:19:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-09T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-14T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-14T20:00:00Z")?.to_utc(),
     );
-    let end = DateTime::parse_from_rfc3339("2026-10-10T00:00:00Z")?.to_utc();
+    let end = DateTime::parse_from_rfc3339("2026-10-16T00:00:00Z")?.to_utc();
 
     let mut all_events = Vec::new();
 
@@ -91,15 +113,15 @@ async fn __main() -> EmptyResult {
             all_events.extend(events);
         }
 
-            diapason.from += TimeDelta::days(1);
-            diapason.to += TimeDelta::days(1);
-        }
+        diapason.from += TimeDelta::days(1);
+        diapason.to += TimeDelta::days(1);
+    }
 
-        let optimizer = StrategyOptimizer::new(inst_id);
-        info!("Start optimizing");
-        let config = optimizer.optimize(&all_events, 5000)?;
-        std::fs::write("optimized_config_10_09.txt", format!("{config:?}"))?;
-        info!("Done");
+    let optimizer = StrategyOptimizer::new(inst_id);
+    info!("Start optimizing");
+    let config = optimizer.optimize(&all_events, 15000, 120)?;
+    std::fs::write("optimized_config_10_15.txt", format!("{config:?}"))?;
+    info!("Done");
     Ok(())
 }
 
@@ -134,6 +156,12 @@ async fn _main() -> EmptyResult {
         train_data_minutes: 120,
         train_interval_minutes: 1,
         decay_time: 360.0,
+
+        price_change_filter: 0.0,
+        prediction_strength: 0.0035,
+        predicted_change: 0.2,
+        prediction_probability_up_to_flat: -0.65,
+        prediction_probability_up_to_down: 0.056,
     };
     let model_buy = WalkForwardModel::new_buying(inst_id, config_buy);
     let mut window_data_buy = WindowData::new();
@@ -247,7 +275,7 @@ async fn _main() -> EmptyResult {
 }
 
 #[tokio::main]
-async fn main() -> EmptyResult {
+async fn __main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
@@ -265,6 +293,12 @@ async fn main() -> EmptyResult {
         train_data_minutes: 120,
         train_interval_minutes: 1,
         decay_time: 360.0,
+
+        price_change_filter: 0.0,
+        prediction_strength: 0.0035,
+        predicted_change: 0.2,
+        prediction_probability_up_to_flat: -0.65,
+        prediction_probability_up_to_down: 0.056,
     };
     let model_buy = WalkForwardModel::new_buying(inst_id, config_buy);
     let mut window_data_buy = WindowData::new();

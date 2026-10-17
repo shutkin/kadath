@@ -43,6 +43,12 @@ pub struct ModelConfig {
     pub train_interval_minutes: u16,
     pub decay_time: f64,
     pub hold_time_ms: i32,
+    
+    pub price_change_filter: f64, // 0.0
+    pub prediction_strength: f64, // 0.0035
+    pub predicted_change: f64, // 0.2
+    pub prediction_probability_up_to_flat: f64, // -0.65
+    pub prediction_probability_up_to_down: f64, // 0.056
 }
 
 pub struct WindowData {
@@ -154,10 +160,20 @@ impl WalkForwardModel {
             let signal_score = calculator.calculate(&v);
             if signal_score.abs() > f64::MIN_POSITIVE {
                 if self.is_buying && signal_score > 0.0 {
-                    return TradeSignal::Buy(calculator.get_hold_time_ms())
-                } else if !self.is_buying && signal_score < 0.0 {
+                    if let Some(price_change) = self.get_price_change_from_past(5000)
+                        && price_change > self.config.price_change_filter {
+                        if let Some(prediction) = self.predict(5000) {
+                            if prediction.strength > self.config.prediction_strength
+                                && prediction.predicted_change > self.config.predicted_change
+                                && prediction.probability_up - prediction.probability_flat > self.config.prediction_probability_up_to_flat
+                                && prediction.probability_up - prediction.probability_down > self.config.prediction_probability_up_to_down {
+                                return TradeSignal::Buy(calculator.get_hold_time_ms())
+                            }
+                        }
+                    }
+                } /*else if !self.is_buying && signal_score < 0.0 {
                     return TradeSignal::Sell(calculator.get_hold_time_ms())
-                }
+                }*/
             }
         }
         TradeSignal::None

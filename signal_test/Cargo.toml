@@ -9,6 +9,7 @@ db = { path = "../db" }
 signal = { path = "../signal" }
 dotenv = "0.15"
 simplelog = "0.12"
+fern = "0.7"
 tokio = { version = "1.48", features = ["full"] }
 chrono = "0.4"
 log = "0.4"

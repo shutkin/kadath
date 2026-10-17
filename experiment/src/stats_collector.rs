@@ -1,6 +1,6 @@
 use std::io::Write;
 use crate::deal::{Deal, DealDirection};
-use crate::math_utils::{mean, median, p05_p95, positive_percentile};
+use crate::math_utils::{mean, median, positive_percentile};
 use crate::signal_optimization::{calibrate_params, collect_signal_to_pnl_values, CostFunctionImpl, Signal, SignalParams, SignalPnL};
 //use crate::signals::{signal_huber_09_07, signal_spearman_09_07, signal_trading_09_07, signal_unknown_09_03};
 use crate::simulation::{DealHandler, find_order_books_on_horizon, run_stats};
@@ -10,6 +10,7 @@ use log::info;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::ops::Range;
+use model::math_util::p05_p95;
 
 pub trait StatisticsProvider {
     fn variants(&self) -> Vec<String>;

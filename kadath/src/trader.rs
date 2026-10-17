@@ -30,13 +30,17 @@ impl KadathTrader {
         db: Db,
         trades: Arc<Queue<Trade>>,
     ) -> Self {
-        let config = ModelConfig {
-            hold_time_ms: 15000,
-            derivatives_normalize_diapason_s: 325.0,
-            trend_tau_s: 176.0,
+        let config = ModelConfig { // Score: 22.95000000001164
+            derivatives_normalize_diapason_s: 129.26958112763333,
+            trend_tau_s: 129.26958112763333,
             train_data_minutes: 120,
-            train_interval_minutes: 1,
-            decay_time: 360.0,
+            train_interval_minutes: 1, decay_time: 594.3687987398677,
+            hold_time_ms: 15000,
+            price_change_filter: 0.12109375,
+            prediction_strength: 0.0035078124999999996,
+            predicted_change: 0.275,
+            prediction_probability_up_to_flat: -0.65,
+            prediction_probability_up_to_down: 0.056
         };
         let model = WalkForwardModel::new_buying(instrument.id.unwrap(), config);
         
@@ -72,8 +76,8 @@ impl KadathTrader {
 
         loop {
             let event = self.queue.pop().await;
-            if matches!(event.order_book.timestamp.weekday().number_from_monday(), 6 | 7) {
-                // ignore weekends
+            if matches!(event.order_book.timestamp.weekday().number_from_monday(), 6 | 7) // ignore weekends
+                || event.instrument_id != self.inst_id() {
                 continue;
             }
 
@@ -81,12 +85,10 @@ impl KadathTrader {
 
             let mut last_prices_copy = None;
             if let Ok(last_prices) = self.last_prices.lock().as_mut() {
-                if event.instrument_id == self.inst_id() {
-                    last_prices.time = event.order_book.timestamp;
-                    last_prices.ask = lowest_price(&event.order_book.asks);
-                    last_prices.bid = highest_price(&event.order_book.bids);
-                    last_prices.signal = signal;
-                }
+                last_prices.time = event.order_book.timestamp;
+                last_prices.ask = lowest_price(&event.order_book.asks);
+                last_prices.bid = highest_price(&event.order_book.bids);
+                last_prices.signal = signal;
                 last_prices_copy = Some(last_prices.clone());
             }
 
@@ -101,24 +103,11 @@ impl KadathTrader {
                     match signal {
                         TradeSignal::None => {}
                         TradeSignal::Buy(hold) => {
-                            if let Some(prediction) = self.model.predict(hold)
-                                && prediction.probability_up > prediction.probability_down
-                                && prediction.strength > 0.0025 {
-                                if prediction.predicted_change > 0.3 && prediction.probability_up > prediction.probability_down {
-                                    if let Err(err) = self.executor.open_deal(TradeDirection::Buy, hold).await {
-                                        error!("error opening UP deal: {err}");
-                                    } else {
-                                        deals += 1;
-                                        info!("Deals: {deals}");
-                                    }
-                                } else if prediction.predicted_change < -0.25 && prediction.probability_down > prediction.probability_up {
-                                    if let Err(err) = self.executor.open_deal(TradeDirection::Sell, hold).await {
-                                        error!("error opening DOWN deal: {err}");
-                                    } else {
-                                        deals += 1;
-                                        info!("Deals: {deals}");
-                                    }
-                                }
+                            if let Err(err) = self.executor.open_deal(self.instrument.clone(), TradeDirection::Buy, hold).await {
+                                error!("error opening UP deal: {err}");
+                            } else {
+                                deals += 1;
+                                info!("Deals: {deals}");
                             }
                         }
                         TradeSignal::Sell(hold) => {
