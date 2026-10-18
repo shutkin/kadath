@@ -35,7 +35,7 @@ impl KadathExecutor {
         tokio::spawn(async move {
             loop {
                 let trade = trades.pop().await;
-                if let Some((_instrument, mut deal)) = if let Ok(lock) = cur_deal_clone.lock() {
+                if let Some((instrument, mut deal)) = if let Ok(lock) = cur_deal_clone.lock() {
                     lock.clone()
                 } else {
                     None
@@ -57,7 +57,7 @@ impl KadathExecutor {
                             info!("Deal confirmed and closed");
                             *lock = None;
                         } else {
-                            *lock = Some(deal.clone());
+                            *lock = Some((instrument.clone(), deal.clone()));
                         }
                     }
                 } else {
@@ -131,7 +131,7 @@ impl KadathExecutor {
             None
         };
 
-        if let Some((instrument, mut deal)) = option {
+        if let Some((_instrument, mut deal)) = option {
             let price = match deal.direction {
                 TradeDirection::Buy => last_prices.bid,
                 TradeDirection::Sell => last_prices.ask,
@@ -190,7 +190,7 @@ impl KadathExecutor {
             deal.close_order_id = Some(id.clone());
         }
         if let Ok(cur_deal) = self.cur_deal.lock().as_mut() {
-            cur_deal.replace(deal.clone());
+            cur_deal.replace((instrument.clone(), deal.clone()));
         }
         if let Err(err) = self.db.update_deal(&deal).await {
             error!("Error updating deal on make orders: {err:?}");

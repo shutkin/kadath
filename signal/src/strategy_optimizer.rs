@@ -1,16 +1,51 @@
+use std::cmp::Ordering;
 use crate::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
-use argmin::core::{CostFunction, Error, Executor, State};
-use argmin::solver::neldermead::NelderMead;
+use argmin::core::{CostFunction, Error};
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
-use log::info;
-use model::events::OrderBookEvent;
-use ndarray::Array1;
+use log::{debug, info};
+use rayon::prelude::*;
 use model::common::CommonError;
+use model::events::OrderBookEvent;
 use model::math_util::{mean, standard_deviation};
 use model::{OrderBook, TradeDirection};
 
 pub struct StrategyOptimizer {
     instrument_id: i32,
+}
+
+const POINTS: usize = 8;
+const FULL_CYCLES: usize = 6;
+
+const PARAM_NAME: [&str; 8] = [
+    "Decay",
+    "StdDiv Window",
+    "Trend Tau",
+    "Price Change Filter",
+    "Prediction Strength",
+    "Predicted Price Change",
+    "Prediction Probability Up to Flat",
+    "Prediction Probability Up to Down",
+];
+
+#[derive(Copy, Clone)]
+struct ExponentFunction {
+    a: f64,
+    b: f64,
+}
+
+impl ExponentFunction {
+    fn find(y_low: f64, y_mid: f64, y_high: f64) -> Self {
+        let (low_ln, mid_ln, high_ln) = (y_low.ln(), y_mid.ln(), y_high.ln());
+        let sum_ln = low_ln + mid_ln + high_ln;
+        let sum_x_ln = -low_ln + high_ln;
+        let b = sum_ln / 3.0;
+        let a = sum_x_ln / 2.0;
+        Self { a, b }
+    }
+
+    fn calculate(&self, x: f64) -> f64 {
+        (x * self.a + self.b).exp()
+    }
 }
 
 impl StrategyOptimizer {
@@ -21,51 +56,120 @@ impl StrategyOptimizer {
     }
 
     pub fn optimize(&self, events: &[OrderBookEvent], hold_time: i32, train_time_minutes: u16) -> Result<ModelConfig, CommonError> {
-        let initial = Array1::from(
-            // decay, stddiv_window
-            vec![
-                0.0,   // decay
-                0.0,   // stddiv window len
-                0.0,   // trend tau
-                0.0,   // price_change_filter
-                0.0035,// prediction_strength
-                0.2,   // predicted_change
-                -0.65, // prediction_probability_up_to_flat
-                0.056, // prediction_probability_up_to_down
-            ]
-        );
-        let mut simplex = Vec::with_capacity(initial.len() + 1);
+        let param_functions = [
+            Some(ExponentFunction::find(70.0, 300.0, 1300.0)),
+            Some(ExponentFunction::find(60.0, 250.0, 1100.0)),
+            Some(ExponentFunction::find(20.0, 80.0, 400.0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let mut diapasons = [
+            -1.0..1.0, // decay
+            -1.0..1.0, // stddiv window len
+            -1.0..1.0, // trend tau
+            0.15 - 0.6..0.15 + 0.6, // price change filter
+            0.0..0.007, // prediction strength
+            -0.2..0.6, // predicted change
+            -1.0..-0.4, // prediction probability up to flat
+            0.0..0.12, // prediction probability up to down
+        ];
 
-        simplex.push(initial.clone());
+        let problem = GlobalProblem { events, param_functions: &param_functions, instrument_id: self.instrument_id, hold_time, train_time_minutes };
 
-        for i in 0..initial.len() {
-            let mut point = initial.clone();
-            point[i] += match i {
-                0 | 1 | 2 => 0.2,  // decay, stddiv window len, trend tau
-                3 => 0.5, // price change filter
-                4 => 0.001, // prediction strength
-                5 => 0.1, // prediction change
-                6 => 0.05, // prediction probability up to flat
-                _ => 0.01, // prediction probability up to down
-            };
-            simplex.push(point);
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_config = None;
+
+        let mut cycle = 0;
+        let mut param_index = 0;
+        let mut best_param_points = [0.0; PARAM_NAME.len()];
+        loop {
+            let full_range = diapasons[param_index].end - diapasons[param_index].start;
+
+            let point_params_score = (0..POINTS).into_par_iter().map(|point_index| {
+                let point = diapasons[param_index].start + point_index as f64 * full_range / (POINTS - 1) as f64;
+
+                let params = diapasons.iter().enumerate()
+                    .map(|(i, d)| {
+                        if i == param_index {
+                            point
+                        } else {
+                            (d.start + d.end) * 0.5
+                        }
+                    }).collect::<Vec<_>>();
+                problem.cost(&params).ok().map(|score| {
+                    (point, params, score)
+                })
+            }).filter_map(|opt| opt).collect::<Vec<_>>();
+
+            if let Some((best_param_point, _, _)) = point_params_score.iter().max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)) {
+                best_param_points[param_index] = *best_param_point;
+            }
+
+            let min_score = point_params_score.iter().map(|(_, _, score)| *score).reduce(f64::min).unwrap_or_default();
+            let (mut sum, mut sum_score) = (0.0, 0.0);
+            for (point, params, score) in point_params_score {
+                if score > best_score {
+                    best_score = score;
+                    best_config = Some(config_from_param(&params, &param_functions, hold_time, train_time_minutes));
+                }
+                let score_from_min = score - min_score;
+                let score_squared = score_from_min * score_from_min;
+                sum += point * score_squared;
+                sum_score += score_squared;
+            }
+
+            let next_center = sum / sum_score;
+            let next_range = full_range * 0.6;
+            diapasons[param_index] = next_center - next_range * 0.5 .. next_center + next_range * 0.5;
+            if let Some(function) = &param_functions[param_index] {
+                info!(
+                    "{} center {}, diapason {}..{}",
+                    PARAM_NAME[param_index],
+                    function.calculate(next_center),
+                    function.calculate(diapasons[param_index].start),
+                    function.calculate(diapasons[param_index].end),
+                );
+            } else {
+                info!(
+                    "{} center {}, diapason {}..{}",
+                    PARAM_NAME[param_index],
+                    next_center,
+                    diapasons[param_index].start,
+                    diapasons[param_index].end,
+                );
+            }
+
+            param_index += 1;
+            if param_index == diapasons.len() {
+                param_index = 0;
+                cycle += 1;
+                info!("Cycle {cycle} completed");
+                if cycle == FULL_CYCLES {
+                    break;
+                }
+            }
         }
 
-        let solver = NelderMead::<Array1<f64>, f64>::new(simplex.clone());
-        let problem = GlobalProblem { events, instrument_id: self.instrument_id, hold_time, train_time_minutes };
-        let result = Executor::new(problem, solver)
-            .configure(|state| state.max_iters(128))
-            .run()?;
-        let optimized_score = -result.state().get_best_cost();
-        let param = result.state().get_best_param().ok_or("Failed to get best param")?;
-        let config = config_from_param(param, hold_time, train_time_minutes);
-        info!("Best score {optimized_score} with {config:?}");
-
-        Ok(config)
+        if let Ok(optimal_score) = problem.cost(&best_param_points.to_vec()) && let Some(best_config) = best_config {
+            let optimal_config = config_from_param(&best_param_points, &param_functions, hold_time, train_time_minutes);
+            info!("Optimal {optimal_config:?} score {optimal_score}");
+            info!("Best {best_config:?} score {best_score}");
+            if optimal_score > best_score {
+                Ok(optimal_config)
+            } else {
+                Ok(best_config)
+            }
+        } else {
+            Err("failed to optimize model config".into())
+        }
     }
 }
 
 struct GlobalProblem<'a> {
+    param_functions: &'a [Option<ExponentFunction>],
     events: &'a [OrderBookEvent],
     instrument_id: i32,
     hold_time: i32,
@@ -79,11 +183,11 @@ struct SimDeal {
 }
 
 impl CostFunction for GlobalProblem<'_> {
-    type Param = Array1<f64>;
+    type Param = Vec<f64>;
     type Output = f64;
 
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
-        let config = config_from_param(param, self.hold_time, self.train_time_minutes);
+        let config = config_from_param(param, self.param_functions, self.hold_time, self.train_time_minutes);
         info!("Check {config:?}");
         let model = WalkForwardModel::new_buying(
             self.instrument_id, config,
@@ -138,30 +242,40 @@ impl CostFunction for GlobalProblem<'_> {
             }
         }
         if daily_revenue > 0.0 || daily_cost > 0.0 {
-            info!("Daily PnL {} and commission {daily_commission}", daily_revenue - daily_cost);
+            debug!("Daily PnL {} and commission {daily_commission}", daily_revenue - daily_cost);
             daily_pnl.push(daily_revenue - daily_cost - daily_commission);
         }
 
-        let mean_pnl = mean(&daily_pnl);
-        let pnl_deviation = standard_deviation(&daily_pnl).unwrap_or_default();
-        let score = mean_pnl - pnl_deviation;
+        let score = if daily_pnl.len() == 1 {
+            daily_pnl[0]
+        } else {
+            let mean_pnl = mean(&daily_pnl);
+            let pnl_deviation = standard_deviation(&daily_pnl).unwrap_or_default();
+            mean_pnl - pnl_deviation
+        };
         info!("Score: {score}");
 
-        Ok(-score)
+        // Must be negative for Nelder-Mead!!
+        Ok(score)
     }
 }
 
-fn config_from_param(param: &Array1<f64>, hold_time_ms: i32, train_time: u16) -> ModelConfig {
-    ModelConfig {
-        decay_time: (param[0] * 1.7006 + 6.3875).exp(), // x=-1: y=108.5, x=0: y=594.5, x=1: y=3250
-        derivatives_normalize_diapason_s: (param[1] * 1.4979 + 4.8619).exp(), // x=-1: y=28.9, x=0: y=129.3, x=1: y=578.7
-        trend_tau_s: (param[2] * 1.4979 + 4.8619).exp(), // x=-1: y=28.9, x=0: y=129.3, x=1: y=578.7
+fn config_from_param(param: &[f64], functions: &[Option<ExponentFunction>], hold_time_ms: i32, train_time: u16) -> ModelConfig {
 
-        price_change_filter: param[3],
-        prediction_strength: param[4],
-        predicted_change: param[5],
-        prediction_probability_up_to_flat: param[6],
-        prediction_probability_up_to_down: param[7],
+    let calc = move |i: usize| {
+        functions[i].as_ref().map(|func| func.calculate(param[i])).unwrap_or(param[i])
+    };
+
+    ModelConfig {
+        decay_time: calc(0),
+        derivatives_normalize_diapason_s: calc(1),
+        trend_tau_s: calc(2),
+
+        price_change_filter: calc(3),
+        prediction_strength: calc(4),
+        predicted_change: calc(5),
+        prediction_probability_up_to_flat: calc(6),
+        prediction_probability_up_to_down: calc(7),
 
         train_interval_minutes: 1,
         train_data_minutes: train_time,
