@@ -88,6 +88,7 @@ struct TradingProblem {
 impl ScoreProvider for TradingProblem {
     fn score(&self, param: &Array1<f64>) -> f64 {
         struct Deal {
+            open_at: DateTime<Utc>,
             closing_at: DateTime<Utc>,
             open_price: f64,
         }
@@ -102,7 +103,22 @@ impl ScoreProvider for TradingProblem {
         self.values.iter()
             .for_each(|v| {
                 if let Some(deal) = &cur_deal {
+                    let mut close_deal = false;
                     if v.time >= deal.closing_at {
+                        close_deal = true;
+                    } else {
+                        if self.is_positive {
+                            if v.mid < deal.open_price - 0.5 && v.time > deal.open_at + TimeDelta::milliseconds(300) {
+                                close_deal = true;
+                            }
+                        } else {
+                            if v.mid > deal.open_price + 0.5 && v.time > deal.open_at + TimeDelta::milliseconds(300) {
+                                close_deal = true;
+                            }
+                        }
+                    }
+                    
+                    if close_deal {
                         let price_delta = v.mid - deal.open_price;
                         let weight = (-(last_time - v.time).as_seconds_f64() / self.decay_time).exp();
                         if self.is_positive {
@@ -125,7 +141,7 @@ impl ScoreProvider for TradingProblem {
                 } else {
                     let signal = calculator.calculate(v);
                     if signal > f64::MIN_POSITIVE && self.is_positive || signal < -f64::MIN_POSITIVE && !self.is_positive {
-                        cur_deal = Some(Deal {open_price: v.mid, closing_at: v.time + TimeDelta::milliseconds(self.hold_time as i64)});
+                        cur_deal = Some(Deal {open_price: v.mid, open_at: v.time, closing_at: v.time + TimeDelta::milliseconds(self.hold_time as i64)});
                     }
                 }
             });

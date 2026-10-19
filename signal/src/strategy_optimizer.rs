@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use crate::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use argmin::core::{CostFunction, Error};
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
-use log::{debug, info};
+use log::{debug, info, warn};
 use rayon::prelude::*;
 use model::common::CommonError;
 use model::events::OrderBookEvent;
@@ -71,10 +71,10 @@ impl StrategyOptimizer {
             -1.0..1.0, // stddiv window len
             -1.0..1.0, // trend tau
             0.15 - 0.6..0.15 + 0.6, // price change filter
-            0.0..0.007, // prediction strength
-            -0.2..0.6, // predicted change
-            -1.0..-0.4, // prediction probability up to flat
-            0.0..0.12, // prediction probability up to down
+            0.0015 - 0.0015..0.0015 + 0.0015, // prediction strength
+            0.3 - 0.4..0.3 + 0.4, // predicted change
+            -0.75 - 0.5..-0.75 + 0.5, // prediction probability up to flat
+            0.08 - 0.1..0.08 + 0.1, // prediction probability up to down
         ];
 
         let problem = GlobalProblem { events, param_functions: &param_functions, instrument_id: self.instrument_id, hold_time, train_time_minutes };
@@ -104,49 +104,56 @@ impl StrategyOptimizer {
                 })
             }).filter_map(|opt| opt).collect::<Vec<_>>();
 
-            if let Some((best_param_point, _, _)) = point_params_score.iter().max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)) {
-                best_param_points[param_index] = *best_param_point;
-            }
-
             let min_score = point_params_score.iter().map(|(_, _, score)| *score).reduce(f64::min).unwrap_or_default();
             let (mut sum, mut sum_score) = (0.0, 0.0);
-            for (point, params, score) in point_params_score {
-                if score > best_score {
-                    best_score = score;
-                    best_config = Some(config_from_param(&params, &param_functions, hold_time, train_time_minutes));
+            for (point, params, score) in &point_params_score {
+                if *score > best_score {
+                    best_score = *score;
+                    let config = config_from_param(&params, &param_functions, hold_time, train_time_minutes);
+                    info!("New best {best_score} with {config:?}");
+                    best_config = Some(config);
                 }
                 let score_from_min = score - min_score;
                 let score_squared = score_from_min * score_from_min;
                 sum += point * score_squared;
                 sum_score += score_squared;
             }
-
-            let next_center = sum / sum_score;
-            let next_range = full_range * 0.6;
-            diapasons[param_index] = next_center - next_range * 0.5 .. next_center + next_range * 0.5;
-            if let Some(function) = &param_functions[param_index] {
-                info!(
-                    "{} center {}, diapason {}..{}",
-                    PARAM_NAME[param_index],
-                    function.calculate(next_center),
-                    function.calculate(diapasons[param_index].start),
-                    function.calculate(diapasons[param_index].end),
-                );
+            if sum_score < 0.1 {
+                warn!("Scores are equal!");
             } else {
-                info!(
-                    "{} center {}, diapason {}..{}",
-                    PARAM_NAME[param_index],
-                    next_center,
-                    diapasons[param_index].start,
-                    diapasons[param_index].end,
-                );
+                if let Some((best_param_point, _, _)) = point_params_score.iter().max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)) {
+                    best_param_points[param_index] = *best_param_point;
+                }
+
+                let next_center = sum / sum_score;
+                let next_range = full_range * 0.6;
+                diapasons[param_index] = next_center - next_range * 0.5 .. next_center + next_range * 0.5;
+                if let Some(function) = &param_functions[param_index] {
+                    info!(
+                        "{} center {}, diapason {}..{}",
+                        PARAM_NAME[param_index],
+                        function.calculate(next_center),
+                        function.calculate(diapasons[param_index].start),
+                        function.calculate(diapasons[param_index].end),
+                    );
+                } else {
+                    info!(
+                        "{} center {}, diapason {}..{}",
+                        PARAM_NAME[param_index],
+                        next_center,
+                        diapasons[param_index].start,
+                        diapasons[param_index].end,
+                    );
+                }
             }
 
             param_index += 1;
             if param_index == diapasons.len() {
                 param_index = 0;
                 cycle += 1;
-                info!("Cycle {cycle} completed");
+                let config = config_from_param(&best_param_points, &param_functions, hold_time, train_time_minutes);
+                let optimal_score = problem.cost(&best_param_points.to_vec()).unwrap_or_default();
+                info!("Cycle {cycle} optimal score {optimal_score} with {config:?}");
                 if cycle == FULL_CYCLES {
                     break;
                 }
@@ -177,6 +184,7 @@ struct GlobalProblem<'a> {
 }
 
 struct SimDeal {
+    open_at: DateTime<Utc>,
     close_time: DateTime<Utc>,
     direction: TradeDirection,
     open_price: f64,
@@ -203,7 +211,7 @@ impl CostFunction for GlobalProblem<'_> {
 
         for event in self.events {
             if event.order_book.timestamp.num_days_from_ce() > prev_event_time.num_days_from_ce() {
-                info!("Daily PnL {} and commission {daily_commission}", daily_revenue - daily_cost);
+                debug!("Daily PnL {} and commission {daily_commission}", daily_revenue - daily_cost);
                 daily_pnl.push(daily_revenue - daily_cost - daily_commission);
                 daily_revenue = 0.0;
                 daily_cost = 0.0;
@@ -216,11 +224,30 @@ impl CostFunction for GlobalProblem<'_> {
             model.calibrate(true);
             let signal = model.process(&mut window_data, event);
             if let Some(deal) = active_deal.as_ref() {
-                if deal.close_time <= cur_ob.timestamp {
-                    let close_price = get_mid_price(&cur_ob);
+                let cur_price = get_mid_price(&cur_ob);
+
+                let mut close_deal = false;
+                if cur_ob.timestamp >= deal.close_time {
+                    close_deal = true;
+                } else {
+                    match deal.direction {
+                        TradeDirection::Buy => {
+                            if cur_price < deal.open_price - 0.5 && cur_ob.timestamp > deal.open_at + TimeDelta::milliseconds(300) {
+                                close_deal = true;
+                            }
+                        }
+                        TradeDirection::Sell => {
+                            if cur_price > deal.open_price + 0.5 && cur_ob.timestamp > deal.open_at + TimeDelta::milliseconds(300) {
+                                close_deal = true;
+                            }
+                        }
+                    }
+                }
+
+                if close_deal {
                     let (revenue, cost) = match deal.direction {
-                        TradeDirection::Buy => (close_price, deal.open_price),
-                        TradeDirection::Sell => (deal.open_price, close_price),
+                        TradeDirection::Buy => (cur_price, deal.open_price),
+                        TradeDirection::Sell => (deal.open_price, cur_price),
                     };
                     daily_revenue += revenue;
                     daily_cost += cost;
@@ -232,11 +259,11 @@ impl CostFunction for GlobalProblem<'_> {
                     TradeSignal::None => {}
                     TradeSignal::Buy(hold) => {
                         let close_time = cur_ob.timestamp + TimeDelta::milliseconds(hold as i64);
-                        active_deal = Some(SimDeal { close_time, direction: TradeDirection::Buy, open_price: get_mid_price(&cur_ob) });
+                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, close_time, direction: TradeDirection::Buy, open_price: get_mid_price(&cur_ob) });
                     }
                     TradeSignal::Sell(hold) => {
                         let close_time = cur_ob.timestamp + TimeDelta::milliseconds(hold as i64);
-                        active_deal = Some(SimDeal { close_time, direction: TradeDirection::Sell, open_price: get_mid_price(&cur_ob) });
+                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, close_time, direction: TradeDirection::Sell, open_price: get_mid_price(&cur_ob) });
                     }
                 }
             }

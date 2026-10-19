@@ -30,17 +30,18 @@ impl KadathTrader {
         db: Db,
         trades: Arc<Queue<Trade>>,
     ) -> Self {
-        let config = ModelConfig { // Score: 49.6
-            derivatives_normalize_diapason_s: 285.44202583336147,
-            trend_tau_s: 88.9031552067671,
-            train_data_minutes: 120, train_interval_minutes: 1,
-            decay_time: 297.9063772507548,
+        let config = ModelConfig {
+            derivatives_normalize_diapason_s: 188.6128974149429,
+            trend_tau_s: 80.56655630108168,
+            train_data_minutes: 120,
+            train_interval_minutes: 1,
+            decay_time: 308.29617113815294,
             hold_time_ms: 15000,
-            price_change_filter: 0.15404987074257917,
-            prediction_strength: 0.0015863138578258583,
-            predicted_change: 0.2972490372763181,
-            prediction_probability_up_to_flat: -0.7683753234050105,
-            prediction_probability_up_to_down: 0.08270319259021781,
+            price_change_filter: -0.0310822185621702,
+            prediction_strength: 0.0021771551776655815,
+            predicted_change: -0.018042337354087265,
+            prediction_probability_up_to_flat: -1.0377714753698688,
+            prediction_probability_up_to_down: 0.02836358508759033
         };
         let model = WalkForwardModel::new_buying(instrument.id.unwrap(), config);
         
