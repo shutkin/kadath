@@ -1,13 +1,13 @@
-use std::cmp::Ordering;
-use crate::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
+use crate::{DealData, ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use argmin::core::{CostFunction, Error};
-use chrono::{DateTime, Datelike, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use log::{debug, info, warn};
-use rayon::prelude::*;
 use model::common::CommonError;
 use model::events::OrderBookEvent;
 use model::math_util::{mean, standard_deviation};
 use model::{OrderBook, TradeDirection};
+use rayon::prelude::*;
+use std::cmp::Ordering;
 
 pub struct StrategyOptimizer {
     instrument_id: i32,
@@ -71,7 +71,7 @@ impl StrategyOptimizer {
             -1.0..1.0, // stddiv window len
             -1.0..1.0, // trend tau
             0.15 - 0.6..0.15 + 0.6, // price change filter
-            0.0015 - 0.0015..0.0015 + 0.0015, // prediction strength
+            0.0015 - 0.0014..0.0015 + 0.0015, // prediction strength
             0.3 - 0.4..0.3 + 0.4, // predicted change
             -0.75 - 0.5..-0.75 + 0.5, // prediction probability up to flat
             0.08 - 0.1..0.08 + 0.1, // prediction probability up to down
@@ -185,9 +185,9 @@ struct GlobalProblem<'a> {
 
 struct SimDeal {
     open_at: DateTime<Utc>,
-    close_time: DateTime<Utc>,
     direction: TradeDirection,
     open_price: f64,
+    deal_data: DealData,
 }
 
 impl CostFunction for GlobalProblem<'_> {
@@ -223,31 +223,16 @@ impl CostFunction for GlobalProblem<'_> {
 
             model.calibrate(true);
             let signal = model.process(&mut window_data, event);
-            if let Some(deal) = active_deal.as_ref() {
-                let cur_price = get_mid_price(&cur_ob);
+            if let Some(deal) = active_deal.as_mut() {
+                let close_price = match deal.direction {
+                    TradeDirection::Buy => get_bid_price(&cur_ob),
+                    TradeDirection::Sell => get_ask_price(&cur_ob),
+                };
 
-                let mut close_deal = false;
-                if cur_ob.timestamp >= deal.close_time {
-                    close_deal = true;
-                } else {
-                    match deal.direction {
-                        TradeDirection::Buy => {
-                            if cur_price < deal.open_price - 0.5 && cur_ob.timestamp > deal.open_at + TimeDelta::milliseconds(300) {
-                                close_deal = true;
-                            }
-                        }
-                        TradeDirection::Sell => {
-                            if cur_price > deal.open_price + 0.5 && cur_ob.timestamp > deal.open_at + TimeDelta::milliseconds(300) {
-                                close_deal = true;
-                            }
-                        }
-                    }
-                }
-
-                if close_deal {
+                if model.is_it_time_to_close_deal(&cur_ob, &mut deal.deal_data) {
                     let (revenue, cost) = match deal.direction {
-                        TradeDirection::Buy => (cur_price, deal.open_price),
-                        TradeDirection::Sell => (deal.open_price, cur_price),
+                        TradeDirection::Buy => (close_price, deal.open_price),
+                        TradeDirection::Sell => (deal.open_price, close_price),
                     };
                     daily_revenue += revenue;
                     daily_cost += cost;
@@ -258,12 +243,12 @@ impl CostFunction for GlobalProblem<'_> {
                 match signal {
                     TradeSignal::None => {}
                     TradeSignal::Buy(hold) => {
-                        let close_time = cur_ob.timestamp + TimeDelta::milliseconds(hold as i64);
-                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, close_time, direction: TradeDirection::Buy, open_price: get_mid_price(&cur_ob) });
+                        let deal_data = DealData::new(&cur_ob, TradeDirection::Buy);
+                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, deal_data, direction: TradeDirection::Buy, open_price: get_mid_price(&cur_ob) });
                     }
                     TradeSignal::Sell(hold) => {
-                        let close_time = cur_ob.timestamp + TimeDelta::milliseconds(hold as i64);
-                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, close_time, direction: TradeDirection::Sell, open_price: get_mid_price(&cur_ob) });
+                        let deal_data = DealData::new(&cur_ob, TradeDirection::Buy);
+                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, deal_data, direction: TradeDirection::Sell, open_price: get_mid_price(&cur_ob) });
                     }
                 }
             }
@@ -308,6 +293,14 @@ fn config_from_param(param: &[f64], functions: &[Option<ExponentFunction>], hold
         train_data_minutes: train_time,
         hold_time_ms,
     }
+}
+
+fn get_ask_price(book: &OrderBook) -> f64 {
+    book.asks.iter().map(|data| data.price).min().unwrap_or_default().as_f64()
+}
+
+fn get_bid_price(book: &OrderBook) -> f64 {
+    book.bids.iter().map(|data| data.price).max().unwrap_or_default().as_f64()
 }
 
 fn get_mid_price(order_book: &OrderBook) -> f64 {

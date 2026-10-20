@@ -124,7 +124,7 @@ impl KadathExecutor {
         Ok(())
     }
 
-    pub async fn try_close_deal(&self, last_prices: LastPrices) {
+    pub async fn try_close_deal(&self, last_prices: LastPrices) -> Option<Decimal> {
         let option = if let Ok(lock) = self.cur_deal.lock() {
             lock.clone()
         } else {
@@ -174,9 +174,16 @@ impl KadathExecutor {
                 if let Err(err) = self.db.update_deal(&deal).await {
                     error!("Error updating deal: {err:?}");
                 }
+                Some(match deal.direction {
+                    TradeDirection::Buy => price - deal.expected_open_price,
+                    TradeDirection::Sell => deal.expected_open_price - price,
+                })
+            } else {
+                None
             }
         } else {
             info!("Deal already closed");
+            None
         }
     }
 

@@ -75,6 +75,8 @@ impl KadathTrader {
         let mut online_events = 0;
         let mut deals = 0;
 
+        let mut do_not_trade_until = None;
+
         loop {
             let event = self.queue.pop().await;
             if matches!(event.order_book.timestamp.weekday().number_from_monday(), 6 | 7) // ignore weekends
@@ -101,22 +103,34 @@ impl KadathTrader {
                     online_events += 1;
                 }
                 if !self.executor.has_active_deal() {
-                    match signal {
-                        TradeSignal::None => {}
-                        TradeSignal::Buy(hold) => {
-                            if let Err(err) = self.executor.open_deal(self.instrument.clone(), TradeDirection::Buy, hold).await {
-                                error!("error opening UP deal: {err}");
-                            } else {
-                                deals += 1;
-                                info!("Deals: {deals}");
+                    let can_trade = if let Some(do_not_trade_until) = do_not_trade_until {
+                        event.order_book.timestamp > do_not_trade_until
+                    } else {
+                        true
+                    };
+                    if can_trade {
+                        do_not_trade_until = None;
+                        match signal {
+                            TradeSignal::None => {}
+                            TradeSignal::Buy(hold) => {
+                                if let Err(err) = self.executor.open_deal(self.instrument.clone(), TradeDirection::Buy, hold).await {
+                                    error!("error opening UP deal: {err}");
+                                } else {
+                                    deals += 1;
+                                    info!("Deals: {deals}");
+                                }
                             }
-                        }
-                        TradeSignal::Sell(hold) => {
-                            info!("Sell hold: {hold:?}");
+                            TradeSignal::Sell(hold) => {
+                                info!("Sell hold: {hold:?}");
+                            }
                         }
                     }
                 } else if let Some(last_prices) = last_prices_copy {
-                    self.executor.try_close_deal(last_prices).await;
+                    if let Some(delta) = self.executor.try_close_deal(last_prices).await && delta.is_sign_negative() {
+                        let time = event.order_book.timestamp + TimeDelta::minutes(4);
+                        do_not_trade_until = Some(time);
+                        info!("Deal close with delta {delta:?}, stop trading until {time}");
+                    }
                 }
             }
         }

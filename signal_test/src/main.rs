@@ -7,38 +7,40 @@ use log::{LevelFilter, debug, error, info};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
 use model::math_util::{mean, median, p05_p95, p10_p90};
-use model::{DataSource, Instrument, OrderBook, order_book_cache};
+use model::{order_book_cache, DataSource, Instrument, OrderBook, TradeDirection};
 use ndarray::Array2;
 use plotters::prelude::*;
 use rust_decimal::Decimal;
-use signal::kernel_prediction::KernelPrediction;
 use signal::strategy_optimizer::StrategyOptimizer;
-use signal::{ModelConfig, TradeSignal, WalkForwardModel, WindowData};
+use signal::{DealData, ModelConfig, Regime, TradeSignal, WalkForwardModel, WindowData};
 use simplelog::SimpleLogger;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 #[derive(Copy, Clone)]
 struct TestDeal {
-    prediction: KernelPrediction,
+    regime: Regime,
     open_index: usize,
     close_index: Option<usize>,
     open_time: DateTime<Utc>,
     close_time: DateTime<Utc>,
     open_price: f64,
     close_price: Option<f64>,
+
+    deal_data: DealData,
 }
 
 impl TestDeal {
-    fn open(prediction: KernelPrediction, index: usize, ob: &OrderBook, hold: i32) -> Self {
+    fn open(regime: Regime, index: usize, ob: &OrderBook, hold: i32) -> Self {
+        let cur_price = get_best_ask(ob).as_f64();
         TestDeal {
-            prediction,
+            regime,
             open_index: index,
             open_time: ob.timestamp,
             close_time: ob.timestamp + TimeDelta::milliseconds(hold as i64),
-            open_price: get_mid_price(ob),
+            open_price: cur_price,
             close_price: None,
             close_index: None,
+            deal_data: DealData::new(ob, TradeDirection::Buy),
         }
     }
 
@@ -49,7 +51,7 @@ impl TestDeal {
 
         self.close_index = Some(index);
         self.close_time = ob.timestamp;
-        let close_price = get_mid_price(ob);
+        let close_price = get_best_bid(ob).as_f64();
         self.close_price = Some(close_price);
 
         debug!(
@@ -58,7 +60,7 @@ impl TestDeal {
             self.open_price,
             ob.timestamp.time(),
             close_price,
-            self.prediction
+            self.regime
         );
     }
 }
@@ -86,19 +88,19 @@ fn setup_logging(log_filename: &str) -> Result<(), fern::InitError> {
 
 
 #[tokio::main]
-async fn main() -> EmptyResult {
+async fn __main() -> EmptyResult {
     dotenv::dotenv().ok();
     setup_logging("strategy_optimize.log")?;
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
     let db = Db::new(&db_url).await?;
 
-    let ticker = "GLZ6";
+    let ticker = "SiZ6";
 
     let all_instruments = db.get_instruments(DataSource::TInvest).await?;
     let inst_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to fins instrument")?;
     let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-14T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-14T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-15T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-15T20:00:00Z")?.to_utc(),
     );
     let end = DateTime::parse_from_rfc3339("2026-10-16T00:00:00Z")?.to_utc();
 
@@ -119,7 +121,7 @@ async fn main() -> EmptyResult {
 
     let optimizer = StrategyOptimizer::new(inst_id);
     info!("Start optimizing");
-    let config = optimizer.optimize(&all_events, 15000, 120)?;
+    let config = optimizer.optimize(&all_events, 15000, 45)?;
     std::fs::write("optimized_config_10_15.txt", format!("{config:?}"))?;
     info!("Done");
     Ok(())
@@ -275,32 +277,32 @@ async fn _main() -> EmptyResult {
 }
 
 #[tokio::main]
-async fn __main() -> EmptyResult {
+async fn main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
     let db = Db::new(&db_url).await?;
 
-    let ticker = "GLZ6";
+    let ticker = "SiZ6";
 
     let all_instruments = db.get_instruments(DataSource::TInvest).await?;
     let inst_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to fins instrument")?;
-    
-    let config_buy = ModelConfig {
-        hold_time_ms: 15000,
-        derivatives_normalize_diapason_s: 325.0,
-        trend_tau_s: 176.0,
-        train_data_minutes: 120,
-        train_interval_minutes: 1,
-        decay_time: 360.0,
 
-        price_change_filter: 0.0,
-        prediction_strength: 0.0035,
-        predicted_change: 0.2,
-        prediction_probability_up_to_flat: -0.65,
-        prediction_probability_up_to_down: 0.056,
+    let config = ModelConfig {
+        derivatives_normalize_diapason_s: 143.85382726456606,
+        trend_tau_s: 169.5125156541239,
+        train_data_minutes: 45,
+        train_interval_minutes: 1,
+        decay_time: 406.9147817442151,
+        hold_time_ms: 3000,
+        price_change_filter: -0.10125996676884258,
+        prediction_strength: -0.00014426395772103946,
+        predicted_change: 0.33270623995088566,
+        prediction_probability_up_to_flat: -0.8793157802057888,
+        prediction_probability_up_to_down: 0.03010602216182194
     };
-    let model_buy = WalkForwardModel::new_buying(inst_id, config_buy);
+
+    let model_buy = WalkForwardModel::new_buying(inst_id, config);
     let mut window_data_buy = WindowData::new();
 
     let mut diapason = TimeDiapason::new(
@@ -313,6 +315,8 @@ async fn __main() -> EmptyResult {
 
     let mut deals = Vec::new();
     let mut deals_visualisations = Vec::new();
+
+    let mut do_not_trade_until = None;
 
     while diapason.from < end {
         if !matches!(diapason.from.weekday().number_from_monday(), 6 | 7) {
@@ -329,8 +333,6 @@ async fn __main() -> EmptyResult {
             let events = merge_events(&[inst_id], &[order_books]);
             debug!("Total events: {}", events.len());
 
-            let mut process_delays = Vec::new();
-
             let mut prev_hour = events[0].order_book.timestamp.hour();
             for (i, event) in events.iter().enumerate() {
                 if event.order_book.timestamp.hour() != prev_hour {
@@ -338,53 +340,35 @@ async fn __main() -> EmptyResult {
                     info!("Hour {prev_hour}");
                 }
 
-                let started = Instant::now();
                 let resp = model_buy.calibrate(true);
                 if let Some(calc) = &resp.calculator {
-                    let elapsed = Instant::now().duration_since(started).as_millis();
                     let pref = calc.get_performances();
                     debug!(
-                        "Calibration takes {elapsed}ms. Predictions inside training interval {:?}: {} correct, {} incorrect, score {}",
+                        "Predictions inside training interval {:?}: {} correct, {} incorrect, score {}",
                         pref.train_diapason,
                         pref.training_correct_predictions,
                         pref.training_incorrect_predictions,
                         pref.training_score
                     );
-
-                    if !process_delays.is_empty() {
-                        debug!(
-                            "Process delay mean {}, median {}, p10-p90 {:?}, max {}",
-                            mean(&process_delays), median(&process_delays), p10_p90(&process_delays),
-                            process_delays.iter().copied().reduce(f64::max).unwrap_or_default(),
-                        );
-                        process_delays.clear();
-                    }
                 }
 
-                let started = Instant::now();
                 let signal_buy = model_buy.process(&mut window_data_buy, event);
-                let elapsed = Instant::now().duration_since(started).as_micros() as f64;
-                process_delays.push(elapsed);
 
                 if let Some(deal) = active_deal.as_mut() {
-                    let mut close_deal = false;
-                    if event.order_book.timestamp > deal.close_time {
-                        if let Some(prediction) = model_buy.predict(1000) {
-                            if prediction.predicted_change < 0.0 && prediction.probability_down > prediction.probability_up {
-                                close_deal = true;
-                            }
-                        } else {
-                            close_deal = true;
+                    if model_buy.is_it_time_to_close_deal(&event.order_book, &mut deal.deal_data) {
+                        deal.close(i, &event.order_book);
+                        let delta = deal.close_price.unwrap_or_default() - deal.open_price;
+                        info!(
+                            "{} Hold {}: {} -> {} | {} | {:?}",
+                            deal.open_time,
+                            (event.order_book.timestamp - deal.open_time).as_seconds_f64(),
+                            deal.open_price, deal.close_price.unwrap_or_default(),
+                            delta,
+                            deal.regime,
+                        );
+                        if delta < 0.5 {
+                            do_not_trade_until = Some(event.order_book.timestamp + TimeDelta::minutes(4));
                         }
-                    } else {
-                        let cur_price = get_best_bid(&event.order_book);
-                        if cur_price.as_f64() < deal.open_price - 1.0 && event.order_book.timestamp > deal.open_time + TimeDelta::milliseconds(500) {
-                            close_deal = true;
-                        }
-                    }
-
-                    if close_deal {
-                    deal.close(i, &event.order_book);
                         if let Some(visualization) = build_deal_visualization(&events, &deal) {
                             deals_visualisations.push(visualization);
                         }
@@ -392,22 +376,20 @@ async fn __main() -> EmptyResult {
                         active_deal = None;
                     }
                 } else {
-                    match signal_buy {
-                        TradeSignal::Buy(hold) => {
-                            if let Some(price_change) = model_buy.get_price_change_from_past(5000)
-                                && price_change > 0.0 {
-                                if let Some(prediction) = model_buy.predict(5000) {
-                                    if prediction.strength > 0.0035
-                                        && prediction.predicted_change > 0.2
-                                        && prediction.probability_up - prediction.probability_flat > -0.65
-                                        && prediction.probability_up - prediction.probability_down > 0.056 {
-                                        let deal = TestDeal::open(prediction, i, &event.order_book, hold);
-                                        active_deal = Some(deal);
-                                    }
+                    let do_trade = do_not_trade_until
+                        .map(|until| event.order_book.timestamp > until)
+                        .unwrap_or(true);
+                    if do_trade {
+                        do_not_trade_until = None;
+                        match signal_buy {
+                            TradeSignal::Buy(hold) => {
+                                if let Some(regime) = model_buy.get_regime() {
+                                    let deal = TestDeal::open(regime, i, &event.order_book, hold);
+                                    active_deal = Some(deal);
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -417,92 +399,41 @@ async fn __main() -> EmptyResult {
     }
 
     let mut pnl = 0.0;
-    let mut positive_predictions = Vec::new();
-    let mut neutral_predictions = Vec::new();
-    let mut negative_predictions = Vec::new();
     let (mut neutrals, mut positives, mut negatives) = (0, 0, 0);
+    let (mut neutrals_regimes, mut positives_regimes, mut negatives_regimes) = (Vec::new(), Vec::new(), Vec::new());
     for deal in &deals {
         if let Some(close_price) = deal.close_price {
             pnl += close_price - deal.open_price;
             if close_price >= deal.open_price + 1.5 {
-                positive_predictions.push(deal.prediction);
                 positives += 1;
-            } else if close_price < deal.open_price - 1.5 {
-                negative_predictions.push(deal.prediction);
+                positives_regimes.push(deal.regime);
+            } else if close_price < deal.open_price - 0.5 {
                 negatives += 1;
+                negatives_regimes.push(deal.regime);
             } else {
-                neutral_predictions.push(deal.prediction);
                 neutrals += 1;
+                neutrals_regimes.push(deal.regime);
             }
         }
     }
-    info!("Positives {positives}, negatives {negatives}, neutrals {neutrals}");
     info!("Total PnL {pnl}, PnL per deal {}", pnl / deals.len() as f64);
+    info!("Positives {positives}, negatives {negatives}, neutrals {neutrals}");
 
     if positives > 10 && negatives > 5 && neutrals > 10 {
-        let predictions_changes = positive_predictions.iter().map(|p| p.predicted_change).collect::<Vec<_>>();
-        info!(
-            "Positive predictions changes: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
-        let predictions_changes = negative_predictions.iter().map(|p| p.predicted_change).collect::<Vec<_>>();
-        info!(
-            "Negative predictions changes: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
-        let predictions_changes = neutral_predictions.iter().map(|p| p.predicted_change).collect::<Vec<_>>();
-        info!(
-            "Neutral predictions changes: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
+        let changes = positives_regimes.iter().map(|r| r.change).collect::<Vec<_>>();
+        info!("Positive deals regime change mean {}, median {}, p10-p90 {:?}", mean(&changes), median(&changes), p10_p90(&changes));
+        let ers = positives_regimes.iter().map(|r| r.er).collect::<Vec<_>>();
+        info!("Positive deals regime ER mean {}, median {}, p10-p90 {:?}", mean(&ers), median(&ers), p10_p90(&ers));
 
-        let predictions_changes = positive_predictions.iter().map(|p| p.strength).collect::<Vec<_>>();
-        info!(
-            "Positive predictions strength: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
-        let predictions_changes = negative_predictions.iter().map(|p| p.strength).collect::<Vec<_>>();
-        info!(
-            "Negative predictions strength: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
-        let predictions_changes = neutral_predictions.iter().map(|p| p.strength).collect::<Vec<_>>();
-        info!(
-            "Neutral predictions strength: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
+        let changes = neutrals_regimes.iter().map(|r| r.change).collect::<Vec<_>>();
+        info!("Neutral deals regime change mean {}, median {}, p10-p90 {:?}", mean(&changes), median(&changes), p10_p90(&changes));
+        let ers = neutrals_regimes.iter().map(|r| r.er).collect::<Vec<_>>();
+        info!("Neutral deals regime ER mean {}, median {}, p10-p90 {:?}", mean(&ers), median(&ers), p10_p90(&ers));
 
-        let predictions_changes = positive_predictions.iter().map(|p| p.probability_up - p.probability_down).collect::<Vec<_>>();
-        info!(
-            "Positive predictions up - down: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
-        let predictions_changes = negative_predictions.iter().map(|p| p.probability_up - p.probability_down).collect::<Vec<_>>();
-        info!(
-            "Negative predictions up - down: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
-        let predictions_changes = neutral_predictions.iter().map(|p| p.probability_up - p.probability_down).collect::<Vec<_>>();
-        info!(
-            "Neutral predictions up - down: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
-
-        let predictions_changes = positive_predictions.iter().map(|p| p.probability_up - p.probability_flat).collect::<Vec<_>>();
-        info!(
-            "Positive predictions up - flat: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
-        let predictions_changes = negative_predictions.iter().map(|p| p.probability_up - p.probability_flat).collect::<Vec<_>>();
-        info!(
-            "Negative predictions up - flat: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
-        let predictions_changes = neutral_predictions.iter().map(|p| p.probability_up - p.probability_flat).collect::<Vec<_>>();
-        info!(
-            "Neutral predictions up - flat: mean {}, median {}, p10-p90 {:?}",
-            mean(&predictions_changes), median(&predictions_changes), p10_p90(&predictions_changes),
-        );
+        let changes = negatives_regimes.iter().map(|r| r.change).collect::<Vec<_>>();
+        info!("Negative deals regime change mean {}, median {}, p10-p90 {:?}", mean(&changes), median(&changes), p10_p90(&changes));
+        let ers = negatives_regimes.iter().map(|r| r.er).collect::<Vec<_>>();
+        info!("Negative deals regime ER mean {}, median {}, p10-p90 {:?}", mean(&ers), median(&ers), p10_p90(&ers));
 
         let average_deal = average_deal_visual(&deals_visualisations)?;
         for (i, (cnt, avg)) in average_deal.iter().enumerate() {

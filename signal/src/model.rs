@@ -5,20 +5,19 @@ pub mod signal_calculator;
 mod optimizer;
 pub mod strategy_optimizer;
 pub mod kernel_prediction;
+mod regime;
 
 use crate::optimizer::calibrate_signal_calculator;
 use crate::orderbook_values::{OrderBookValues, WindowValuesCalculator};
 use crate::signal_calculator::{SignalCalculator, SignalPerformance};
-use chrono::TimeDelta;
+use chrono::{DateTime, TimeDelta, Utc};
 use model::events::OrderBookEvent;
 use std::sync::{Arc, Mutex, RwLock};
+use model::{OrderBook, TradeDirection};
 use crate::kernel_prediction::{predict_kernel, KernelPrediction, KernelConfig};
+use crate::regime::get_regime;
 
 const MAX_WINDOW_LENGTH_S: i64 = 2000;
-const TRAIN_DATA_MINUTES: u16 = 45;
-const TRAIN_INTERVAL_MINUTES: u16 = 1;
-const DEFAULT_DECAY_TIME: f64 = 15.0;
-const STD_DIAPASON_SECONDS: u16 = 1200;
 
 pub const HOLD_TIME_VARIANTS: [u16; 6] = [200, 300, 500, 750, 1000, 1500];
 
@@ -36,6 +35,12 @@ impl Default for TradeSignal {
 }
 
 #[derive(Copy, Clone, Debug)]
+pub struct Regime {
+    pub change: f64,
+    pub er: f64,
+}
+
+#[derive(Copy, Clone, Debug)]
 pub struct ModelConfig {
     pub derivatives_normalize_diapason_s: f64,
     pub trend_tau_s: f64,
@@ -44,11 +49,11 @@ pub struct ModelConfig {
     pub decay_time: f64,
     pub hold_time_ms: i32,
     
-    pub price_change_filter: f64, // 0.0
-    pub prediction_strength: f64, // 0.0035
-    pub predicted_change: f64, // 0.2
-    pub prediction_probability_up_to_flat: f64, // -0.65
-    pub prediction_probability_up_to_down: f64, // 0.056
+    pub price_change_filter: f64,
+    pub prediction_strength: f64,
+    pub predicted_change: f64,
+    pub prediction_probability_up_to_flat: f64,
+    pub prediction_probability_up_to_down: f64,
 }
 
 pub struct WindowData {
@@ -59,6 +64,34 @@ impl WindowData {
     pub fn new() -> Self {
         Self {
             values_calculator: WindowValuesCalculator::new(),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct DealData {
+    direction: TradeDirection,
+    open_time: DateTime<Utc>,
+    open_price: f64,
+    trend: f64,
+    max_trend: f64,
+    prev_price_time: DateTime<Utc>,
+}
+
+impl DealData {
+    pub fn new(book: &OrderBook, direction: TradeDirection) -> Self {
+        let (_ask, _bid, mid) = OrderBookValues::calculate_ask_bid_mid(book);
+        //let (open_price, close_price) = match direction {
+        //    TradeDirection::Buy => (ask, bid),
+        //    TradeDirection::Sell => (bid, ask),
+        //};
+        Self {
+            direction,
+            open_time: book.timestamp,
+            open_price: mid,
+            trend: mid,
+            max_trend: mid,
+            prev_price_time: book.timestamp,
         }
     }
 }
@@ -141,6 +174,45 @@ impl WalkForwardModel {
         }
     }
 
+    pub fn get_regime(&self) -> Option<Regime> {
+        get_regime(self.buffer.lock().unwrap().as_slice())
+    }
+
+    pub fn is_it_time_to_close_deal(&self, book: &OrderBook, deal_data: &mut DealData) -> bool {
+        let (_ask, _bid, close_price) = OrderBookValues::calculate_ask_bid_mid(book);
+        //let close_price = match deal_data.direction {
+        //    TradeDirection::Buy => bid,
+        //    TradeDirection::Sell => ask,
+        //};
+
+        let dt = (book.timestamp - deal_data.prev_price_time).as_seconds_f64();
+        let alpha = 1.0 - (-dt / 1.5).exp();
+        deal_data.trend += alpha * (close_price - deal_data.trend);
+
+        if deal_data.max_trend < deal_data.trend {
+            deal_data.max_trend = deal_data.trend;
+        }
+
+        deal_data.prev_price_time = book.timestamp;
+
+        match deal_data.direction {
+            TradeDirection::Buy => {
+                if close_price < deal_data.open_price - 0.5 && book.timestamp > deal_data.open_time + TimeDelta::milliseconds(300)
+                    || deal_data.trend < deal_data.max_trend - 0.5 {
+                    return true;
+                }
+            }
+            TradeDirection::Sell => {
+                if close_price > deal_data.open_price + 0.5 && book.timestamp > deal_data.open_time + TimeDelta::milliseconds(300)
+                    || deal_data.trend > deal_data.max_trend + 0.5 {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {
         let v = if self.instrument_id == event.instrument_id {
             window_data.values_calculator.calculate(
@@ -162,7 +234,7 @@ impl WalkForwardModel {
                 if self.is_buying && signal_score > 0.0 {
                     if let Some(price_change) = self.get_price_change_from_past(5000)
                         && price_change > self.config.price_change_filter {
-                        if let Some(prediction) = self.predict(5000) {
+                        if let Some(prediction) = self.predict(3000) {
                             if prediction.strength > self.config.prediction_strength
                                 && prediction.predicted_change > self.config.predicted_change
                                 && prediction.probability_up - prediction.probability_flat > self.config.prediction_probability_up_to_flat

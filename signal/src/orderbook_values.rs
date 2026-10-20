@@ -35,6 +35,12 @@ impl OrderBookValues {
         map
     }
 
+    pub fn calculate_ask_bid_mid(book: &OrderBook) -> (f64, f64, f64) {
+        let ask = book.asks.iter().map(|data| data.price).min().unwrap_or_default().as_f64();
+        let bid = book.bids.iter().map(|data| data.price).max().unwrap_or_default().as_f64();
+        let mid = (ask + bid) * 0.5;
+        (ask, bid, mid)
+    }
 }
 
 pub struct WindowValuesCalculator {
