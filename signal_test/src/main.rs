@@ -289,27 +289,27 @@ async fn main() -> EmptyResult {
     let inst_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to fins instrument")?;
 
     let config = ModelConfig {
-        derivatives_normalize_diapason_s: 143.85382726456606,
-        trend_tau_s: 169.5125156541239,
+        derivatives_normalize_diapason_s: 266.6075790370919,
+        trend_tau_s: 169.31465504345616,
         train_data_minutes: 45,
         train_interval_minutes: 1,
-        decay_time: 406.9147817442151,
+        decay_time: 490.4368789053648,
         hold_time_ms: 3000,
-        price_change_filter: -0.10125996676884258,
-        prediction_strength: -0.00014426395772103946,
-        predicted_change: 0.33270623995088566,
-        prediction_probability_up_to_flat: -0.8793157802057888,
-        prediction_probability_up_to_down: 0.03010602216182194
+        price_change_filter: 0.7252934346035782,
+        prediction_strength: 0.0016547748955359003,
+        predicted_change: 0.42751430574273985,
+        prediction_probability_up_to_flat: -0.27957291936687434,
+        prediction_probability_up_to_down: 0.17813105774508864
     };
 
     let model_buy = WalkForwardModel::new_buying(inst_id, config);
     let mut window_data_buy = WindowData::new();
 
     let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-16T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-16T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-19T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-19T20:00:00Z")?.to_utc(),
     );
-    let end = DateTime::parse_from_rfc3339("2026-10-17T00:00:00Z")?.to_utc();
+    let end = DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")?.to_utc();
 
     let mut active_deal = Option::<TestDeal>::None;
 

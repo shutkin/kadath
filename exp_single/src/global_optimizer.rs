@@ -1,10 +1,13 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use crate::filter_values_with_horizons;
+use crate::gradient_boost::GradientBoost;
+use crate::orderbook_values::OrderBookValues;
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
 use log::{error, info};
+use model::common::TimeDiapason;
+use model::math_util::ExponentFunction;
 use ndarray::Array1;
-use crate::orderbook_values::OrderBookValues;
-use crate::signal_calculator::SignalCalculator;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Copy, Clone, Debug)]
 pub struct GlobalParams {
@@ -12,59 +15,34 @@ pub struct GlobalParams {
     pub trend_tau: f64,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct GlobalParamsPair {
-    pub positive: GlobalParams,
-    pub negative: GlobalParams,
-}
-
 impl GlobalParams {
-    pub fn from_param(param: &Array1<f64>) -> Self {
+    pub fn from_param(param: &Array1<f64>, functions: &[Option<ExponentFunction>]) -> Self {
         Self {
-            derivatives_normalize: (0.021 * param[0] + 3.9).exp(),
-            trend_tau: (0.021 * param[1] + 3.9).exp(),
+            derivatives_normalize: functions[0].map(|f| f.calculate(param[0])).unwrap_or(param[0]),
+            trend_tau: functions[1].map(|f| f.calculate(param[1])).unwrap_or(param[1]),
         }
     }
 }
 
-pub fn global_optimize(values: &[OrderBookValues], horizons: &[f64], penalty: f64) -> Option<GlobalParamsPair> {
-    let values_positive = values.to_vec();
-    let horizons_positive = horizons.to_vec();
-    let handle_positive = std::thread::spawn(move || {
-        let problem = GlobalProblem {
-            values: &values_positive,
-            horizons: &horizons_positive,
-            is_positive: true,
-            penalty,
-            count: AtomicU8::new(0)
-        };
-        execute(problem)
-    });
+pub fn global_optimize(values: &[OrderBookValues], horizons: &[f64], train_diapason: TimeDiapason, test_diapason: TimeDiapason) -> Option<GlobalParams> {
+    let functions = [
+        Some(ExponentFunction::find(40.0, 200.0, 800.0)),
+        Some(ExponentFunction::find(30.0, 160.0, 600.0)),
+    ];
 
-    let values_negative = values.to_vec();
-    let horizons_negative = horizons.to_vec();
-    let handle_negative = std::thread::spawn(move || {
-        let problem = GlobalProblem {
-            values: &values_negative,
-            horizons: &horizons_negative,
-            is_positive: false,
-            penalty,
-            count: AtomicU8::new(0)
-        };
-        execute(problem)
-    });
-
-    let positive = handle_positive.join().ok().flatten();
-    let negative = handle_negative.join().ok().flatten();
-    if let Some(positive) = positive && let Some(negative) = negative {
-        Some(GlobalParamsPair { positive, negative })
-    } else {
-        None
-    }
+    let problem = GlobalProblem {
+        values,
+        horizons,
+        train_diapason,
+        test_diapason,
+        functions: &functions,
+        count: AtomicU8::new(0)
+    };
+    execute(problem, &functions)
 }
 
-fn execute(problem: GlobalProblem) -> Option<GlobalParams> {
-    let initial = Array1::from_vec(vec![60.0, 60.0]);
+fn execute(problem: GlobalProblem, functions: &[Option<ExponentFunction>]) -> Option<GlobalParams> {
+    let initial = Array1::from_vec(vec![0.0, 0.0]);
 
     let mut simplex = Vec::with_capacity(initial.len() + 1);
 
@@ -72,7 +50,7 @@ fn execute(problem: GlobalProblem) -> Option<GlobalParams> {
 
     for i in 0..initial.len() {
         let mut point = initial.clone();
-        point[i] += 20.0;
+        point[i] += 0.25;
         simplex.push(point);
     }
 
@@ -84,7 +62,7 @@ fn execute(problem: GlobalProblem) -> Option<GlobalParams> {
         Ok(result) => {
             if let Some(best_param) = result.state().get_best_param() {
                 let score = -result.state().get_best_cost();
-                let global_param = GlobalParams::from_param(best_param);
+                let global_param = GlobalParams::from_param(best_param, functions);
                 info!("Best score: {score} with {global_param:?}");
                 Some(global_param)
             } else {
@@ -101,8 +79,9 @@ fn execute(problem: GlobalProblem) -> Option<GlobalParams> {
 struct GlobalProblem<'a> {
     values: &'a [OrderBookValues],
     horizons: &'a [f64],
-    is_positive: bool,
-    penalty: f64,
+    train_diapason: TimeDiapason,
+    test_diapason: TimeDiapason,
+    functions: &'a [Option<ExponentFunction>],
     count: AtomicU8,
 }
 
@@ -111,16 +90,21 @@ impl CostFunction for GlobalProblem<'_> {
     type Output = f64;
 
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
-        let global = GlobalParams::from_param(param);
+        let global = GlobalParams::from_param(param, self.functions);
         let mut values = self.values.to_vec();
         OrderBookValues::calculate_window_values(&mut values, global.derivatives_normalize, global.trend_tau);
+
+        let (train_values, train_horizons) = filter_values_with_horizons(&values, self.horizons, self.train_diapason);
+        let mut gradient_boost = GradientBoost::new();
+        gradient_boost.train(&train_values, &train_horizons);
+
+        let (test_values, test_horizons) = filter_values_with_horizons(&values, self.horizons, self.test_diapason);
+        let predictions = gradient_boost.test(&test_values);
+
+        let correlation = correlation::spearmanr(&test_horizons, &predictions);
+
         let count = self.count.fetch_add(1, Ordering::Relaxed);
-        let score = if let Some(result) = SignalCalculator::optimize(&values, self.horizons, self.is_positive, self.penalty) {
-            result.score
-        } else {
-            0.0
-        };
-        info!("{} {count}: {global:?} => {score}", if self.is_positive {"positive"} else {"negative"});
-        Ok(-score)
+        info!("{count}: {global:?} => {correlation}");
+        Ok(-correlation)
     }
 }

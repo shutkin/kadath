@@ -4,7 +4,7 @@ use chrono::{DateTime, Datelike, Utc};
 use log::{debug, info, warn};
 use model::common::CommonError;
 use model::events::OrderBookEvent;
-use model::math_util::{mean, standard_deviation};
+use model::math_util::{mean, standard_deviation, ExponentFunction};
 use model::{OrderBook, TradeDirection};
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -26,27 +26,6 @@ const PARAM_NAME: [&str; 8] = [
     "Prediction Probability Up to Flat",
     "Prediction Probability Up to Down",
 ];
-
-#[derive(Copy, Clone)]
-struct ExponentFunction {
-    a: f64,
-    b: f64,
-}
-
-impl ExponentFunction {
-    fn find(y_low: f64, y_mid: f64, y_high: f64) -> Self {
-        let (low_ln, mid_ln, high_ln) = (y_low.ln(), y_mid.ln(), y_high.ln());
-        let sum_ln = low_ln + mid_ln + high_ln;
-        let sum_x_ln = -low_ln + high_ln;
-        let b = sum_ln / 3.0;
-        let a = sum_x_ln / 2.0;
-        Self { a, b }
-    }
-
-    fn calculate(&self, x: f64) -> f64 {
-        (x * self.a + self.b).exp()
-    }
-}
 
 impl StrategyOptimizer {
     pub fn new(instrument_id: i32) -> Self {
