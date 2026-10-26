@@ -1,5 +1,5 @@
 use crate::filter_values_with_horizons;
-use crate::gradient_boost::GradientBoost;
+use crate::gradient_boost::{GradientBoost, PredictionType};
 use crate::orderbook_values::OrderBookValues;
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
@@ -95,7 +95,7 @@ impl CostFunction for GlobalProblem<'_> {
         OrderBookValues::calculate_window_values(&mut values, global.derivatives_normalize, global.trend_tau);
 
         let (train_values, train_horizons) = filter_values_with_horizons(&values, self.horizons, self.train_diapason);
-        let mut gradient_boost = GradientBoost::new();
+        let mut gradient_boost = GradientBoost::new(PredictionType::Regression);
         gradient_boost.train(&train_values, &train_horizons);
 
         let (test_values, test_horizons) = filter_values_with_horizons(&values, self.horizons, self.test_diapason);

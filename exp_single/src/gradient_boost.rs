@@ -5,30 +5,66 @@ use gbdt::gradient_boost::GBDT;
 use log::info;
 use plotters::prelude::LogScalable;
 
+pub enum PredictionType {
+    Regression, ClassificationPositive(f64), ClassificationNegative(f64)
+}
+
+impl PredictionType {
+    pub fn get_label(&self, horizon: f64) -> f32 {
+        match self {
+            PredictionType::Regression => horizon as f32,
+            PredictionType::ClassificationPositive(threshold) => if horizon > *threshold {1.0} else {-1.0},
+            PredictionType::ClassificationNegative(threshold) => if horizon < *threshold {1.0} else {-1.0},
+        }
+    }
+}
+
 pub struct GradientBoost {
+    prediction_type: PredictionType,
     gbdt: GBDT,
 }
 
 impl GradientBoost {
-    pub fn new() -> Self {
+    pub fn new(prediction_type: PredictionType) -> Self {
         let mut cfg = Config::new();
         cfg.set_feature_size(12);
-        cfg.set_max_depth(3);
-        cfg.set_iterations(100);
-        cfg.set_shrinkage(0.05);
-        cfg.set_min_leaf_size(200);
-        cfg.set_loss("SquaredError");
-        cfg.set_data_sample_ratio(0.8);
+        cfg.set_data_sample_ratio(1.0);
         cfg.set_feature_sample_ratio(1.0);
         cfg.set_debug(false);
+        match prediction_type {
+            PredictionType::Regression => {
+                cfg.set_loss("SquaredError");
+                cfg.set_max_depth(3);
+                cfg.set_iterations(100);
+                cfg.set_shrinkage(0.05);
+                cfg.set_min_leaf_size(200);
+            }
+            PredictionType::ClassificationPositive(_) => {
+                cfg.set_loss("LogLikelyhood");
+                cfg.set_max_depth(2);
+                cfg.set_iterations(50);
+                cfg.set_shrinkage(0.03);
+                cfg.set_min_leaf_size(200);
+            }
+            PredictionType::ClassificationNegative(_) => {
+                cfg.set_loss("LogLikelyhood");
+                cfg.set_max_depth(2);
+                cfg.set_iterations(200);
+                cfg.set_shrinkage(0.05);
+                cfg.set_min_leaf_size(300);
+            }
+        }
 
-        Self { gbdt: GBDT::new(&cfg) }
+        Self {
+            prediction_type,
+            gbdt: GBDT::new(&cfg),
+        }
     }
 
     pub fn train(&mut self, data: &[OrderBookValues], horizons: &[f64]) {
         let mut train_data = data.iter().zip(horizons.iter())
             .map(|(values, horizon)| {
-                Data::new_training_data(values_to_features(values), 1.0, *horizon as f32, None)
+                Data::new_training_data(values_to_features(values), 1.0, self.prediction_type.get_label(*horizon), None)
             }).collect::<Vec<_>>();
 
         info!("Start training...");
@@ -47,8 +83,8 @@ impl GradientBoost {
 
 fn values_to_features(values: &OrderBookValues) -> Vec<f32> {
     vec![
-        values.mid_derivative as f32,
-        (values.mid - values.trend) as f32,
+        values.trend_deviation as f32,
+        values.trend_deviation_derivative as f32,
         values.imbalances[0] as f32,
         values.imbalances[1] as f32,
         values.imbalances[2] as f32,

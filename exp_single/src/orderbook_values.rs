@@ -1,7 +1,6 @@
-use std::vec;
 use chrono::{DateTime, TimeDelta, Utc};
-use model::math_util::standard_deviation;
 use model::OrderBook;
+use model::math_util::standard_deviation;
 
 pub const IMBALANCE_LEVELS: [usize; 5] = [3, 5, 10, 20, 50];
 
@@ -13,8 +12,8 @@ pub struct OrderBookValues {
     pub mid: f64,
     pub imbalances: [f64; IMBALANCE_LEVELS.len()],
     pub imbalances_derivative: [f64; IMBALANCE_LEVELS.len()],
-    pub trend: f64,
-    pub mid_derivative: f64,
+    pub trend_deviation: f64,
+    pub trend_deviation_derivative: f64,
 }
 
 impl OrderBookValues {
@@ -55,8 +54,8 @@ impl OrderBookValues {
             mid,
             imbalances,
             imbalances_derivative: [0.0; IMBALANCE_LEVELS.len()],
-            trend: mid,
-            mid_derivative: 0.0,
+            trend_deviation: 0.0,
+            trend_deviation_derivative: 0.0,
         })
     }
 
@@ -101,15 +100,32 @@ impl OrderBookValues {
             }
         }
 
+        // Calculate trend
+        let mut trend = 0.0;
+        let mut prev_time = Option::<DateTime<Utc>>::None;
+
+        for value in values.iter_mut() {
+            if let Some(cur_prev_time) = prev_time {
+                let dt = (value.time - cur_prev_time).as_seconds_f64();
+                let alpha = 1.0 - (-dt / trend_tau_seconds).exp();
+                trend += alpha * (value.mid - trend);
+                value.trend_deviation = value.mid - trend;
+                prev_time = Some(value.time);
+            } else {
+                trend = value.mid;
+                prev_time = Some(value.time);
+            }
+        }
+
         // Calculate absolute mid derivatives
         let mut derivatives = Vec::with_capacity(values.len());
         for i in 0..values.len() {
             let mut derivative = 0.0;
             if i > 0 {
-                let delta_time = values[i].time.timestamp_millis() - values[i - 1].time.timestamp_millis();
-                if delta_time > 0 {
-                    let d = values[i].mid - values[i - 1].mid;
-                    derivative = d / delta_time as f64;
+                let delta_time = (values[i].time - values[i - 1].time).as_seconds_f64();
+                if delta_time > 0.0 {
+                    let d = values[i].trend_deviation - values[i - 1].trend_deviation;
+                    derivative = d / delta_time;
                 }
             }
             derivatives.push(derivative);
@@ -124,29 +140,12 @@ impl OrderBookValues {
                     window_start -= 1;
                 }
                 if let Some(std) = standard_deviation(&derivatives[window_start .. i]) && std > f64::MIN_POSITIVE {
-                    values[i].mid_derivative = derivatives[i] / std;
+                    values[i].trend_deviation_derivative = derivatives[i] / std;
                 } else {
-                    values[i].mid_derivative = derivatives[i];
+                    values[i].trend_deviation_derivative = derivatives[i];
                 }
             } else {
-                values[i].mid_derivative = derivatives[i];
-            }
-        }
-
-        // Calculate trend
-        let mut trend = 0.0;
-        let mut prev_time = Option::<DateTime<Utc>>::None;
-
-        for value in values {
-            if let Some(cur_prev_time) = prev_time {
-                let dt = (value.time - cur_prev_time).as_seconds_f64();
-                let alpha = 1.0 - (-dt / trend_tau_seconds).exp();
-                trend += alpha * (value.mid - trend);
-                value.trend = trend;
-                prev_time = Some(value.time);
-            } else {
-                trend = value.mid;
-                prev_time = Some(value.time);
+                values[i].trend_deviation_derivative = derivatives[i];
             }
         }
     }

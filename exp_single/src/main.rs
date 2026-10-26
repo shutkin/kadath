@@ -5,16 +5,16 @@ mod global_optimizer;
 mod gradient_boost;
 
 use crate::global_optimizer::{GlobalParams, global_optimize};
-use crate::gradient_boost::GradientBoost;
+use crate::gradient_boost::{GradientBoost, PredictionType};
 use crate::orderbook_values::OrderBookValues;
 use chrono::{DateTime, TimeDelta, Utc};
 use db::Db;
 use log::{LevelFilter, info};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
-use model::math_util::{mean, median};
 use model::{DataSource, Instrument, OrderBook, order_book_cache};
 use simplelog::SimpleLogger;
 use std::collections::HashMap;
+use model::math_util::{mean, median, p05_p95};
 
 #[tokio::main]
 async fn _main() -> EmptyResult {
@@ -80,17 +80,24 @@ async fn main() -> EmptyResult {
     ]);
 
     const HOLD_TIME: i32 = 2_000;
+    const TRAIN_DIAPASON: i64 = 5 * 60;
     const TEST_DIAPASON: i64 = 30;
 
     let horizons = build_horizon(&all_values, HOLD_TIME);
 
-    let mut prediction_buckets = vec![Vec::new(); 10];
-    const PREDICTION_MAX: f64 = 10.0;
-    const PREDICTION_MIN: f64 = -10.0;
+    const THRESHOLD: f64 = 5.0;
+    let (mut correct, mut incorrect) = (0_u32, 0_u32);
+    let (mut missed, mut total) = (0_u32, 0_u32);
+
+    let mut prediction_buckets_positive = vec![Vec::new(); 6];
+    let mut prediction_buckets_negative = vec![Vec::new(); 6];
+    const PREDICTION_MAX_POSITIVE: f64 = 0.25;
+    const PREDICTION_MAX_NEGATIVE: f64 = 0.45;
+    const PREDICTION_MIN: f64 = 0.03;
 
     if let Some(global) = predefined_global.get(&HOLD_TIME).copied() {
         OrderBookValues::calculate_window_values(&mut all_values, global.derivatives_normalize, global.trend_tau);
-        let mut train_diapason = TimeDiapason::new(diapason.from, diapason.from + TimeDelta::hours(5));
+        let mut train_diapason = TimeDiapason::new(diapason.from, diapason.from + TimeDelta::minutes(TRAIN_DIAPASON));
         while train_diapason.to <= diapason.to - TimeDelta::minutes(TEST_DIAPASON) {
             let test_diapason = TimeDiapason::new(train_diapason.to + TimeDelta::seconds(1), train_diapason.to + TimeDelta::minutes(TEST_DIAPASON));
             info!("Train diapason {train_diapason:?}, test diapason {test_diapason:?}");
@@ -98,37 +105,101 @@ async fn main() -> EmptyResult {
             let (train_values, train_horizons) = filter_values_with_horizons(&all_values, &horizons, train_diapason);
             let (test_values, test_horizons) = filter_values_with_horizons(&all_values, &horizons, test_diapason);
 
-            let mut gradient_boost = GradientBoost::new();
-            gradient_boost.train(&train_values, &train_horizons);
+            let mut classificator_positive = GradientBoost::new(PredictionType::ClassificationPositive(THRESHOLD));
+            classificator_positive.train(&train_values, &train_horizons);
+            let mut classificator_negative = GradientBoost::new(PredictionType::ClassificationNegative(-THRESHOLD));
+            classificator_negative.train(&train_values, &train_horizons);
 
-            let predictions = gradient_boost.test(&test_values);
+            let predictions_positive = classificator_positive.test(&test_values);
+            info!(
+                "Predictions positive min {}, max {}",
+                predictions_positive.iter().copied().reduce(f64::min).unwrap(),
+                predictions_positive.iter().copied().reduce(f64::max).unwrap(),
+            );
+            let predictions_negative = classificator_negative.test(&test_values);
+            info!(
+                "Predictions negative min {}, max {}",
+                predictions_negative.iter().copied().reduce(f64::min).unwrap(),
+                predictions_negative.iter().copied().reduce(f64::max).unwrap(),
+            );
 
-            for bucket_index in 0..prediction_buckets.len() {
-                let prediction_from = PREDICTION_MIN + bucket_index as f64 * (PREDICTION_MAX - PREDICTION_MIN) / prediction_buckets.len() as f64;
-                let prediction_to = PREDICTION_MIN + (bucket_index + 1) as f64 * (PREDICTION_MAX - PREDICTION_MIN) / prediction_buckets.len() as f64;
-                prediction_buckets[bucket_index].extend(
-                    predictions.iter()
+            for bucket_index in 0..prediction_buckets_positive.len() {
+                let prediction_from = PREDICTION_MIN + bucket_index as f64 * (PREDICTION_MAX_POSITIVE - PREDICTION_MIN) / prediction_buckets_positive.len() as f64;
+                let prediction_to = PREDICTION_MIN + (bucket_index + 1) as f64 * (PREDICTION_MAX_POSITIVE - PREDICTION_MIN) / prediction_buckets_positive.len() as f64;
+                prediction_buckets_positive[bucket_index].extend(
+                    predictions_positive.iter()
                         .zip(test_horizons.iter())
                         .filter(|(p, _)| *p >= &prediction_from && *p < &prediction_to)
                         .map(|(_, h)| *h)
                 );
             }
 
-            let correlation = correlation::spearmanr(&test_horizons, &predictions);
+            for bucket_index in 0..prediction_buckets_negative.len() {
+                let prediction_from = PREDICTION_MIN + bucket_index as f64 * (PREDICTION_MAX_NEGATIVE - PREDICTION_MIN) / prediction_buckets_negative.len() as f64;
+                let prediction_to = PREDICTION_MIN + (bucket_index + 1) as f64 * (PREDICTION_MAX_NEGATIVE - PREDICTION_MIN) / prediction_buckets_negative.len() as f64;
+                prediction_buckets_negative[bucket_index].extend(
+                    predictions_negative.iter()
+                        .zip(test_horizons.iter())
+                        .filter(|(p, _)| *p >= &prediction_from && *p < &prediction_to)
+                        .map(|(_, h)| *h)
+                );
+            }
+
+            predictions_positive.iter()
+                .zip(predictions_negative.iter())
+                .zip(test_horizons.iter()).for_each(|((positive, negative), horizon)| {
+                if *positive > PREDICTION_MAX_POSITIVE * 0.65 && *negative < PREDICTION_MAX_NEGATIVE * 0.25 {
+                    if *horizon > 0.1 {
+                        correct += 1;
+                    } else {
+                        incorrect += 1;
+                    }
+                } else if *horizon >= THRESHOLD {
+                    missed += 1;
+                }
+                total += 1;
+            });
+
+            let categories = test_horizons.iter()
+                .map(|horizon| if *horizon >= THRESHOLD {0.2} else {0.0})
+                .collect::<Vec<_>>();
+            let correlation = correlation::pearsonr(&categories, &predictions_positive);
             info!("Correlation {}", correlation);
 
             train_diapason.from += TimeDelta::minutes(TEST_DIAPASON);
             train_diapason.to += TimeDelta::minutes(TEST_DIAPASON);
         }
 
-        for i in 0..prediction_buckets.len() {
-            if prediction_buckets[i].len() > 2 {
-                let prediction_from = PREDICTION_MIN + i as f64 * (PREDICTION_MAX - PREDICTION_MIN) / prediction_buckets.len() as f64;
-                let prediction_to = PREDICTION_MIN + (i + 1) as f64 * (PREDICTION_MAX - PREDICTION_MIN) / prediction_buckets.len() as f64;
-                info!("predictions {prediction_from} - {prediction_to}: {} horizons mean {}, median {}",
-                    prediction_buckets[i].len(), mean(&prediction_buckets[i]), median(&prediction_buckets[i]));
+        for i in 0..prediction_buckets_positive.len() {
+            if prediction_buckets_positive[i].len() > 2 {
+                let prediction_from = PREDICTION_MIN + i as f64 * (PREDICTION_MAX_POSITIVE - PREDICTION_MIN) / prediction_buckets_positive.len() as f64;
+                let prediction_to = PREDICTION_MIN + (i + 1) as f64 * (PREDICTION_MAX_POSITIVE - PREDICTION_MIN) / prediction_buckets_positive.len() as f64;
+                info!(
+                    "predictions {prediction_from:.3} - {prediction_to:.3}: {}, horizon > threshold {:.2}%, horizon < -threshold {:.2}%, mean {}, median {}, p05-p95 {:?}",
+                    prediction_buckets_positive[i].len(),
+                    prediction_buckets_positive[i].iter().filter(|h| **h > THRESHOLD).count() as f64 * 100.0 / prediction_buckets_positive[i].len() as f64,
+                    prediction_buckets_positive[i].iter().filter(|h| **h < -THRESHOLD).count() as f64 * 100.0 / prediction_buckets_positive[i].len() as f64,
+                    mean(&prediction_buckets_positive[i]), median(&prediction_buckets_positive[i]), p05_p95(&prediction_buckets_positive[i])
+                );
             }
         }
+
+        for i in 0..prediction_buckets_negative.len() {
+            if prediction_buckets_negative[i].len() > 2 {
+                let prediction_from = PREDICTION_MIN + i as f64 * (PREDICTION_MAX_NEGATIVE - PREDICTION_MIN) / prediction_buckets_negative.len() as f64;
+                let prediction_to = PREDICTION_MIN + (i + 1) as f64 * (PREDICTION_MAX_NEGATIVE - PREDICTION_MIN) / prediction_buckets_negative.len() as f64;
+                info!(
+                    "predictions {prediction_from:.3} - {prediction_to:.3}: {}, horizon > threshold {:.2}%, horizon < -threshold {:.2}%, mean {}, median {}, p05-p95 {:?}",
+                    prediction_buckets_negative[i].len(),
+                    prediction_buckets_negative[i].iter().filter(|h| **h > THRESHOLD).count() as f64 * 100.0 / prediction_buckets_negative[i].len() as f64,
+                    prediction_buckets_negative[i].iter().filter(|h| **h < -THRESHOLD).count() as f64 * 100.0 / prediction_buckets_negative[i].len() as f64,
+                    mean(&prediction_buckets_negative[i]), median(&prediction_buckets_negative[i]), p05_p95(&prediction_buckets_negative[i])
+                );
+            }
+        }
+
+        info!("Correct {correct}, incorrect {incorrect} {:.2}%", 100.0 * correct as f64 / (correct + incorrect) as f64);
+        info!("Missed {missed}, total {total}");
 
         /*
         let char_filename = format!("hold_{}.png", hold_time);

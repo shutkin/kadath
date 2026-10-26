@@ -31,7 +31,7 @@ impl SignalCalculator {
     }
 
     pub fn calculate(&self, v: &OrderBookValues) -> f64 {
-        let mut score = v.mid_derivative * self.mid_derivative_weight;
+        let mut score = 0.0;
 
         for (i, w) in self.imbalance_weights.iter().enumerate() {
             score += v.imbalances[i] * w
@@ -41,7 +41,7 @@ impl SignalCalculator {
             score += v.imbalances_derivative[i] * w
         }
 
-        score += (v.trend - v.mid) * self.trend_weight;
+        score += v.trend_deviation * self.trend_weight;
 
         if score >= 0.0 {
             if score > self.threshold {
