@@ -18,6 +18,10 @@ pub fn standard_deviation(data: &[f64]) -> Option<f64> {
 }
 
 pub fn median(data: &[f64]) -> f64 {
+    if data.len() < 2 {
+        return 0.0;
+    }
+    
     let mut sorted = data.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Equal));
     if sorted.len() % 2 == 0 {

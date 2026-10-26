@@ -88,9 +88,9 @@ fn setup_logging(log_filename: &str) -> Result<(), fern::InitError> {
 
 
 #[tokio::main]
-async fn __main() -> EmptyResult {
+async fn main() -> EmptyResult {
     dotenv::dotenv().ok();
-    setup_logging("strategy_optimize.log")?;
+    setup_logging("strategy_optimize_SiZ6_2.log")?;
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
     let db = Db::new(&db_url).await?;
 
@@ -102,7 +102,7 @@ async fn __main() -> EmptyResult {
         DateTime::parse_from_rfc3339("2026-10-15T05:00:00Z")?.to_utc(),
         DateTime::parse_from_rfc3339("2026-10-15T20:00:00Z")?.to_utc(),
     );
-    let end = DateTime::parse_from_rfc3339("2026-10-16T00:00:00Z")?.to_utc();
+    let end = DateTime::parse_from_rfc3339("2026-10-17T00:00:00Z")?.to_utc();
 
     let mut all_events = Vec::new();
 
@@ -121,7 +121,7 @@ async fn __main() -> EmptyResult {
 
     let optimizer = StrategyOptimizer::new(inst_id);
     info!("Start optimizing");
-    let config = optimizer.optimize(&all_events, 15000, 45)?;
+    let config = optimizer.optimize(&all_events, 3000, 45)?;
     std::fs::write("optimized_config_10_15.txt", format!("{config:?}"))?;
     info!("Done");
     Ok(())
@@ -277,7 +277,7 @@ async fn _main() -> EmptyResult {
 }
 
 #[tokio::main]
-async fn main() -> EmptyResult {
+async fn __main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");

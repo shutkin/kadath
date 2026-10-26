@@ -223,11 +223,11 @@ impl CostFunction for GlobalProblem<'_> {
                     TradeSignal::None => {}
                     TradeSignal::Buy(hold) => {
                         let deal_data = DealData::new(&cur_ob, TradeDirection::Buy);
-                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, deal_data, direction: TradeDirection::Buy, open_price: get_mid_price(&cur_ob) });
+                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, deal_data, direction: TradeDirection::Buy, open_price: get_ask_price(&cur_ob) });
                     }
                     TradeSignal::Sell(hold) => {
                         let deal_data = DealData::new(&cur_ob, TradeDirection::Buy);
-                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, deal_data, direction: TradeDirection::Sell, open_price: get_mid_price(&cur_ob) });
+                        active_deal = Some(SimDeal { open_at: cur_ob.timestamp, deal_data, direction: TradeDirection::Sell, open_price: get_bid_price(&cur_ob) });
                     }
                 }
             }

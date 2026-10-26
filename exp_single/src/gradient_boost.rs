@@ -2,7 +2,7 @@ use crate::orderbook_values::OrderBookValues;
 use gbdt::config::Config;
 use gbdt::decision_tree::Data;
 use gbdt::gradient_boost::GBDT;
-use log::info;
+use log::{debug, info};
 use plotters::prelude::LogScalable;
 
 pub enum PredictionType {
@@ -25,7 +25,7 @@ pub struct GradientBoost {
 }
 
 impl GradientBoost {
-    pub fn new(prediction_type: PredictionType) -> Self {
+    pub fn new(prediction_type: PredictionType, depth_iterations_shrinkage_minleaf: Option<(u32, usize, f32, usize)>) -> Self {
         let mut cfg = Config::new();
         cfg.set_feature_size(12);
         cfg.set_data_sample_ratio(1.0);
@@ -40,18 +40,20 @@ impl GradientBoost {
                 cfg.set_min_leaf_size(200);
             }
             PredictionType::ClassificationPositive(_) => {
+                // (2, 150, 0.0125, 100)
                 cfg.set_loss("LogLikelyhood");
-                cfg.set_max_depth(2);
-                cfg.set_iterations(50);
-                cfg.set_shrinkage(0.03);
-                cfg.set_min_leaf_size(200);
+                cfg.set_max_depth(depth_iterations_shrinkage_minleaf.map(|c| c.0).unwrap_or(2));
+                cfg.set_iterations(depth_iterations_shrinkage_minleaf.map(|c| c.1).unwrap_or(150));
+                cfg.set_shrinkage(depth_iterations_shrinkage_minleaf.map(|c| c.2).unwrap_or(0.0125));
+                cfg.set_min_leaf_size(depth_iterations_shrinkage_minleaf.map(|c| c.3).unwrap_or(100));
             }
             PredictionType::ClassificationNegative(_) => {
+                // (3, 150, 0.05, 400)
                 cfg.set_loss("LogLikelyhood");
-                cfg.set_max_depth(2);
-                cfg.set_iterations(200);
-                cfg.set_shrinkage(0.05);
-                cfg.set_min_leaf_size(300);
+                cfg.set_max_depth(depth_iterations_shrinkage_minleaf.map(|c| c.0).unwrap_or(3));
+                cfg.set_iterations(depth_iterations_shrinkage_minleaf.map(|c| c.1).unwrap_or(150));
+                cfg.set_shrinkage(depth_iterations_shrinkage_minleaf.map(|c| c.2).unwrap_or(0.05));
+                cfg.set_min_leaf_size(depth_iterations_shrinkage_minleaf.map(|c| c.3).unwrap_or(400));
             }
         }
 
@@ -67,9 +69,9 @@ impl GradientBoost {
                 Data::new_training_data(values_to_features(values), 1.0, self.prediction_type.get_label(*horizon), None)
             }).collect::<Vec<_>>();
 
-        info!("Start training...");
+        debug!("Start training...");
         self.gbdt.fit(&mut train_data);
-        info!("Train completed");
+        debug!("Train completed");
     }
 
     pub fn test(&self, data: &[OrderBookValues]) -> Vec<f64> {
