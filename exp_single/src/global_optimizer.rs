@@ -1,5 +1,5 @@
 use crate::filter_values_with_horizons;
-use crate::gradient_boost::{GradientBoost, PredictionType};
+use crate::gradient_boost::{GradientBoost, MachineConfig, PredictionType, calculate_predictions_error};
 use crate::orderbook_values::OrderBookValues;
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
@@ -24,13 +24,22 @@ impl GlobalParams {
     }
 }
 
-pub fn global_optimize(values: &[OrderBookValues], horizons: &[f64], train_diapason: TimeDiapason, test_diapason: TimeDiapason) -> Option<GlobalParams> {
+pub fn global_optimize(
+    machine_config: MachineConfig,
+    prediction_type: PredictionType,
+    values: &[OrderBookValues],
+    horizons: &[f64],
+    train_diapason: TimeDiapason,
+    test_diapason: TimeDiapason,
+) -> Option<GlobalParams> {
     let functions = [
         Some(ExponentFunction::find(40.0, 200.0, 800.0)),
         Some(ExponentFunction::find(30.0, 160.0, 600.0)),
     ];
 
     let problem = GlobalProblem {
+        machine_config,
+        prediction_type,
         values,
         horizons,
         train_diapason,
@@ -77,6 +86,8 @@ fn execute(problem: GlobalProblem, functions: &[Option<ExponentFunction>]) -> Op
 }
 
 struct GlobalProblem<'a> {
+    machine_config: MachineConfig,
+    prediction_type: PredictionType,
     values: &'a [OrderBookValues],
     horizons: &'a [f64],
     train_diapason: TimeDiapason,
@@ -95,16 +106,15 @@ impl CostFunction for GlobalProblem<'_> {
         OrderBookValues::calculate_window_values(&mut values, global.derivatives_normalize, global.trend_tau);
 
         let (train_values, train_horizons) = filter_values_with_horizons(&values, self.horizons, self.train_diapason);
-        let mut gradient_boost = GradientBoost::new(PredictionType::Regression, None);
-        gradient_boost.train(&train_values, &train_horizons);
+        let machine = GradientBoost::train(self.prediction_type, &self.machine_config, &train_values, &train_horizons).unwrap();
 
         let (test_values, test_horizons) = filter_values_with_horizons(&values, self.horizons, self.test_diapason);
-        let predictions = gradient_boost.test(&test_values);
+        let predictions = machine.test(&test_values).unwrap();
 
-        let correlation = correlation::spearmanr(&test_horizons, &predictions);
+        let error = calculate_predictions_error(&predictions, &test_horizons, self.prediction_type);
 
         let count = self.count.fetch_add(1, Ordering::Relaxed);
-        info!("{count}: {global:?} => {correlation}");
-        Ok(-correlation)
+        info!("{count}: {global:?} => {error}");
+        Ok(error)
     }
 }
