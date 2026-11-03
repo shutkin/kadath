@@ -12,7 +12,6 @@ pub struct Deal {
     open_time1: DateTime<Utc>,
     open_time2: DateTime<Utc>,
     open_time: DateTime<Utc>,
-    quantity: u16,
     entry_price1: f64,
     entry_price2: f64,
     close_price1: Option<f64>,
@@ -35,8 +34,6 @@ impl Deal {
             // Buy GLZ6 -> ask
             entry_price2: v2.ask,
 
-            quantity: v1.quantity_bid.min(v2.quantity_ask),
-
             close_price1: None,
             close_price2: None,
             close_time1: None,
@@ -56,8 +53,6 @@ impl Deal {
 
             // Sell GLZ6 -> bid
             entry_price2: v2.bid,
-
-            quantity: v1.quantity_ask.min(v2.quantity_bid),
 
             close_price1: None,
             close_price2: None,
@@ -111,7 +106,7 @@ impl Deal {
         }
     }
 
-    pub fn close(&self, log: bool) -> (u16, f64, f64) {
+    pub fn close(&self, log: bool) -> (f64, f64) {
         if let Some(p1) = self.close_price1 && let Some (p2) = self.close_price2 &&
             let Some(close_time1) = self.close_time1 && let Some(close_time2) = self.close_time2 {
             match self.direction {
@@ -129,7 +124,7 @@ impl Deal {
                         println!("Profit {}", revenue - cost);
                     }
 
-                    (self.quantity, revenue, cost)
+                    (revenue, cost)
                 }
 
                 DealDirection::Buy1Sell2 => {
@@ -146,7 +141,7 @@ impl Deal {
                         println!("Profit {}", revenue - cost);
                     }
 
-                    (self.quantity, revenue, cost)
+                    (revenue, cost)
                 }
             }
         } else {

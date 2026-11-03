@@ -1,7 +1,7 @@
 use crate::deal::{Deal, DealDirection};
-use crate::signal_optimization::{Signal, SignalParams};
-use crate::{MarketEvent, OrderBookValues, commission};
+use crate::{OrderBookValues, commission};
 use chrono::{DateTime, TimeDelta, Utc};
+use model::events::OrderBookEvent;
 
 pub struct SimulationResult {
     pub win: u32,
@@ -26,74 +26,15 @@ fn get_close_price_from_values2(deal: &Deal, values: &OrderBookValues) -> f64 {
     }
 }
 
-pub fn find_order_books_on_horizon(
-    events: &[MarketEvent],
-    mut index: usize,
-    target_time: DateTime<Utc>,
-) -> Option<(OrderBookValues, OrderBookValues)> {
-    let (mut v1, mut v2) = (None, None);
-    while index < events.len() {
-        match events[index] {
-            MarketEvent::OrderBook1(v) => {
-                if v.time >= target_time {
-                    v1 = Some(v);
-                }
-            }
-            MarketEvent::OrderBook2(v) => {
-                if v.time >= target_time {
-                    v2 = Some(v);
-                }
-            }
-            _ => {}
-        }
-        if let Some(v1) = v1 && let Some(v2) = v2 {
-            return Some((v1, v2));
-        }
-        index += 1;
-    }
-    None
-}
-
-pub trait DealHandler {
-    fn handle_deal(&mut self, events: &[MarketEvent], event_index: usize, deal: Deal);
-    fn get_stats(&self) -> Vec<(String, String)>;
-    fn init(&mut self, variant: u8);
-}
-
-pub fn run_stats(events: &[MarketEvent], params: &SignalParams, deal_handler: &mut dyn DealHandler) -> Vec<(String, String)> {
-    let (mut last_order_book1, mut last_order_book2) = (None, None);
-    let mut prev_signal = Signal::None;
-
-    for (index, event) in events.iter().enumerate() {
-        match event {
-            MarketEvent::OrderBook1(values) => last_order_book1 = Some(*values),
-            MarketEvent::OrderBook2(values) => last_order_book2 = Some(*values),
-        }
-
-        if let Some(values1) = &last_order_book1 && let Some(values2) = &last_order_book2 {
-            let (cur_signal, _) = params.signal(values1, values2);
-
-            if cur_signal != prev_signal &&
-                let Some(deal) = match cur_signal {
-                    Signal::Buy1Sell2 => Some(Deal::buy1_sell2(values1, values2)),
-                    Signal::Sell1Buy2 => Some(Deal::sell1_buy2(values1, values2)),
-                    _ => None,
-                } { deal_handler.handle_deal(events, index, deal); }
-
-            prev_signal = cur_signal;
-        }
-    }
-    deal_handler.get_stats()
-}
-
-pub fn run_simulation(events: &[MarketEvent], params: &SignalParams, log: bool) -> SimulationResult {
+pub fn run_simulation(events: &[OrderBookEvent], log: bool) -> SimulationResult {
     let (mut win, mut loss) = (0, 0);
     let (mut total_revenue, mut total_cost, mut total_commission) = (0.0, 0.0, 0.0);
     let mut cur_deal = Option::<Deal>::None;
-    let (mut last_order_book1, mut last_order_book2) = (None, None);
-    let mut prev_signal = Signal::None;
+    //let (mut last_order_book1, mut last_order_book2) = (None, None);
+    //let mut prev_signal = Signal::None;
     //let mut scores = Vec::new();
 
+    /*
     for event in events {
         match event {
             MarketEvent::OrderBook1(values) => last_order_book1 = Some(*values),
@@ -119,7 +60,7 @@ pub fn run_simulation(events: &[MarketEvent], params: &SignalParams, log: bool) 
                 deal.close_instrument2(price, v.time)
             }
             if deal.is_completed() {
-                let (quantity, revenue, cost) = deal.close(log);
+                let (revenue, cost) = deal.close(log);
                 if revenue > cost {win += 1} else {loss += 1};
                 total_revenue += revenue;// * quantity as f64;
                 total_cost += cost;// * quantity as f64;
@@ -146,15 +87,10 @@ pub fn run_simulation(events: &[MarketEvent], params: &SignalParams, log: bool) 
             }
 
             prev_signal = cur_signal;
-            
-            /*if apply_filters {
-                scores.push(score);
-                if scores.len() > 32768 {
-                    scores.remove(0);
-                }
-            }*/
         }
     }
+     */
+
     SimulationResult {
         win,
         loss,
