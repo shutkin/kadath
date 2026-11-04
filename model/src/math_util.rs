@@ -45,6 +45,13 @@ pub fn p05_p95(data: &[f64]) -> (f64, f64) {
     (sorted[sorted.len() / 20], sorted[sorted.len() - 1 - sorted.len() / 20])
 }
 
+pub fn percentile(data: &[f64], percentile: f64) -> f64 {
+    let mut sorted = data.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let index = ((sorted.len() - 1) as f64 * percentile) as usize;
+    sorted[index]
+}
+
 pub fn mean(data: &[f64]) -> f64 {
     data.iter().sum::<f64>() / data.len() as f64
 }
@@ -93,6 +100,7 @@ pub enum OutputType {
     TrendDeviationDerivativeNorm(&'static str),
 }
 
+#[derive(Clone)]
 pub struct FeaturesRollingWindow {
     norm_diapason: TimeDelta,
     trend_tau: TimeDelta,

@@ -7,61 +7,61 @@ use log::{LevelFilter, debug, error, info};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
 use model::math_util::{mean, median, p05_p95, p10_p90};
-use model::{order_book_cache, DataSource, Instrument, OrderBook, TradeDirection};
+use model::{DataSource, Instrument, OrderBook, TradeDirection, order_book_cache};
 use ndarray::Array2;
 use plotters::prelude::*;
 use rust_decimal::Decimal;
-use signal::strategy_optimizer::StrategyOptimizer;
-use signal::{DealData, ModelConfig, Regime, TradeSignal, WalkForwardModel, WindowData};
+use signal::{DealData, ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use simplelog::SimpleLogger;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Copy, Clone)]
 struct TestDeal {
-    regime: Regime,
     open_index: usize,
     close_index: Option<usize>,
     open_time: DateTime<Utc>,
     close_time: DateTime<Utc>,
-    open_price: f64,
-    close_price: Option<f64>,
+    open_price1: (f64, f64),
+    open_price2: (f64, f64),
+    close_price1: Option<(f64, f64)>,
+    close_price2: Option<(f64, f64)>,
 
     deal_data: DealData,
 }
 
 impl TestDeal {
-    fn open(regime: Regime, index: usize, ob: &OrderBook, hold: i32) -> Self {
-        let cur_price = get_best_ask(ob).as_f64();
+    fn open(index: usize, book1: &OrderBook, book2: &OrderBook, hold: i32) -> Self {
+        let cur_time = book1.timestamp.max(book2.timestamp);
         TestDeal {
-            regime,
             open_index: index,
-            open_time: ob.timestamp,
-            close_time: ob.timestamp + TimeDelta::milliseconds(hold as i64),
-            open_price: cur_price,
-            close_price: None,
+            open_time: cur_time,
+            close_time: cur_time + TimeDelta::milliseconds(hold as i64),
+            open_price1: (get_best_ask(book1).as_f64(), get_mid_price(book1).as_f64()),
+            open_price2: (get_best_bid(book2).as_f64(), get_mid_price(book2).as_f64()),
+            close_price1: None,
+            close_price2: None,
             close_index: None,
-            deal_data: DealData::new(ob, TradeDirection::Buy),
+            deal_data: DealData::new(book1, book2, TradeDirection::Buy, hold),
         }
     }
 
-    fn close(&mut self, index: usize, ob: &OrderBook) {
-        if self.close_price.is_some() {
+    fn close(&mut self, index: usize, book1: &OrderBook, book2: &OrderBook) {
+        if self.close_price1.is_some() {
             return;
         }
 
+        let cur_time = book1.timestamp.max(book2.timestamp);
         self.close_index = Some(index);
-        self.close_time = ob.timestamp;
-        let close_price = get_best_bid(ob).as_f64();
-        self.close_price = Some(close_price);
+        self.close_time = cur_time;
 
-        debug!(
-            "{} Buy @ {} => {} Sell @ {} {:?}",
-            self.open_time.time(),
-            self.open_price,
-            ob.timestamp.time(),
-            close_price,
-            self.regime
-        );
+        self.close_price1 = Some((get_best_bid(book1).as_f64(), get_mid_price(book1).as_f64()));
+        self.close_price2 = Some((get_best_ask(book2).as_f64(), get_mid_price(book2).as_f64()));
+    }
+
+    fn pnl(&self) -> (f64, f64) {
+        let real = self.close_price1.unwrap_or_default().0 - self.open_price1.0 + self.open_price2.0 - self.close_price2.unwrap_or_default().0;
+        let mid = self.close_price1.unwrap_or_default().1 - self.open_price1.1 + self.open_price2.1 - self.close_price2.unwrap_or_default().1;
+        (real, mid)
     }
 }
 
@@ -87,46 +87,6 @@ fn setup_logging(log_filename: &str) -> Result<(), fern::InitError> {
 }
 
 
-#[tokio::main]
-async fn main() -> EmptyResult {
-    dotenv::dotenv().ok();
-    setup_logging("strategy_optimize_SiZ6_2.log")?;
-    let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
-    let db = Db::new(&db_url).await?;
-
-    let ticker = "SiZ6";
-
-    let all_instruments = db.get_instruments(DataSource::TInvest).await?;
-    let inst_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to fins instrument")?;
-    let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-15T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-15T20:00:00Z")?.to_utc(),
-    );
-    let end = DateTime::parse_from_rfc3339("2026-10-17T00:00:00Z")?.to_utc();
-
-    let mut all_events = Vec::new();
-
-    while diapason.from < end {
-        if !matches!(diapason.from.weekday().number_from_monday(), 6 | 7) {
-            info!("DAY {}", diapason.from.date_naive());
-            let order_books = get_order_books(ticker, inst_id, diapason, Some(&db)).await?;
-            info!("{} {} order books", order_books.len(), ticker);
-            let events = merge_events(&[inst_id], &[order_books]);
-            all_events.extend(events);
-        }
-
-        diapason.from += TimeDelta::days(1);
-        diapason.to += TimeDelta::days(1);
-    }
-
-    let optimizer = StrategyOptimizer::new(inst_id);
-    info!("Start optimizing");
-    let config = optimizer.optimize(&all_events, 3000, 45)?;
-    std::fs::write("optimized_config_10_15.txt", format!("{config:?}"))?;
-    info!("Done");
-    Ok(())
-}
-
 fn get_mid_price(order_book: &OrderBook) -> f64 {
     (get_best_ask(order_book).as_f64() + get_best_bid(order_book).as_f64()) * 0.5
 }
@@ -139,256 +99,130 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
 }
 
+const OPTIMIZED_CONFIGS: [&str; 2] = [
+    r#"{"bagging_fraction":0.8869652296616486,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.5175497224451625,"lambda_l1":0.671849933963201,"lambda_l2":0.002426698226120504,"learning_rate":0.005251415064970429,"max_depth":-1,"metric":"binary_logloss","min_child_samples":94,"n_jobs":-1,"num_iterations":2000,"num_leaves":105,"objective":"binary","random_state":42,"verbosity":-1}"#,
+    r#"{"bagging_fraction":0.6380151899077117,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.8361884953796676,"lambda_l1":3.0700212121306723,"lambda_l2":0.007479044723956577,"learning_rate":0.0066765177610342355,"max_depth":-1,"metric":"binary_logloss","min_child_samples":413,"n_jobs":-1,"num_iterations":2000,"num_leaves":119,"objective":"binary","random_state":42,"verbosity":-1}"#,
+];
+
 #[tokio::main]
-async fn _main() -> EmptyResult {
+async fn main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
     let db = Db::new(&db_url).await?;
 
-    let ticker = "GLZ6";
+    let tickers = ["SiZ6", "SiH7"];
 
     let all_instruments = db.get_instruments(DataSource::TInvest).await?;
-    let inst_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to fins instrument")?;
-
-    let config_buy = ModelConfig {
-        hold_time_ms: 15000,
-        derivatives_normalize_diapason_s: 325.0,
-        trend_tau_s: 176.0,
-        train_data_minutes: 120,
-        train_interval_minutes: 1,
-        decay_time: 360.0,
-
-        price_change_filter: 0.0,
-        prediction_strength: 0.0035,
-        predicted_change: 0.2,
-        prediction_probability_up_to_flat: -0.65,
-        prediction_probability_up_to_down: 0.056,
-    };
-    let model_buy = WalkForwardModel::new_buying(inst_id, config_buy);
-    let mut window_data_buy = WindowData::new();
-
-    let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-14T08:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-14T15:00:00Z")?.to_utc(),
-    );
-
-    let mut prediction_to_real_change = Vec::new();
-
-    let order_books = get_order_books(ticker, inst_id, diapason, Some(&db)).await?;
-    if order_books.is_empty() {
-        diapason.from += TimeDelta::days(1);
-        diapason.to += TimeDelta::days(1);
-        return Ok(());
-    }
-    info!("{} {} order books", order_books.len(), ticker);
-
-    let events = merge_events(&[inst_id], &[order_books]);
-    debug!("Total events: {}", events.len());
-
-    let mut prev_minute = events[0].order_book.timestamp.minute();
-    for (i, event) in events.iter().enumerate() {
-        if event.order_book.timestamp.minute() != prev_minute {
-            prev_minute = event.order_book.timestamp.minute();
-            info!("{}:{prev_minute}", event.order_book.timestamp.hour());
-        }
-
-        //let resp = model_buy.calibrate(true);
-        let _ = model_buy.process(&mut window_data_buy, event);
-        if let Some(prediction) = model_buy.predict(1000) {
-            if let Some(future) = find_value_on_horizon(&events, i, inst_id, event.order_book.timestamp + TimeDelta::milliseconds(1000)) {
-                prediction_to_real_change.push((prediction, get_mid_price(&future) - get_mid_price(&event.order_book)));
-            }
-        }
-    }
-
-    let predictions = prediction_to_real_change.iter()
-        .map(|(prediction, _)| prediction.predicted_change)
-        .collect::<Vec<_>>();
-    let (min, max) = p05_p95(&predictions);
-    for i in 0..4 {
-        let p_from = max * i as f64 / 4.0;
-        let p_to = max * (i + 1) as f64 / 4.0;
-        let changes = prediction_to_real_change.iter()
-            .filter(|(p, _)| p.predicted_change > p_from && p.predicted_change <= p_to)
-            .map(|(_, change)| *change)
-            .collect::<Vec<_>>();
-        let correct = changes.iter().filter(|&c| *c > 0.0).count();
-        info!(
-            "Predicted changes {p_from} - {p_to}: {} real changes with mean {} and median {}. Direction correctness {}",
-            changes.len(), mean(&changes), median(&changes), correct as f64 / changes.len() as f64,
-        );
-    }
-
-    for i in 0..4 {
-        let p_from = min * i as f64 / 4.0;
-        let p_to = min * (i + 1) as f64 / 4.0;
-        let changes = prediction_to_real_change.iter()
-            .filter(|(p, _)| p.predicted_change < p_from && p.predicted_change >= p_to)
-            .map(|(_, change)| *change)
-            .collect::<Vec<_>>();
-        let correct = changes.iter().filter(|&c| *c < 0.0).count();
-        info!(
-            "Predicted changes {p_from} - {p_to}: {} real changes with mean {} and median {}. Direction correctness {}",
-            changes.len(), mean(&changes), median(&changes), correct as f64 / changes.len() as f64,
-        );
-    }
-
-    let strengths = prediction_to_real_change.iter()
-        .map(|(p, _)| p.strength)
-        .collect::<Vec<_>>();
-    let max_strength = strengths.iter().copied().reduce(|a, b| a.max(b)).unwrap_or(0.0);
-    for i in 0..8 {
-        let strength_from = i as f64 * max_strength / 8.0;
-        let strength_to = (i + 1) as f64 * max_strength / 8.0;
-        let errors = prediction_to_real_change.iter()
-            .filter(|(p, _)| p.strength >= strength_from && p.strength <= strength_to)
-            .map(|(p, change)| (p.predicted_change - change).abs())
-            .collect::<Vec<_>>();
-        info!(
-            "Strength {strength_from} - {strength_to}: {} real changes, mean error {}, median error {}",
-            errors.len(), mean(&errors), median(&errors),
-        );
-
-        let correct_by_probabilities = prediction_to_real_change.iter()
-            .filter(|(p, _)| p.strength >= strength_from && p.strength <= strength_to)
-            .map(|(p, change)| {
-                if *change >= 0.0 {
-                    if p.probability_up > p.probability_down {
-                        1_u64
-                    } else {
-                        0_u64
-                    }
-                } else {
-                    if p.probability_down > p.probability_up {
-                        1_u64
-                    } else {
-                        0_u64
-                    }
-                }
-            }).sum::<u64>();
-        info!(
-            "Strength {strength_from} - {strength_to}: prediction by probability {}",
-            correct_by_probabilities as f64 / errors.len() as f64,
-        )
-    }
-
-    Ok(())
-}
-
-#[tokio::main]
-async fn __main() -> EmptyResult {
-    dotenv::dotenv().ok();
-    SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
-    let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
-    let db = Db::new(&db_url).await?;
-
-    let ticker = "SiZ6";
-
-    let all_instruments = db.get_instruments(DataSource::TInvest).await?;
-    let inst_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to fins instrument")?;
+    let first_leg_id = find_instrument_id(&all_instruments, tickers[0]).ok_or("Failed to find instrument")?;
+    let second_leg_id = find_instrument_id(&all_instruments, tickers[1]).ok_or("Failed to find instrument")?;
 
     let config = ModelConfig {
-        derivatives_normalize_diapason_s: 266.6075790370919,
-        trend_tau_s: 169.31465504345616,
-        train_data_minutes: 45,
-        train_interval_minutes: 1,
-        decay_time: 490.4368789053648,
-        hold_time_ms: 3000,
-        price_change_filter: 0.7252934346035782,
-        prediction_strength: 0.0016547748955359003,
-        predicted_change: 0.42751430574273985,
-        prediction_probability_up_to_flat: -0.27957291936687434,
-        prediction_probability_up_to_down: 0.17813105774508864
+        derivatives_normalize_diapason_s: 57.28,
+        trend_tau_s: 614.61,
+        train_buf_size: 285000,
+        train_min_size: 200000,
+        optimize_iterations: 20,
+        hold_time: TimeDelta::milliseconds(5000),
+        expected_delta: 5.0,
+        prediction_percentile: 0.99966,
     };
 
-    let model_buy = WalkForwardModel::new_buying(inst_id, config);
-    let mut window_data_buy = WindowData::new();
+    let mut window_data = WindowData::new(&config);
+    let model = WalkForwardModel::new(first_leg_id, second_leg_id, config);
 
     let mut diapason = TimeDiapason::new(
         DateTime::parse_from_rfc3339("2026-10-19T05:00:00Z")?.to_utc(),
         DateTime::parse_from_rfc3339("2026-10-19T20:00:00Z")?.to_utc(),
     );
-    let end = DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")?.to_utc();
+    let end = DateTime::parse_from_rfc3339("2026-10-24T00:00:00Z")?.to_utc();
 
     let mut active_deal = Option::<TestDeal>::None;
-
     let mut deals = Vec::new();
-    let mut deals_visualisations = Vec::new();
+    let mut deals_visualizations = Vec::new();
 
     let mut do_not_trade_until = None;
+
+    let (mut last_book1, mut last_book2) = (None, None);
+
+    let mut optimized_config_index = 0;
+    let mut last_optimize_time = diapason.from;
+    let mut last_train_time = diapason.from + TimeDelta::hours(6);
 
     while diapason.from < end {
         if !matches!(diapason.from.weekday().number_from_monday(), 6 | 7) {
             info!("DAY {}", diapason.from.date_naive());
 
-            let order_books = get_order_books(ticker, inst_id, diapason, Some(&db)).await?;
-            if order_books.is_empty() {
+            let books1 = get_order_books(tickers[0], first_leg_id, diapason, Some(&db)).await?;
+            if books1.is_empty() {
                 diapason.from += TimeDelta::days(1);
                 diapason.to += TimeDelta::days(1);
                 continue;
             }
-            info!("{} {} order books", order_books.len(), ticker);
+            info!("{} {} order books", books1.len(), tickers[0]);
 
-            let events = merge_events(&[inst_id], &[order_books]);
+            let books2 = get_order_books(tickers[1], second_leg_id, diapason, Some(&db)).await?;
+            info!("{} {} order books", books2.len(), tickers[1]);
+
+            let events = merge_events(&[first_leg_id, second_leg_id], &[&books1, &books2]);
             debug!("Total events: {}", events.len());
 
             let mut prev_hour = events[0].order_book.timestamp.hour();
             for (i, event) in events.iter().enumerate() {
+                if event.instrument_id == first_leg_id {
+                    last_book1 = Some(event.order_book.clone());
+                } else if event.instrument_id == second_leg_id {
+                    last_book2 = Some(event.order_book.clone());
+                }
+
                 if event.order_book.timestamp.hour() != prev_hour {
                     prev_hour = event.order_book.timestamp.hour();
                     info!("Hour {prev_hour}");
                 }
 
-                let resp = model_buy.calibrate(true);
-                if let Some(calc) = &resp.calculator {
-                    let pref = calc.get_performances();
-                    debug!(
-                        "Predictions inside training interval {:?}: {} correct, {} incorrect, score {}",
-                        pref.train_diapason,
-                        pref.training_correct_predictions,
-                        pref.training_incorrect_predictions,
-                        pref.training_score
-                    );
+                if last_optimize_time < event.order_book.timestamp - TimeDelta::hours(5)
+                    && model.optimize_config(OPTIMIZED_CONFIGS.get(optimized_config_index).copied()) {
+                    last_optimize_time = event.order_book.timestamp;
+                    optimized_config_index += 1;
                 }
 
-                let signal_buy = model_buy.process(&mut window_data_buy, event);
+                if last_train_time < event.order_book.timestamp - TimeDelta::minutes(30)
+                    && model.train() {
+                    last_train_time = event.order_book.timestamp;
+                }
 
-                if let Some(deal) = active_deal.as_mut() {
-                    if model_buy.is_it_time_to_close_deal(&event.order_book, &mut deal.deal_data) {
-                        deal.close(i, &event.order_book);
-                        let delta = deal.close_price.unwrap_or_default() - deal.open_price;
-                        info!(
-                            "{} Hold {}: {} -> {} | {} | {:?}",
-                            deal.open_time,
-                            (event.order_book.timestamp - deal.open_time).as_seconds_f64(),
-                            deal.open_price, deal.close_price.unwrap_or_default(),
-                            delta,
-                            deal.regime,
-                        );
-                        if delta < 0.5 {
-                            do_not_trade_until = Some(event.order_book.timestamp + TimeDelta::minutes(4));
-                        }
-                        if let Some(visualization) = build_deal_visualization(&events, &deal) {
-                            deals_visualisations.push(visualization);
-                        }
-                        deals.push(deal.clone());
-                        active_deal = None;
-                    }
-                } else {
-                    let do_trade = do_not_trade_until
-                        .map(|until| event.order_book.timestamp > until)
-                        .unwrap_or(true);
-                    if do_trade {
-                        do_not_trade_until = None;
-                        match signal_buy {
-                            TradeSignal::Buy(hold) => {
-                                if let Some(regime) = model_buy.get_regime() {
-                                    let deal = TestDeal::open(regime, i, &event.order_book, hold);
-                                    active_deal = Some(deal);
-                                }
+                let signal_buy = model.process(&mut window_data, event);
+
+                if let Some(book1) = &last_book1 && let Some(book2) = &last_book2 {
+                    if let Some(deal) = active_deal.as_mut() {
+                        if model.is_it_time_to_close_deal(book1, book2, &mut deal.deal_data) {
+                            deal.close(i, book1, book2);
+                            let pnl = deal.pnl();
+                            info!(
+                                "{} Hold {}: {:?}",
+                                deal.open_time,
+                                (event.order_book.timestamp - deal.open_time).as_seconds_f64(),
+                                pnl,
+                            );
+                            if pnl.1 < -5.0 {
+                                do_not_trade_until = Some(event.order_book.timestamp + TimeDelta::minutes(4));
                             }
-                            _ => {}
+                            deals.push(*deal);
+                            if let Some(visualization) = build_deal_visualization(first_leg_id, second_leg_id, &events, deal) {
+                                deals_visualizations.push(visualization);
+                            }
+                            active_deal = None;
+                        }
+                    } else {
+                        let do_trade = do_not_trade_until
+                            .map(|until| event.order_book.timestamp > until)
+                            .unwrap_or(true);
+                        if do_trade {
+                            do_not_trade_until = None;
+                            if let TradeSignal::Buy(hold) = signal_buy {
+                                let deal = TestDeal::open(i, book1, book2, hold);
+                                active_deal = Some(deal);
+                            }
                         }
                     }
                 }
@@ -400,46 +234,30 @@ async fn __main() -> EmptyResult {
 
     let mut pnl = 0.0;
     let (mut neutrals, mut positives, mut negatives) = (0, 0, 0);
-    let (mut neutrals_regimes, mut positives_regimes, mut negatives_regimes) = (Vec::new(), Vec::new(), Vec::new());
     for deal in &deals {
-        if let Some(close_price) = deal.close_price {
-            pnl += close_price - deal.open_price;
-            if close_price >= deal.open_price + 1.5 {
-                positives += 1;
-                positives_regimes.push(deal.regime);
-            } else if close_price < deal.open_price - 0.5 {
-                negatives += 1;
-                negatives_regimes.push(deal.regime);
-            } else {
-                neutrals += 1;
-                neutrals_regimes.push(deal.regime);
-            }
+        let deal_pnl = deal.pnl();
+        pnl += deal_pnl.0;
+        if deal_pnl.0 >= 1.5 {
+            positives += 1;
+        } else if deal_pnl.0 < -0.5 {
+            negatives += 1;
+        } else {
+            neutrals += 1;
         }
     }
     info!("Total PnL {pnl}, PnL per deal {}", pnl / deals.len() as f64);
     info!("Positives {positives}, negatives {negatives}, neutrals {neutrals}");
 
-    if positives > 10 && negatives > 5 && neutrals > 10 {
-        let changes = positives_regimes.iter().map(|r| r.change).collect::<Vec<_>>();
-        info!("Positive deals regime change mean {}, median {}, p10-p90 {:?}", mean(&changes), median(&changes), p10_p90(&changes));
-        let ers = positives_regimes.iter().map(|r| r.er).collect::<Vec<_>>();
-        info!("Positive deals regime ER mean {}, median {}, p10-p90 {:?}", mean(&ers), median(&ers), p10_p90(&ers));
-
-        let changes = neutrals_regimes.iter().map(|r| r.change).collect::<Vec<_>>();
-        info!("Neutral deals regime change mean {}, median {}, p10-p90 {:?}", mean(&changes), median(&changes), p10_p90(&changes));
-        let ers = neutrals_regimes.iter().map(|r| r.er).collect::<Vec<_>>();
-        info!("Neutral deals regime ER mean {}, median {}, p10-p90 {:?}", mean(&ers), median(&ers), p10_p90(&ers));
-
-        let changes = negatives_regimes.iter().map(|r| r.change).collect::<Vec<_>>();
-        info!("Negative deals regime change mean {}, median {}, p10-p90 {:?}", mean(&changes), median(&changes), p10_p90(&changes));
-        let ers = negatives_regimes.iter().map(|r| r.er).collect::<Vec<_>>();
-        info!("Negative deals regime ER mean {}, median {}, p10-p90 {:?}", mean(&ers), median(&ers), p10_p90(&ers));
-
-        let average_deal = average_deal_visual(&deals_visualisations)?;
-        for (i, (cnt, avg)) in average_deal.iter().enumerate() {
-            if let Err(err) = visualize_deal(avg, &format!("{} deals", cnt), &format!("average_deal_{i}.png")) {
-                error!("Can't visualize deal: {err}");
+    match average_deal_visual(&deals_visualizations) {
+        Ok(visualizations) => {
+            for (i, (deals, data)) in visualizations.iter().enumerate() {
+                if let Err(err) = visualize_deal(data, &format!("deals_{i}.png"), &format!("{deals} deals")) {
+                    error!("Failed to print deals visualisation {err}");
+                }
             }
+        }
+        Err(err) => {
+            error!("Average deal visualizations failed: {err}");
         }
     }
 
@@ -493,20 +311,27 @@ fn average_deal_visual(deals: &[Vec<f64>]) -> Result<Vec<(usize, Vec<f64>)>, Com
     Ok(result)
 }
 
-fn build_deal_visualization(events: &[OrderBookEvent], deal: &TestDeal) -> Option<Vec<f64>> {
+fn build_deal_visualization(first_leg_id: i32, second_leg_id: i32, events: &[OrderBookEvent], deal: &TestDeal) -> Option<Vec<f64>> {
     if let Some(close_index) = deal.close_index {
-        let start = (deal.open_index as i32 - 500).max(0) as usize;
-        let end = (close_index + 500).min(events.len() - 1);
+        let start = (deal.open_index as i32 - 1000).max(0) as usize;
+        let end = (close_index + 5000).min(events.len() - 1);
 
-        let start_timestamp = (deal.open_time - TimeDelta::seconds(20)).timestamp_millis() / 500;
-        let end_timestamp = (deal.close_time + TimeDelta::seconds(40)).timestamp_millis() / 500;
+        let start_timestamp = (deal.open_time - TimeDelta::seconds(10)).timestamp_millis() / 500;
+        let end_timestamp = (deal.open_time + TimeDelta::seconds(40)).timestamp_millis() / 500;
 
         let mut half_second_map = HashMap::new();
-        for i in start..=end {
-            let t = events[i].order_book.timestamp.timestamp_millis() / 500;
-            if t >= start_timestamp && t <= end_timestamp {
-                let mid_price = (get_best_ask(&events[i].order_book).as_f64() + get_best_bid(&events[i].order_book).as_f64()) * 0.5;
-                half_second_map.entry(t).or_insert_with(Vec::new).push(mid_price);
+        let (mut mid1, mut mid2) = (0.0, 0.0);
+        for event in &events[start..=end] {
+            if event.instrument_id == first_leg_id {
+                mid1 = get_mid_price(&event.order_book);
+            } else if event.instrument_id == second_leg_id {
+                mid2 = get_mid_price(&event.order_book);
+            }
+
+            let t = event.order_book.timestamp.timestamp_millis() / 500;
+            if mid1 > 0.0 && mid2 > 0.0 && t >= start_timestamp && t <= end_timestamp {
+                let delta = mid2 - mid1;
+                half_second_map.entry(t).or_insert_with(Vec::new).push(delta);
             }
         }
 

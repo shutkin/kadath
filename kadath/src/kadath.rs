@@ -20,7 +20,7 @@ use tinvest::TInvest;
 const QUEUE_CAPACITY: usize = 65536;
 
 const LISTEN_TICKERS: [&str; 9] = ["GLZ6", "GLH7", "GLM7", "GLU7", "BMV6", "BMX6", "BMZ6", "SiZ6", "SiH7"];
-const TRADE_TICKER: &str = "GLZ6";
+const TRADE_LEGS: [&str; 2] = ["SiZ6", "SiH7"];
 
 #[tokio::main]
 async fn main() -> EmptyResult {
@@ -65,11 +65,14 @@ async fn main() -> EmptyResult {
         error!("Listener stopped");
     });
 
-    let trade_instrument = instruments.iter()
-        .find(|instrument| TRADE_TICKER == instrument.ticker.as_str())
+    let trade_leg1 = instruments.iter()
+        .find(|instrument| TRADE_LEGS[0] == instrument.ticker.as_str())
         .cloned();
-    if let Some(trade_instrument) = trade_instrument {
-        let trader = KadathTrader::new(broker, order_book_queue, trade_instrument, db, trade_queue);
+    let trade_leg2 = instruments.iter()
+        .find(|instrument| TRADE_LEGS[1] == instrument.ticker.as_str())
+        .cloned();
+    if let Some(leg1) = trade_leg1 && let Some(leg2) = trade_leg2 {
+        let trader = KadathTrader::new(broker, order_book_queue, leg1, leg2, db, trade_queue);
         if let Err(err) = trader.run().await {
             error!("Trader failed: {err}");
         }

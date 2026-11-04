@@ -33,7 +33,7 @@ pub struct OrderResponseEvent {
     pub order_id: String,
 }
 
-pub fn merge_events(ids: &[i32], data: &[Vec<OrderBook>]) -> Vec<OrderBookEvent> {
+pub fn merge_events(ids: &[i32], data: &[&[OrderBook]]) -> Vec<OrderBookEvent> {
     let total_size = data.iter().map(|d| d.len()).sum();
     let mut events = Vec::with_capacity(total_size);
     let mut indices = vec![0; data.len()];

@@ -4,19 +4,24 @@ mod stats_collector;
 mod deal;
 mod gradient_boost;
 
-use std::sync::Arc;
-use std::thread;
+use std::cmp::Ordering::Equal;
+use crate::gradient_boost::{GbdtConfig, GradientBoost, MachineConfig, PredictionType, calculate_predictions_brier, calculate_predictions_pnl, optimize_gbdt, optimize_light_gbm};
+use argmin::core::{CostFunction, Error, Executor, State};
+use argmin::solver::neldermead::NelderMead;
 use chrono::{DateTime, TimeDelta, Utc};
-use log::{error, info, warn};
-use serde_json::Value;
 use db::Db;
+use log::{error, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
 use model::math_util::OutputType::{DerivativeNorm, Raw, TrendDeviation, TrendDeviationDerivativeNorm};
-use model::math_util::{FeaturesRollingWindow, OutputType, TimedFeatures};
+use model::math_util::{ExponentFunction, FeaturesRollingWindow, OutputType, TimedFeatures};
 use model::{DataSource, Instrument, OrderBook, order_book_cache};
+use ndarray::Array1;
+use serde_json::Value;
 use simplelog::{LevelFilter, SimpleLogger};
-use crate::gradient_boost::{optimize_gbdt, PredictionType, GradientBoost, GbdtConfig, MachineConfig, optimize_light_gbm};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::thread;
 
 pub const IMBALANCE_LEVELS: [usize; 5] = [3, 5, 10, 20, 50];
 
@@ -66,12 +71,13 @@ const FEATURES_OUTPUT: [OutputType; 12] = [
     DerivativeNorm("i20"),
     DerivativeNorm("i50"),
 ];
-const DERIVATIVE_NORM_DIAPASON: i64 = 90;
-const TREND_TAU: i64 = 300;
+const DERIVATIVE_NORM_DIAPASON: f64 = 57.28;
+const TREND_TAU: f64 = 614.61;
 pub const HORIZON_MS: u16 = 2000;
 const THRESHOLD: f64 = 5.0;
 
 const OPTIMIZE: bool = true;
+const OPTIMIZE_GLOBAL_PARAMS: bool = false;
 
 #[tokio::main]
 async fn main() -> EmptyResult {
@@ -100,12 +106,25 @@ async fn main() -> EmptyResult {
         find_instrument_id(&all_instruments, tickers[0]),
         find_instrument_id(&all_instruments, tickers[1]),
     ) {
+        let mut global = GlobalParams::default();
+
         let (cfg_up, cfg_down) = if OPTIMIZE {
             let (order_books1, order_books2) = get_order_books(&tickers, &[first_leg_id, second_leg_id], optimize_diapason, Some(&db)).await?;
             info!("Got {} {} books and {} {} books for optimization", order_books1.len(), tickers[0], order_books2.len(), tickers[1]);
 
+            if OPTIMIZE_GLOBAL_PARAMS {
+                let cfg_json_up = r#"
+{"bagging_fraction":0.9095846010507107,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.8618735092340805,"lambda_l1":0.12233067115578736,"lambda_l2":0.0036432070771574556,"learning_rate":0.025273059075476657,"max_depth":-1,"metric":"binary_logloss","min_child_samples":1086,"n_jobs":-1,"num_iterations":2000,"num_leaves":114,"objective":"binary","random_state":42,"verbosity":-1}            "#;
+                let value: Value = serde_json::from_str(cfg_json_up)?;
+                let cfg_up = MachineConfig::LightGBM(value);
+                if let Some(best_global) = global_optimize(first_leg_id, second_leg_id, cfg_up, prediction_type_up, &order_books1, &order_books2, optimize_train_end) {
+                    info!("Best global {best_global:?}");
+                    global = best_global;
+                }
+            }
+
             let (train, test, train_h, test_h) =
-                features_with_horizons(first_leg_id, second_leg_id, order_books1, order_books2, optimize_train_end);
+                features_with_horizons(first_leg_id, second_leg_id, &order_books1, &order_books2, optimize_train_end, global);
             info!("Optimize train {} events, test {} events", train.len(), test.len());
 
             let train_arc = Arc::new(train);
@@ -136,9 +155,9 @@ async fn main() -> EmptyResult {
             (cfg_up, cfg_down)
         } else {
             let cfg_json_up = r#"
-{"bagging_fraction":0.9095846010507107,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.8618735092340805,"lambda_l1":0.12233067115578736,"lambda_l2":0.0036432070771574556,"learning_rate":0.025273059075476657,"max_depth":-1,"metric":"binary_logloss","min_child_samples":1086,"n_jobs":-1,"num_iterations":2000,"num_leaves":114,"objective":"binary","random_state":42,"verbosity":-1}            "#;
+{"bagging_fraction":0.895994038988877,"bagging_freq":4,"boosting_type":"gbdt","feature_fraction":0.5118879801269481,"lambda_l1":0.003943743350232156,"lambda_l2":0.1630738251743011,"learning_rate":0.006470704862855319,"max_depth":-1,"metric":"binary_logloss","min_child_samples":169,"n_jobs":-1,"num_iterations":2000,"num_leaves":50,"objective":"binary","random_state":42,"verbosity":-1}"#;
             let cfg_json_down = r#"
-{"bagging_fraction":0.8369160588211664,"bagging_freq":4,"boosting_type":"gbdt","feature_fraction":0.8967208605079544,"lambda_l1":0.001863656999813329,"lambda_l2":0.0001985706187862285,"learning_rate":0.021912667924278612,"max_depth":-1,"metric":"binary_logloss","min_child_samples":700,"n_jobs":-1,"num_iterations":2000,"num_leaves":12,"objective":"binary","random_state":42,"verbosity":-1}            "#;
+{"bagging_fraction":0.8361357907636818,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.9596713385375366,"lambda_l1":0.549411566785072,"lambda_l2":0.00047609572483133504,"learning_rate":0.0051143561715938065,"max_depth":-1,"metric":"binary_logloss","min_child_samples":267,"n_jobs":-1,"num_iterations":2000,"num_leaves":44,"objective":"binary","random_state":42,"verbosity":-1}"#;
 
             let value: Value = serde_json::from_str(cfg_json_up)?;
             let cfg_up = MachineConfig::LightGBM(value);
@@ -151,26 +170,30 @@ async fn main() -> EmptyResult {
         let (order_books1, order_books2) = get_order_books(&tickers, &[first_leg_id, second_leg_id], check_diapason, Some(&db)).await?;
         info!("Got {} {} books and {} {} books for check", order_books1.len(), tickers[0], order_books2.len(), tickers[1]);
         let (train, test, train_h, test_h) =
-            features_with_horizons(first_leg_id, second_leg_id, order_books1, order_books2, check_train_end);
+            features_with_horizons(first_leg_id, second_leg_id, &order_books1, &order_books2, check_train_end, global);
         info!("Check train {} events, test {} events", train.len(), test.len());
 
         info!("Train models...");
         let gb_up = GradientBoost::train(prediction_type_up, &cfg_up, &train, &train_h)?;
-        let gb_down = GradientBoost::train(prediction_type_down, &cfg_down, &train, &train_h)?;
+        //let gb_down = GradientBoost::train(prediction_type_down, &cfg_down, &train, &train_h)?;
         info!("Training completed");
 
-        let predictions_up = gb_up.test(&test)?;
-        let predictions_down = gb_down.test(&test)?;
-        let predictions = predictions_up.into_iter().zip(predictions_down.into_iter())
-            .map(|(p_up, p_down)| p_up * (1.0 - p_down))
-            .collect::<Vec<f64>>();
+        let h = thread::spawn(move || {
+            gb_up.test(&test)
+        });
+        let predictions = h.join().unwrap()?;
 
-        let min = predictions.iter().copied().reduce(f64::min).unwrap();
-        let max = predictions.iter().copied().reduce(f64::max).unwrap();
-        info!("Min {min:?}, Max {max:?}");
+        //let predictions_down = gb_down.test(&test)?;
+        //let predictions = predictions_up.into_iter().zip(predictions_down.into_iter())
+        //    .map(|(p_up, p_down)| p_up * (1.0 - p_down))
+        //    .collect::<Vec<f64>>();
 
-        for i in 0..32 {
-            let threshold = min + (i + 1) as f64 * (max - min) / 33.0;
+        let mut predictions_ord = predictions.clone();
+        predictions_ord.sort_by(|p1, p2| p1.partial_cmp(p2).unwrap_or(Equal));
+
+        for percentile in [0.99, 0.995, 0.999, 0.9995, 0.99966, 0.9999] {
+            let index = ((predictions_ord.len() - 1) as f64 * percentile) as usize;
+            let threshold = predictions_ord[index];
             let (mut correct, mut incorrect) = (0, 0);
             let (mut commission, mut pnl) = (0.0, 0.0);
             for (prediction, horizon) in predictions.iter().zip(test_h.iter()) {
@@ -185,7 +208,7 @@ async fn main() -> EmptyResult {
                     commission += 5.0;
                 }
             }
-            info!("Threshold {threshold}: {:.2}%, PnL {pnl}, commission {commission}, gross {}",
+            info!("Percentile {percentile} ({threshold}): {:.2}%, PnL {pnl}, commission {commission}, gross {}",
             correct as f64 * 100.0 / (correct + incorrect) as f64, pnl - commission);
         }
     }
@@ -216,21 +239,22 @@ fn export_to_csv(data: &[Vec<f32>], horizons: &[f64]) {
 fn features_with_horizons(
     first_leg_id: i32,
     second_leg_id: i32,
-    order_books1: Vec<OrderBook>,
-    order_books2: Vec<OrderBook>,
+    order_books1: &[OrderBook],
+    order_books2: &[OrderBook],
     train_end: DateTime<Utc>,
+    global_params: GlobalParams,
 ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f64>, Vec<f64>) {
     let events = merge_events(&[first_leg_id, second_leg_id], &[order_books1, order_books2]);
 
     let mut window1 = FeaturesRollingWindow::new(
-        TimeDelta::seconds(DERIVATIVE_NORM_DIAPASON),
-        TimeDelta::seconds(TREND_TAU),
+        TimeDelta::milliseconds((1000.0 * global_params.derivatives_normalize) as i64),
+        TimeDelta::milliseconds((1000.0 * global_params.trend_tau) as i64),
         &FEATURES_NAMES,
         &FEATURES_OUTPUT,
     );
     let mut window2 = FeaturesRollingWindow::new(
-        TimeDelta::seconds(DERIVATIVE_NORM_DIAPASON),
-        TimeDelta::seconds(TREND_TAU),
+        TimeDelta::milliseconds((1000.0 * global_params.derivatives_normalize) as i64),
+        TimeDelta::milliseconds((1000.0 * global_params.trend_tau) as i64),
         &FEATURES_NAMES,
         &FEATURES_OUTPUT,
     );
@@ -345,5 +369,129 @@ impl OrderBookValues {
             time: self.time,
             features: vec![self.mid, self.imbalances[0], self.imbalances[1], self.imbalances[2], self.imbalances[3], self.imbalances[4]],
         }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct GlobalParams {
+    pub derivatives_normalize: f64,
+    pub trend_tau: f64,
+}
+
+impl Default for GlobalParams {
+    fn default() -> Self {
+        Self {
+            derivatives_normalize: DERIVATIVE_NORM_DIAPASON,
+            trend_tau: TREND_TAU,
+        }
+    }
+}
+
+impl GlobalParams {
+    pub fn from_param(param: &Array1<f64>, functions: &[Option<ExponentFunction>]) -> Self {
+        Self {
+            derivatives_normalize: functions[0].map(|f| f.calculate(param[0])).unwrap_or(param[0]),
+            trend_tau: functions[1].map(|f| f.calculate(param[1])).unwrap_or(param[1]),
+        }
+    }
+}
+
+fn global_optimize(
+    first_leg_id: i32,
+    second_leg_id: i32,
+    machine_config: MachineConfig,
+    prediction_type: PredictionType,
+    books1: &[OrderBook],
+    books2: &[OrderBook],
+    train_end: DateTime<Utc>,
+) -> Option<GlobalParams> {
+    let functions = [
+        Some(ExponentFunction::find(15.0, 100.0, 1000.0)),
+        Some(ExponentFunction::find(30.0, 300.0, 1500.0)),
+    ];
+
+    let problem = GlobalProblem {
+        first_leg_id,
+        second_leg_id,
+        machine_config,
+        prediction_type,
+        books1,
+        books2,
+        train_end,
+        functions: &functions,
+        count: AtomicU8::new(0)
+    };
+    execute(problem, &functions)
+}
+
+fn execute(problem: GlobalProblem, functions: &[Option<ExponentFunction>]) -> Option<GlobalParams> {
+    let initial = Array1::from_vec(vec![0.0, 0.0]);
+
+    let mut simplex = Vec::with_capacity(initial.len() + 1);
+
+    simplex.push(initial.clone());
+
+    for i in 0..initial.len() {
+        let mut point = initial.clone();
+        point[i] += 0.25;
+        simplex.push(point);
+    }
+
+    let solver = NelderMead::<Array1<f64>, f64>::new(simplex.clone());
+
+    match Executor::new(problem, solver)
+        .configure(|state| state.max_iters(50))
+        .run() {
+        Ok(result) => {
+            if let Some(best_param) = result.state().get_best_param() {
+                let score = -result.state().get_best_cost();
+                let global_param = GlobalParams::from_param(best_param, functions);
+                info!("Best score: {score} with {global_param:?}");
+                Some(global_param)
+            } else {
+                None
+            }
+        }
+        Err(err) => {
+            error!("Unable to optimize calculator {err}");
+            None
+        }
+    }
+}
+
+struct GlobalProblem<'a> {
+    first_leg_id: i32,
+    second_leg_id: i32,
+    train_end: DateTime<Utc>,
+    machine_config: MachineConfig,
+    prediction_type: PredictionType,
+    books1: &'a [OrderBook],
+    books2: &'a [OrderBook],
+    functions: &'a [Option<ExponentFunction>],
+    count: AtomicU8,
+}
+
+impl CostFunction for GlobalProblem<'_> {
+    type Param = Array1<f64>;
+    type Output = f64;
+
+    fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
+        let global = GlobalParams::from_param(param, self.functions);
+        let (train, test, train_h, test_h) = features_with_horizons(
+            self.first_leg_id,
+            self.second_leg_id,
+            self.books1,
+            self.books2,
+            self.train_end,
+            global
+        );
+        let boost = GradientBoost::train(self.prediction_type, &self.machine_config, &train, &train_h).unwrap();
+        let predictions = boost.test(&test).unwrap();
+
+        let score = calculate_predictions_brier(&predictions, &train_h, self.prediction_type);
+
+        let count = self.count.fetch_add(1, Ordering::Relaxed);
+        info!("{count}: {global:?} => {score}");
+        Ok(-score)
     }
 }

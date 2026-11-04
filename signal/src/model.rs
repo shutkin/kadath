@@ -1,37 +1,27 @@
 extern crate core;
 
 pub mod orderbook_values;
-pub mod signal_calculator;
-mod optimizer;
-pub mod strategy_optimizer;
-pub mod kernel_prediction;
-mod regime;
+mod gradient_boost;
 
-use crate::optimizer::calibrate_signal_calculator;
-use crate::orderbook_values::{OrderBookValues, WindowValuesCalculator};
-use crate::signal_calculator::{SignalCalculator, SignalPerformance};
+use crate::gradient_boost::{DataVec, GradientBoost, PredictionType, optimize_light_gbm};
+use crate::orderbook_values::OrderBookValues;
 use chrono::{DateTime, TimeDelta, Utc};
+use log::{error, info};
 use model::events::OrderBookEvent;
-use std::sync::{Arc, Mutex, RwLock};
+use model::math_util::OutputType::{DerivativeNorm, Raw, TrendDeviation, TrendDeviationDerivativeNorm};
+use model::math_util::{FeaturesRollingWindow, p05_p95, percentile};
 use model::{OrderBook, TradeDirection};
-use crate::kernel_prediction::{predict_kernel, KernelPrediction, KernelConfig};
-use crate::regime::get_regime;
+use serde_json::Value;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
-const MAX_WINDOW_LENGTH_S: i64 = 2000;
+const LAST_PREDICTIONS_INTERVAL: TimeDelta = TimeDelta::minutes(60);
 
-pub const HOLD_TIME_VARIANTS: [u16; 6] = [200, 300, 500, 750, 1000, 1500];
-
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 pub enum TradeSignal {
+    #[default]
     None,
     Sell(i32),
     Buy(i32),
-}
-
-impl Default for TradeSignal {
-    fn default() -> Self {
-        TradeSignal::None
-    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -44,26 +34,51 @@ pub struct Regime {
 pub struct ModelConfig {
     pub derivatives_normalize_diapason_s: f64,
     pub trend_tau_s: f64,
-    pub train_data_minutes: u16,
-    pub train_interval_minutes: u16,
-    pub decay_time: f64,
-    pub hold_time_ms: i32,
-    
-    pub price_change_filter: f64,
-    pub prediction_strength: f64,
-    pub predicted_change: f64,
-    pub prediction_probability_up_to_flat: f64,
-    pub prediction_probability_up_to_down: f64,
+    pub train_buf_size: usize,
+    pub train_min_size: usize,
+    pub optimize_iterations: usize,
+    pub hold_time: TimeDelta,
+    pub expected_delta: f32,
+    pub prediction_percentile: f64,
 }
 
 pub struct WindowData {
-    values_calculator: WindowValuesCalculator,
+    last_book1: Option<OrderBookValues>,
+    last_book2: Option<OrderBookValues>,
+    window1: FeaturesRollingWindow,
+    window2: FeaturesRollingWindow,
+    last_predictions: Vec<f64>,
+    last_predictions_times: Vec<DateTime<Utc>>,
 }
 
 impl WindowData {
-    pub fn new() -> Self {
+    pub fn new(config: &ModelConfig) -> Self {
+        let window = FeaturesRollingWindow::new(
+            TimeDelta::milliseconds((config.derivatives_normalize_diapason_s * 1000.0) as i64),
+            TimeDelta::milliseconds((config.trend_tau_s * 1000.0) as i64),
+            &["mid", "i3", "i5", "i10", "i20", "i50"],
+            &[
+                TrendDeviation("mid"),
+                TrendDeviationDerivativeNorm("mid"),
+                Raw("i3"),
+                Raw("i5"),
+                Raw("i10"),
+                Raw("i20"),
+                Raw("i50"),
+                DerivativeNorm("i3"),
+                DerivativeNorm("i5"),
+                DerivativeNorm("i10"),
+                DerivativeNorm("i20"),
+                DerivativeNorm("i50"),
+            ],
+        );
         Self {
-            values_calculator: WindowValuesCalculator::new(),
+            last_book1: None,
+            last_book2: None,
+            window1: window.clone(),
+            window2: window.clone(),
+            last_predictions: Vec::new(),
+            last_predictions_times: Vec::new(),
         }
     }
 }
@@ -72,140 +87,277 @@ impl WindowData {
 pub struct DealData {
     direction: TradeDirection,
     open_time: DateTime<Utc>,
-    open_price: f64,
+    hold_to: DateTime<Utc>,
+    open_price1: f64,
+    open_price2: f64,
+
     trend: f64,
     max_trend: f64,
     prev_price_time: DateTime<Utc>,
 }
 
 impl DealData {
-    pub fn new(book: &OrderBook, direction: TradeDirection) -> Self {
-        let (_ask, _bid, mid) = OrderBookValues::calculate_ask_bid_mid(book);
+    pub fn new(book1: &OrderBook, book2: &OrderBook, direction: TradeDirection, hold_time_ms: i32) -> Self {
+        let cur_time = book1.timestamp.max(book2.timestamp);
+        let (_ask, _bid, mid1) = OrderBookValues::calculate_ask_bid_mid(book1);
+        let (_ask, _bid, mid2) = OrderBookValues::calculate_ask_bid_mid(book2);
         //let (open_price, close_price) = match direction {
         //    TradeDirection::Buy => (ask, bid),
         //    TradeDirection::Sell => (bid, ask),
         //};
         Self {
             direction,
-            open_time: book.timestamp,
-            open_price: mid,
-            trend: mid,
-            max_trend: mid,
-            prev_price_time: book.timestamp,
+            open_time: cur_time,
+            hold_to: cur_time + TimeDelta::milliseconds(hold_time_ms as i64),
+            open_price1: mid1,
+            open_price2: mid2,
+            trend: 0.0,
+            max_trend: 0.0,
+            prev_price_time: cur_time,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct HistoryPrices {
+    time: DateTime<Utc>,
+    price1: f32,
+    price2: f32,
+    price1_horizon: f32,
+    price2_horizon: f32,
 }
 
 #[derive(Clone)]
 pub struct WalkForwardModel {
-    instrument_id: i32,
+    first_leg_id: i32,
+    second_leg_id: i32,
     config: ModelConfig,
-    is_buying: bool,
-    calculator: Arc<RwLock<Option<SignalCalculator>>>,
-    buffer: Arc<Mutex<Vec<OrderBookValues>>>,
-}
-
-#[derive(Copy, Clone, Default)]
-pub struct CalibrationResponse {
-    pub prev_cycle_performances: Option<SignalPerformance>,
-    pub calculator: Option<SignalCalculator>,
+    booster_config: Arc<RwLock<Option<Value>>>,
+    booster: Arc<RwLock<Option<GradientBoost>>>,
+    features_buffer: Arc<Mutex<Vec<Vec<f32>>>>,
+    prices_buffer: Arc<Mutex<Vec<HistoryPrices>>>,
 }
 
 impl WalkForwardModel {
-    pub fn new_buying(instrument_id: i32, config: ModelConfig) -> Self {
+    pub fn new(first_leg_id: i32, second_leg_id: i32, config: ModelConfig) -> Self {
         Self {
-            instrument_id,
+            first_leg_id,
+            second_leg_id,
             config,
-            is_buying: true,
-            calculator: Arc::new(RwLock::new(None)),
-            buffer: Arc::new(Mutex::new(Vec::new())),
+            booster_config: Arc::new(RwLock::new(None)),
+            booster: Arc::new(RwLock::new(None)),
+            features_buffer: Arc::new(Mutex::new(Vec::new())),
+            prices_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn new_selling(instrument_id: i32, config: ModelConfig) -> Self {
-        Self {
-            instrument_id,
-            config,
-            is_buying: false,
-            calculator: Arc::new(RwLock::new(None)),
-            buffer: Arc::new(Mutex::new(Vec::new())),
+    pub fn get_config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    pub fn is_it_time_to_close_deal(&self, book1: &OrderBook, book2: &OrderBook, deal_data: &mut DealData) -> bool {
+        let last_time = book1.timestamp.max(book2.timestamp);
+
+        let (_ask, _bid, mid1) = OrderBookValues::calculate_ask_bid_mid(book1);
+        let (_ask, _bid, mid2) = OrderBookValues::calculate_ask_bid_mid(book2);
+        let cur_pnl = match deal_data.direction {
+            TradeDirection::Buy => mid1 - deal_data.open_price1 + deal_data.open_price2 - mid2,
+            TradeDirection::Sell => deal_data.open_price1 - mid1 + mid2 - deal_data.open_price2,
+        };
+        if cur_pnl < -0.5 && last_time > deal_data.open_time + TimeDelta::milliseconds(300) {
+            return true;
         }
-    }
 
-    fn get_last_value(&self) -> Option<OrderBookValues> {
-        let mut v = None;
-        if let Ok(lock) = self.buffer.lock() {
-            v = lock.last().copied();
-        }
-        v
-    }
-
-    pub fn get_price_change_from_past(&self, time_ms: i64) -> Option<f64> {
-        if let Ok(buf) = self.buffer.lock() && buf.len() > 3 {
-            let mut i = buf.len() - 1;
-            let last_value = &buf[i];
-            let target_time = last_value.time - TimeDelta::milliseconds(time_ms);
-            while i > 0 && buf[i].time > target_time {
-                i -= 1;
-            }
-            if i > 0 {
-                Some(last_value.mid - buf[i].mid)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    pub fn predict(&self, time_ms: i32) -> Option<KernelPrediction> {
-        let buf: Vec<OrderBookValues> = self.buffer.lock()
-            .map(|vec| vec.to_vec())
-            .unwrap_or_default();
-        if let Some(v) = self.get_last_value() {
-            let kernel_config = KernelConfig {
-                bandwidth: 0.2,
-                epsilon: 1.5,
-                min_effective_samples: 1024.0,
-            };
-            predict_kernel(&buf, &v, kernel_config, time_ms)
-        } else {
-            None
-        }
-    }
-
-    pub fn get_regime(&self) -> Option<Regime> {
-        get_regime(self.buffer.lock().unwrap().as_slice())
-    }
-
-    pub fn is_it_time_to_close_deal(&self, book: &OrderBook, deal_data: &mut DealData) -> bool {
-        let (_ask, _bid, close_price) = OrderBookValues::calculate_ask_bid_mid(book);
-        //let close_price = match deal_data.direction {
-        //    TradeDirection::Buy => bid,
-        //    TradeDirection::Sell => ask,
-        //};
-
-        let dt = (book.timestamp - deal_data.prev_price_time).as_seconds_f64();
+        let dt = (last_time - deal_data.prev_price_time).as_seconds_f64();
         let alpha = 1.0 - (-dt / 1.5).exp();
-        deal_data.trend += alpha * (close_price - deal_data.trend);
+        deal_data.trend += alpha * (cur_pnl - deal_data.trend);
 
         if deal_data.max_trend < deal_data.trend {
             deal_data.max_trend = deal_data.trend;
         }
 
-        deal_data.prev_price_time = book.timestamp;
+        deal_data.prev_price_time = last_time;
 
-        match deal_data.direction {
-            TradeDirection::Buy => {
-                if close_price < deal_data.open_price - 0.5 && book.timestamp > deal_data.open_time + TimeDelta::milliseconds(300)
-                    || deal_data.trend < deal_data.max_trend - 0.5 {
-                    return true;
+        if last_time > deal_data.hold_to && deal_data.trend < deal_data.max_trend - 0.5 {
+            return true;
+        }
+
+        false
+    }
+
+    fn write_prices_to_history(&self, mut buffer: MutexGuard<Vec<HistoryPrices>>, prices: HistoryPrices) {
+        let mut i = buffer.len() as i32 - 1;
+        buffer.push(prices);
+        let horizon_target = prices.time - self.config.hold_time;
+        while i >= 0 {
+            let prev_prices = &mut buffer[i as usize];
+            if prev_prices.price1_horizon > 0.0 {
+                break;
+            }
+
+            if prev_prices.time <= horizon_target {
+                prev_prices.price1_horizon = prices.price1;
+                prev_prices.price2_horizon = prices.price2;
+            }
+
+            i -= 1;
+        }
+    }
+
+    pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {
+        if self.first_leg_id == event.instrument_id {
+            window_data.last_book1 = Some(OrderBookValues::from_order_book(&event.order_book));
+        } else if self.second_leg_id == event.instrument_id {
+            window_data.last_book2 = Some(OrderBookValues::from_order_book(&event.order_book));
+        } else {
+            return TradeSignal::None;
+        };
+
+        let mut prediction = None;
+
+        if let Some(book1) = &window_data.last_book1
+            && let Some(book2) = &window_data.last_book2 {
+            let mut features = window_data.window1.process(book1.to_features());
+            features.extend(window_data.window2.process(book2.to_features()));
+
+            if let Ok(mut lock) = self.features_buffer.lock() {
+                lock.push(features.clone());
+            }
+
+            if let Ok(lock) = self.prices_buffer.lock() {
+                let prices = HistoryPrices {
+                    time: event.order_book.timestamp,
+                    price1: book1.mid as f32,
+                    price2: book2.mid as f32,
+                    price1_horizon: 0.0,
+                    price2_horizon: 0.0,
+                };
+                self.write_prices_to_history(lock, prices);
+            }
+
+            if let Ok(read) = self.booster.read()
+                && let Some(booster) = read.as_ref() {
+                match booster.test(&[features]) {
+                    Ok(predictions) => {
+                        prediction = predictions.into_iter().next();
+                    }
+                    Err(err) => {
+                        error!("Failed to make prediction: {err}");
+                    }
                 }
             }
-            TradeDirection::Sell => {
-                if close_price > deal_data.open_price + 0.5 && book.timestamp > deal_data.open_time + TimeDelta::milliseconds(300)
-                    || deal_data.trend > deal_data.max_trend + 0.5 {
-                    return true;
+        }
+
+        if let Some(prediction) = prediction {
+            window_data.last_predictions.push(prediction);
+            window_data.last_predictions_times.push(event.order_book.timestamp);
+
+            let threshold = event.order_book.timestamp - LAST_PREDICTIONS_INTERVAL;
+            while let Some(first_time) = window_data.last_predictions_times.first() && *first_time < threshold {
+                window_data.last_predictions_times.remove(0);
+                window_data.last_predictions.remove(0);
+            }
+
+            let p_threshold = percentile(&window_data.last_predictions, self.config.prediction_percentile);
+            if prediction > p_threshold {
+                return TradeSignal::Buy(self.config.hold_time.num_milliseconds() as i32)
+            }
+        }
+
+        TradeSignal::None
+    }
+
+    fn get_horizons(&self, direction: TradeDirection) -> Vec<f32> {
+        self.prices_buffer.lock()
+            .map(|prices| {
+                if prices.len() < self.config.train_min_size {
+                    Vec::new()
+                } else {
+                    prices.iter()
+                        .filter(|p| p.price1_horizon > 0.0 && p.price2_horizon > 0.0)
+                        .map(|p| {
+                            match direction {
+                                TradeDirection::Buy => p.price1_horizon - p.price1 + p.price2 - p.price2_horizon,
+                                TradeDirection::Sell => p.price1 - p.price1_horizon + p.price2_horizon - p.price2,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                }
+            }).unwrap_or_default()
+    }
+
+    pub fn train(&self) -> bool {
+        self.shrink_buffer();
+
+        let mut booster = None;
+
+        let horizons = self.get_horizons(TradeDirection::Buy);
+        if horizons.len() >= self.config.train_min_size {
+            let features = self.features_buffer.lock().map(|buf| buf[..horizons.len()].to_vec());
+            let config = self.booster_config.read().map(|cfg| cfg.clone());
+            if let Ok(Some(config)) = &config && let Ok(features) = features {
+                info!("Start training on {} events", features.len());
+                match GradientBoost::train(
+                    PredictionType::ClassificationPositive(self.config.expected_delta),
+                    config,
+                    DataVec::Owned(features),
+                    &horizons,
+                ) {
+                    Ok(boost) => {
+                        booster = Some(boost);
+                        info!("New booster trained");
+                    }
+                    Err(err) => {
+                        error!("Failed to train: {err}");
+                    }
+                }
+            }
+        }
+
+        if let Some(booster) = booster
+            && let Ok(mut write) = self.booster.write() {
+            *write = Some(booster);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn optimize_config(&self, config_json: Option<&str>) -> bool {
+        if let Some(config_json) = config_json
+            && let Ok(config) = serde_json::from_str(config_json)
+            && let Ok(mut write) = self.booster_config.write() {
+            *write = Some(config);
+            info!("New predefined booster config saved");
+            return true;
+        }
+
+        let horizons = self.get_horizons(TradeDirection::Buy);
+        if horizons.len() >= self.config.train_min_size {
+            let train_size = horizons.len() * 4 / 5;
+            let features = self.features_buffer.lock()
+                .map(|buf| {
+                    (buf[..train_size].to_vec(), buf[train_size..horizons.len()].to_vec())
+                });
+            if let Ok((train, test)) = features {
+                match optimize_light_gbm(
+                    PredictionType::ClassificationPositive(self.config.expected_delta),
+                    &train,
+                    &horizons[..train_size],
+                    &test,
+                    &horizons[train_size..],
+                    self.config.optimize_iterations,
+                ) {
+                    Ok(config) => {
+                        if let Ok(mut write) = self.booster_config.write() {
+                            *write = Some(config);
+                            info!("New booster config saved");
+                            return true;
+                        }
+                    }
+                    Err(err) => {
+                        error!("Failed to optimize: {err}");
+                    }
                 }
             }
         }
@@ -213,107 +365,20 @@ impl WalkForwardModel {
         false
     }
 
-    pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {
-        let v = if self.instrument_id == event.instrument_id {
-            window_data.values_calculator.calculate(
-                &event.order_book,
-                self.config.derivatives_normalize_diapason_s,
-                self.config.trend_tau_s)
-        } else {
-            return TradeSignal::None;
-        };
-        if let Ok(mut lock) = self.buffer.lock() {
-            lock.push(v);
-        }
-
-        if let Ok(read) = self.calculator.read()
-            && let Some(calculator) = read.as_ref()
-            && let Some(v) = self.get_last_value() {
-            let signal_score = calculator.calculate(&v);
-            if signal_score.abs() > f64::MIN_POSITIVE {
-                if self.is_buying && signal_score > 0.0 {
-                    if let Some(price_change) = self.get_price_change_from_past(5000)
-                        && price_change > self.config.price_change_filter {
-                        if let Some(prediction) = self.predict(3000) {
-                            if prediction.strength > self.config.prediction_strength
-                                && prediction.predicted_change > self.config.predicted_change
-                                && prediction.probability_up - prediction.probability_flat > self.config.prediction_probability_up_to_flat
-                                && prediction.probability_up - prediction.probability_down > self.config.prediction_probability_up_to_down {
-                                return TradeSignal::Buy(calculator.get_hold_time_ms())
-                            }
-                        }
-                    }
-                } /*else if !self.is_buying && signal_score < 0.0 {
-                    return TradeSignal::Sell(calculator.get_hold_time_ms())
-                }*/
-            }
-        }
-        TradeSignal::None
-    }
-    
-    pub fn inform_deal_result(&self, profit: f64) {
-        if let Ok(mut write) = self.calculator.write()
-            && let Some(calc) = write.as_mut() {
-            calc.deal_performance(profit);
-        }
-    }
-    
-    pub fn calibrate(&self, check_time: bool) -> CalibrationResponse {
-        let buf_minutes = if let Ok(buffer) = self.buffer.lock() {
-            if buffer.len() >= 2 {
-                let delta = buffer[buffer.len() - 1].time - buffer[0].time;
-                delta.num_minutes() as u16
-            } else { 0 }
-        } else { 0 };
-        if buf_minutes < self.config.train_data_minutes - 1 {
-            return CalibrationResponse::default();
-        }
-
-        if check_time
-            && let Ok(read) = self.calculator.read()
-            && let Some(calc) = read.as_ref()
-            && let Ok(buffer) = self.buffer.lock() {
-            let last_time = buffer[buffer.len() - 1].time;
-            if last_time - calc.get_created_on() < TimeDelta::minutes(self.config.train_interval_minutes as i64) {
-                return CalibrationResponse::default();
-            }
-        }
-
-        self.shrink_buffer();
-
-        let prev_calc = self.calculator.read().ok().map(|c| c.clone()).flatten();
-        let mut response = CalibrationResponse {
-            prev_cycle_performances: prev_calc.map(|c| c.get_performances()),
-            ..Default::default()
-        };
-
-        let buf_clone = self.buffer.lock().map(|b| b.clone()).unwrap_or_default();
-        let calibration_result = calibrate_signal_calculator(
-            &prev_calc, &buf_clone, self.is_buying, self.config.decay_time, self.config.hold_time_ms
-        );
-        self.set_calculator(calibration_result);
-
-        response.calculator = calibration_result;
-        response
-    }
-    
-    pub fn set_calculator(&self, calculator: Option<SignalCalculator>) {
-        if let Ok(mut write) = self.calculator.write() {
-            *write = calculator;
-        }
-    }
-
     fn shrink_buffer(&self) {
-        if let Ok(mut buffer) = self.buffer.lock() {
-            let threshold = buffer[buffer.len() - 1].time - TimeDelta::minutes(self.config.train_data_minutes as i64);
-            let mut to_delete = 0;
-            while to_delete < buffer.len() && buffer[to_delete].time < threshold {
-                to_delete += 1;
-            }
+        let mut to_delete = 0;
+        if let Ok(mut buffer) = self.features_buffer.lock()
+            && buffer.len() > self.config.train_buf_size {
+            to_delete = buffer.len() - self.config.train_buf_size;
+            buffer.drain(0..to_delete);
+        }
 
-            if to_delete > 0 {
-                buffer.drain(0..to_delete);
-            }
+        if to_delete > 0 && let Ok(mut buffer) = self.prices_buffer.lock() {
+            buffer.drain(0..to_delete);
+        }
+
+        if to_delete > 0 {
+            info!("Delete {to_delete} buffer elements");
         }
     }
 }

@@ -13,6 +13,10 @@ use model::common::CommonError;
 use model::math_util::{FeaturesRollingWindow, OutputType, TimedFeatures};
 use model::math_util::OutputType::{DerivativeNorm, Raw, TrendDeviation, TrendDeviationDerivativeNorm};
 
+pub struct SafeBooster(pub Booster);
+unsafe impl Send for SafeBooster {}
+unsafe impl Sync for SafeBooster {}
+
 #[derive(Copy, Clone, Debug)]
 pub enum PredictionType {
     ClassificationPositive(f64), ClassificationNegative(f64)
@@ -69,7 +73,7 @@ impl Display for MachineConfig {
 }
 
 pub enum Machine {
-    GBDT(GBDT), LightGBM(Booster)
+    GBDT(GBDT), LightGBM(SafeBooster)
 }
 
 pub struct GradientBoost {
@@ -94,7 +98,7 @@ impl GradientBoost {
                 let labels = horizons.iter().map(|&h| prediction_type.get_label(h)).collect::<Vec<_>>();
                 let dataset = Dataset::from_vec_of_vec(data.to_vec(), labels, true)?;
                 let booster = Booster::train(dataset, cfg)?;
-                Machine::LightGBM(booster)
+                Machine::LightGBM(SafeBooster(booster))
             }
         };
 
@@ -114,7 +118,7 @@ impl GradientBoost {
                 Ok(predict_vec.into_iter().map(|p| p as f64).collect())
             }
             Machine::LightGBM(booster) => {
-                let output = booster.predict_from_vec_of_vec(data.to_vec(), true)?;
+                let output = booster.0.predict_from_vec_of_vec(data.to_vec(), true)?;
                 Ok(output.iter().map(|v| v[0]).collect())
             }
         }

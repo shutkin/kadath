@@ -13,3 +13,6 @@ chrono = "0.4"
 argmin = { version = "0.11.0", features = ["_ndarrayl", "rayon"] }
 ndarray = "0.16"
 rayon = "1.12"
+lightgbm3 = { git = "https://github.com/shutkin/lightgbm3-rs", branch = "fix-nanoarrow-link" }
+serde_json = "1.0"
+optimizer = "1.0"
