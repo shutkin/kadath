@@ -99,9 +99,10 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
 }
 
-const OPTIMIZED_CONFIGS: [&str; 2] = [
-    r#"{"bagging_fraction":0.8869652296616486,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.5175497224451625,"lambda_l1":0.671849933963201,"lambda_l2":0.002426698226120504,"learning_rate":0.005251415064970429,"max_depth":-1,"metric":"binary_logloss","min_child_samples":94,"n_jobs":-1,"num_iterations":2000,"num_leaves":105,"objective":"binary","random_state":42,"verbosity":-1}"#,
-    r#"{"bagging_fraction":0.6380151899077117,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.8361884953796676,"lambda_l1":3.0700212121306723,"lambda_l2":0.007479044723956577,"learning_rate":0.0066765177610342355,"max_depth":-1,"metric":"binary_logloss","min_child_samples":413,"n_jobs":-1,"num_iterations":2000,"num_leaves":119,"objective":"binary","random_state":42,"verbosity":-1}"#,
+const OPTIMIZED_CONFIGS: [&str; 0] = [
+    //r#"{"bagging_fraction":0.8869652296616486,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.5175497224451625,"lambda_l1":0.671849933963201,"lambda_l2":0.002426698226120504,"learning_rate":0.005251415064970429,"max_depth":-1,"metric":"binary_logloss","min_child_samples":94,"n_jobs":-1,"num_iterations":2000,"num_leaves":105,"objective":"binary","random_state":42,"verbosity":-1}"#,
+    //r#"{"bagging_fraction":0.6380151899077117,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.8361884953796676,"lambda_l1":3.0700212121306723,"lambda_l2":0.007479044723956577,"learning_rate":0.0066765177610342355,"max_depth":-1,"metric":"binary_logloss","min_child_samples":413,"n_jobs":-1,"num_iterations":2000,"num_leaves":119,"objective":"binary","random_state":42,"verbosity":-1}"#,
+    //r#"{"bagging_fraction":0.9513432522392777,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.7588127350933672,"lambda_l1":0.016256476401869682,"lambda_l2":0.1766160092331088,"learning_rate":0.006253157601892829,"max_depth":-1,"metric":"binary_logloss","min_child_samples":165,"n_jobs":-1,"num_iterations":2000,"num_leaves":93,"objective":"binary","random_state":42,"verbosity":-1}"#,
 ];
 
 #[tokio::main]
@@ -132,8 +133,8 @@ async fn main() -> EmptyResult {
     let model = WalkForwardModel::new(first_leg_id, second_leg_id, config);
 
     let mut diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-19T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-19T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-22T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-22T20:00:00Z")?.to_utc(),
     );
     let end = DateTime::parse_from_rfc3339("2026-10-24T00:00:00Z")?.to_utc();
 

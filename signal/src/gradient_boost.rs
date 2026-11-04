@@ -4,6 +4,7 @@ use model::common::CommonError;
 use optimizer::Study;
 use optimizer::prelude::{FloatParam, IntParam, Parameter};
 use serde_json::{Value, json};
+use model::math_util::percentile;
 
 #[derive(Copy, Clone, Debug)]
 pub enum PredictionType {
@@ -182,9 +183,29 @@ fn check(
             error!("Failed to test LightGBM: {err}");
             optimizer::Error::Internal("Failed to test LightGBM")
         })?;
-    let score = calculate_predictions_brier(&predictions, test_horizons, prediction_type);
+    let score = calculate_predictions_pnl(&predictions, test_horizons, prediction_type);
     debug!("{} {config}: {score}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" });
     Ok::<_, optimizer::Error>(score)
+}
+
+pub fn calculate_predictions_pnl(predictions: &[f64], horizons: &[f32], prediction_type: PredictionType) -> f64 {
+    let threshold = percentile(predictions, 0.999);
+    let (mut pnl, mut commission) = (0.0, 0.0);
+    predictions.iter().zip(horizons)
+        .filter(|(p, _)| **p >= threshold)
+        .for_each(|(_, h)| {
+            match prediction_type {
+                PredictionType::ClassificationPositive(_) => {
+                    pnl += *h as f64;
+                    commission += 2.0;
+                },
+                PredictionType::ClassificationNegative(_) => {
+                    pnl -= *h as f64;
+                    commission += 2.0;
+                },
+            };
+        });
+    pnl - commission
 }
 
 pub fn calculate_predictions_brier(predictions: &[f64], horizons: &[f32], prediction_type: PredictionType) -> f64 {
