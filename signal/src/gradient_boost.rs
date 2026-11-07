@@ -1,5 +1,5 @@
 use lightgbm3::{Booster, Dataset};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use model::common::CommonError;
 use optimizer::Study;
 use optimizer::prelude::{FloatParam, IntParam, Parameter};
@@ -102,6 +102,26 @@ impl LightGBMConfig {
     }
 }
 
+fn export_to_csv(filename: &str, data: &[Vec<f32>], horizons: &[f32]) {
+    let size = data[0].len();
+    let mut csv = Vec::new();
+
+    let header = format!("{},horizon", (0..size).map(|i| format!("f{i}")).collect::<Vec<_>>().join(","));
+    csv.push(header);
+
+    for (features, horizon) in data.iter().zip(horizons.iter()) {
+        if features.len() != size {
+            warn!("Feature length mismatch: expected {}, got {}", size, features.len())
+        }
+        let row = format!("{},{horizon:.2}", features.iter().map(|f| format!("{f:.4}")).collect::<Vec<_>>().join(","));
+        csv.push(row);
+    }
+
+    if let Err(err) = std::fs::write(filename, csv.join("\n")) {
+        error!("Failed to export data to CSV: {}", err);
+    }
+}
+
 pub fn optimize_light_gbm (
     prediction_type: PredictionType,
     train_data: &[Vec<f32>],
@@ -110,6 +130,9 @@ pub fn optimize_light_gbm (
     test_horizons: &[f32],
     iterations: usize,
 ) -> Result<Value, CommonError> {
+    export_to_csv("train.csv", train_data, train_horizons);
+    export_to_csv("test.csv", test_data, test_horizons);
+
     let num_leaves_param = IntParam::new(7, 127).name("num leaves");
     let learning_rate_param = FloatParam::new(0.005, 0.1).name("learning rate").log_scale();
     let feature_fraction_param = FloatParam::new(0.5, 1.0).name("feature fraction").log_scale();
@@ -184,7 +207,7 @@ fn check(
             optimizer::Error::Internal("Failed to test LightGBM")
         })?;
     let score = calculate_predictions_pnl(&predictions, test_horizons, prediction_type);
-    debug!("{} {config}: {score}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" });
+    info!("{} {config}: {score}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" });
     Ok::<_, optimizer::Error>(score)
 }
 

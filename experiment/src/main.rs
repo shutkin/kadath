@@ -76,7 +76,7 @@ const TREND_TAU: f64 = 614.61;
 pub const HORIZON_MS: u16 = 2000;
 const THRESHOLD: f64 = 5.0;
 
-const OPTIMIZE: bool = true;
+const OPTIMIZE: bool = false;
 const OPTIMIZE_GLOBAL_PARAMS: bool = false;
 
 #[tokio::main]
@@ -88,15 +88,15 @@ async fn main() -> EmptyResult {
 
     let tickers = ["SiZ6", "SiH7"];
     let optimize_diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-27T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-27T11:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-22T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-22T10:00:00.07Z")?.to_utc(),
     );
-    let optimize_train_end = DateTime::parse_from_rfc3339("2026-10-27T10:00:00Z")?.to_utc();
+    let optimize_train_end = DateTime::parse_from_rfc3339("2026-10-22T09:00:00Z")?.to_utc();
     let check_diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-27T06:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-27T12:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-22T06:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-22T12:00:00Z")?.to_utc(),
     );
-    let check_train_end = DateTime::parse_from_rfc3339("2026-10-27T11:00:00Z")?.to_utc();
+    let check_train_end = DateTime::parse_from_rfc3339("2026-10-22T11:00:00Z")?.to_utc();
 
     let prediction_type_up = PredictionType::ClassificationPositive(THRESHOLD);
     let prediction_type_down = PredictionType::ClassificationNegative(0.0);
@@ -123,9 +123,52 @@ async fn main() -> EmptyResult {
                 }
             }
 
+            let events = merge_events(&[first_leg_id, second_leg_id], &[&order_books1, &order_books2]);
             let (train, test, train_h, test_h) =
-                features_with_horizons(first_leg_id, second_leg_id, &order_books1, &order_books2, optimize_train_end, global);
+                features_with_horizons(first_leg_id, second_leg_id, &events, optimize_train_end, global);
             info!("Optimize train {} events, test {} events", train.len(), test.len());
+
+            let (mut w_train, mut w_train_h) = import_from_csv("train.csv")?;
+            let (w_test, w_test_h) = import_from_csv("test.csv")?;
+            w_train.extend(w_test);
+            w_train_h.extend(w_test_h);
+            info!("W train size: {}", w_train.len());
+
+            let last_index = find_nearest(w_train.last().unwrap(), &train);
+            let first_index = (last_index as i32 + 1 - w_train.len() as i32).max(0);
+            info!("First index: {}, event time {}", first_index, events[first_index as usize].order_book.timestamp);
+
+            if first_index >= 0 {
+                let mut warnings = 0;
+                let check = &train[first_index as usize..];
+                for (line, (check_features, w_features)) in check.iter().zip(w_train.iter()).enumerate().skip(1000) {
+                    let mut line_warnings = Vec::new();
+                    for (index, (check_feature, w_feature)) in check_features.iter().zip(w_features.iter()).enumerate() {
+                        if (check_feature - w_feature).abs() > 0.001 {
+                            line_warnings.push(format!("feature {index} {check_feature} != {w_feature}"));
+                        }
+                    }
+                    if !line_warnings.is_empty() {
+                        warn!("Line {line}: {}", line_warnings.join(", "));
+                        warnings += 1;
+                        if warnings > 100 {
+                            break;
+                        }
+                    }
+                }
+
+                let mut warnings = 0;
+                let check = &train_h[first_index as usize..];
+                for (line, (check_horizon, w_horizon)) in check.iter().zip(w_train_h.iter()).enumerate().skip(1000) {
+                    if (*check_horizon as f32 - w_horizon).abs() > 0.001 {
+                        warn!("Line {line} horizon: {check_horizon} != {w_horizon}");
+                        warnings += 1;
+                        if warnings > 100 {
+                            break;
+                        }
+                    }
+                }
+            }
 
             let train_arc = Arc::new(train);
             let train_h_arc = Arc::new(train_h);
@@ -155,7 +198,7 @@ async fn main() -> EmptyResult {
             (cfg_up, cfg_down)
         } else {
             let cfg_json_up = r#"
-{"bagging_fraction":0.895994038988877,"bagging_freq":4,"boosting_type":"gbdt","feature_fraction":0.5118879801269481,"lambda_l1":0.003943743350232156,"lambda_l2":0.1630738251743011,"learning_rate":0.006470704862855319,"max_depth":-1,"metric":"binary_logloss","min_child_samples":169,"n_jobs":-1,"num_iterations":2000,"num_leaves":50,"objective":"binary","random_state":42,"verbosity":-1}"#;
+{"bagging_fraction":0.9180913285900155,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.6747405690264315,"lambda_l1":1.7522681012214225,"lambda_l2":0.014180900594981083,"learning_rate":0.005328566087983153,"max_depth":-1,"metric":"binary_logloss","min_child_samples":556,"n_jobs":-1,"num_iterations":2000,"num_leaves":79,"objective":"binary","random_state":42,"verbosity":-1}"#;
             let cfg_json_down = r#"
 {"bagging_fraction":0.8361357907636818,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.9596713385375366,"lambda_l1":0.549411566785072,"lambda_l2":0.00047609572483133504,"learning_rate":0.0051143561715938065,"max_depth":-1,"metric":"binary_logloss","min_child_samples":267,"n_jobs":-1,"num_iterations":2000,"num_leaves":44,"objective":"binary","random_state":42,"verbosity":-1}"#;
 
@@ -169,8 +212,9 @@ async fn main() -> EmptyResult {
 
         let (order_books1, order_books2) = get_order_books(&tickers, &[first_leg_id, second_leg_id], check_diapason, Some(&db)).await?;
         info!("Got {} {} books and {} {} books for check", order_books1.len(), tickers[0], order_books2.len(), tickers[1]);
+        let events = merge_events(&[first_leg_id, second_leg_id], &[&order_books1, &order_books2]);
         let (train, test, train_h, test_h) =
-            features_with_horizons(first_leg_id, second_leg_id, &order_books1, &order_books2, check_train_end, global);
+            features_with_horizons(first_leg_id, second_leg_id, &events, check_train_end, global);
         info!("Check train {} events, test {} events", train.len(), test.len());
 
         info!("Train models...");
@@ -216,6 +260,39 @@ async fn main() -> EmptyResult {
     Ok(())
 }
 
+fn find_nearest(features: &[f32], data: &[Vec<f32>]) -> usize {
+    let mut best_diff = 0.0;
+    let mut best_index = 0;
+    for (i, data_features) in data.iter().enumerate() {
+        let mut diff = 0.0;
+        for (a, b) in features.iter().zip(data_features.iter()) {
+            diff += (a - b).abs() / (1.0 + a + b);
+        }
+        if best_diff > diff {
+            best_index = i;
+            best_diff = diff;
+        }
+    }
+    best_index
+}
+
+fn import_from_csv(filename: &str) -> Result<(Vec<Vec<f32>>, Vec<f32>), CommonError> {
+    let data = std::fs::read_to_string(filename)?;
+    let mut lines = data.split("\n");
+    lines.next(); // skip header
+
+    let mut features = Vec::new();
+    let mut horizons = Vec::new();
+    for line in lines {
+        let mut values = line.split(",").map(|x| x.parse::<f32>()).collect::<Result<Vec<f32>, _>>()?;
+        let horizon = values.pop().unwrap();
+        horizons.push(horizon);
+        features.push(values);
+    }
+
+    Ok((features, horizons))
+}
+
 fn export_to_csv(data: &[Vec<f32>], horizons: &[f64]) {
     let size = data[0].len();
     let mut csv = Vec::new();
@@ -239,13 +316,10 @@ fn export_to_csv(data: &[Vec<f32>], horizons: &[f64]) {
 fn features_with_horizons(
     first_leg_id: i32,
     second_leg_id: i32,
-    order_books1: &[OrderBook],
-    order_books2: &[OrderBook],
+    events: &[OrderBookEvent],
     train_end: DateTime<Utc>,
     global_params: GlobalParams,
 ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f64>, Vec<f64>) {
-    let events = merge_events(&[first_leg_id, second_leg_id], &[order_books1, order_books2]);
-
     let mut window1 = FeaturesRollingWindow::new(
         TimeDelta::milliseconds((1000.0 * global_params.derivatives_normalize) as i64),
         TimeDelta::milliseconds((1000.0 * global_params.trend_tau) as i64),
@@ -265,22 +339,21 @@ fn features_with_horizons(
     let mut test_horizons = Vec::new();
 
     let (mut f1, mut f2) = (None, None);
-    let (mut h1, mut h2) = (None, None);
+    let (mut h1, mut h2) = (0.0, 0.0);
 
     for (i, event) in events.iter().enumerate() {
         if let Some(values) = OrderBookValues::from_order_book(&event.order_book)
-            && let Some(h_price) = get_price_on_horizon(&events, event.instrument_id, i) {
+            && let Some(h_price) = get_price_on_horizon(events, event.instrument_id, i) {
 
             if event.instrument_id == first_leg_id {
                 f1 = Some(window1.process(values.to_features()));
-                h1 = Some(h_price - values.mid)
+                h1 = h_price - values.mid;
             } else if event.instrument_id == second_leg_id {
                 f2 = Some(window2.process(values.to_features()));
-                h2 = Some(h_price - values.mid)
+                h2 = h_price - values.mid;
             }
 
-            if let Some(mut features) = f1.clone() && let Some(f2) = f2.clone()
-                && let Some(h1) = h1 && let Some(h2) = h2 {
+            if let Some(mut features) = f1.clone() && let Some(f2) = f2.clone() {
                 features.extend(f2);
                 let horizon = h1 - h2;
 
@@ -477,11 +550,11 @@ impl CostFunction for GlobalProblem<'_> {
 
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
         let global = GlobalParams::from_param(param, self.functions);
+        let events = merge_events(&[self.first_leg_id, self.second_leg_id], &[self.books1, self.books2]);
         let (train, test, train_h, test_h) = features_with_horizons(
             self.first_leg_id,
             self.second_leg_id,
-            self.books1,
-            self.books2,
+            &events,
             self.train_end,
             global
         );

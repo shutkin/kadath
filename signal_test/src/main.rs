@@ -17,10 +17,10 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Copy, Clone)]
 struct TestDeal {
+    prediction: f64,
     open_index: usize,
     close_index: Option<usize>,
     open_time: DateTime<Utc>,
-    close_time: DateTime<Utc>,
     open_price1: (f64, f64),
     open_price2: (f64, f64),
     close_price1: Option<(f64, f64)>,
@@ -30,18 +30,18 @@ struct TestDeal {
 }
 
 impl TestDeal {
-    fn open(index: usize, book1: &OrderBook, book2: &OrderBook, hold: i32) -> Self {
+    fn open(prediction: f64, index: usize, book1: &OrderBook, book2: &OrderBook) -> Self {
         let cur_time = book1.timestamp.max(book2.timestamp);
         TestDeal {
+            prediction,
             open_index: index,
             open_time: cur_time,
-            close_time: cur_time + TimeDelta::milliseconds(hold as i64),
             open_price1: (get_best_ask(book1).as_f64(), get_mid_price(book1).as_f64()),
             open_price2: (get_best_bid(book2).as_f64(), get_mid_price(book2).as_f64()),
             close_price1: None,
             close_price2: None,
             close_index: None,
-            deal_data: DealData::new(book1, book2, TradeDirection::Buy, hold),
+            deal_data: DealData::new(book1, book2, TradeDirection::Buy),
         }
     }
 
@@ -52,7 +52,6 @@ impl TestDeal {
 
         let cur_time = book1.timestamp.max(book2.timestamp);
         self.close_index = Some(index);
-        self.close_time = cur_time;
 
         self.close_price1 = Some((get_best_bid(book1).as_f64(), get_mid_price(book1).as_f64()));
         self.close_price2 = Some((get_best_ask(book2).as_f64(), get_mid_price(book2).as_f64()));
@@ -99,10 +98,15 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
 }
 
-const OPTIMIZED_CONFIGS: [&str; 0] = [
-    //r#"{"bagging_fraction":0.8869652296616486,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.5175497224451625,"lambda_l1":0.671849933963201,"lambda_l2":0.002426698226120504,"learning_rate":0.005251415064970429,"max_depth":-1,"metric":"binary_logloss","min_child_samples":94,"n_jobs":-1,"num_iterations":2000,"num_leaves":105,"objective":"binary","random_state":42,"verbosity":-1}"#,
-    //r#"{"bagging_fraction":0.6380151899077117,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.8361884953796676,"lambda_l1":3.0700212121306723,"lambda_l2":0.007479044723956577,"learning_rate":0.0066765177610342355,"max_depth":-1,"metric":"binary_logloss","min_child_samples":413,"n_jobs":-1,"num_iterations":2000,"num_leaves":119,"objective":"binary","random_state":42,"verbosity":-1}"#,
-    //r#"{"bagging_fraction":0.9513432522392777,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.7588127350933672,"lambda_l1":0.016256476401869682,"lambda_l2":0.1766160092331088,"learning_rate":0.006253157601892829,"max_depth":-1,"metric":"binary_logloss","min_child_samples":165,"n_jobs":-1,"num_iterations":2000,"num_leaves":93,"objective":"binary","random_state":42,"verbosity":-1}"#,
+const OPTIMIZED_CONFIGS: [&str; 4] = [
+    // 524.5
+    r#"{"bagging_fraction":0.6386075676720108,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.544681408481552,"lambda_l1":0.0033663336109842493,"lambda_l2":0.0030419858206211766,"learning_rate":0.012175936248179512,"max_depth":-1,"metric":"binary_logloss","min_child_samples":417,"n_jobs":-1,"num_iterations":2000,"num_leaves":7,"objective":"binary","random_state":42,"verbosity":-1}"#,
+    // 500.0
+    r#"{"bagging_fraction":0.8501447639977895,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.9911339978504541,"lambda_l1":0.00015294800252169967,"lambda_l2":0.04051994711392981,"learning_rate":0.015465367095512543,"max_depth":-1,"metric":"binary_logloss","min_child_samples":662,"n_jobs":-1,"num_iterations":2000,"num_leaves":76,"objective":"binary","random_state":42,"verbosity":-1}"#,
+    // 211.5
+    r#"{"bagging_fraction":0.6084273107464666,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.8949861393174053,"lambda_l1":2.2720624087028414,"lambda_l2":0.019776956507091253,"learning_rate":0.022871386032990118,"max_depth":-1,"metric":"binary_logloss","min_child_samples":292,"n_jobs":-1,"num_iterations":2000,"num_leaves":13,"objective":"binary","random_state":42,"verbosity":-1}"#,
+    // 452.5
+    r#"{"bagging_fraction":0.7084166428878502,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.7230323815664548,"lambda_l1":0.00010333215848430679,"lambda_l2":1.3731071818467322,"learning_rate":0.011448575073488674,"max_depth":-1,"metric":"binary_logloss","min_child_samples":1245,"n_jobs":-1,"num_iterations":2000,"num_leaves":63,"objective":"binary","random_state":42,"verbosity":-1}"#,
 ];
 
 #[tokio::main]
@@ -124,8 +128,8 @@ async fn main() -> EmptyResult {
         train_buf_size: 285000,
         train_min_size: 200000,
         optimize_iterations: 20,
-        hold_time: TimeDelta::milliseconds(5000),
-        expected_delta: 5.0,
+        hold_time: TimeDelta::milliseconds(3000),
+        expected_delta: 8.0,
         prediction_percentile: 0.99966,
     };
 
@@ -183,6 +187,7 @@ async fn main() -> EmptyResult {
 
                 if last_optimize_time < event.order_book.timestamp - TimeDelta::hours(5)
                     && model.optimize_config(OPTIMIZED_CONFIGS.get(optimized_config_index).copied()) {
+                    info!("Optimized on {}", event.order_book.timestamp);
                     last_optimize_time = event.order_book.timestamp;
                     optimized_config_index += 1;
                 }
@@ -200,9 +205,9 @@ async fn main() -> EmptyResult {
                             deal.close(i, book1, book2);
                             let pnl = deal.pnl();
                             info!(
-                                "{} Hold {}: {:?}",
+                                "{} Prediction {}: {:?}",
                                 deal.open_time,
-                                (event.order_book.timestamp - deal.open_time).as_seconds_f64(),
+                                deal.prediction,
                                 pnl,
                             );
                             if pnl.1 < -5.0 {
@@ -220,8 +225,8 @@ async fn main() -> EmptyResult {
                             .unwrap_or(true);
                         if do_trade {
                             do_not_trade_until = None;
-                            if let TradeSignal::Buy(hold) = signal_buy {
-                                let deal = TestDeal::open(i, book1, book2, hold);
+                            if let TradeSignal::Buy(prediction) = signal_buy {
+                                let deal = TestDeal::open(prediction, i, book1, book2);
                                 active_deal = Some(deal);
                             }
                         }
@@ -252,7 +257,7 @@ async fn main() -> EmptyResult {
     match average_deal_visual(&deals_visualizations) {
         Ok(visualizations) => {
             for (i, (deals, data)) in visualizations.iter().enumerate() {
-                if let Err(err) = visualize_deal(data, &format!("deals_{i}.png"), &format!("{deals} deals")) {
+                if let Err(err) = visualize_deal(data, &format!("{deals} deals"), &format!("deals_{i}.png")) {
                     error!("Failed to print deals visualisation {err}");
                 }
             }
