@@ -1,6 +1,6 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use model::OrderBook;
-use model::math_util::standard_deviation;
+use model::math_util::{standard_deviation, TimedFeatures};
 
 pub const IMBALANCE_LEVELS: [usize; 5] = [3, 5, 10, 20, 50];
 
@@ -11,9 +11,6 @@ pub struct OrderBookValues {
     pub bid: f64,
     pub mid: f64,
     pub imbalances: [f64; IMBALANCE_LEVELS.len()],
-    pub imbalances_derivative: [f64; IMBALANCE_LEVELS.len()],
-    pub trend_deviation: f64,
-    pub trend_deviation_derivative: f64,
 }
 
 impl OrderBookValues {
@@ -53,100 +50,13 @@ impl OrderBookValues {
             ask: best_ask,
             mid,
             imbalances,
-            imbalances_derivative: [0.0; IMBALANCE_LEVELS.len()],
-            trend_deviation: 0.0,
-            trend_deviation_derivative: 0.0,
         })
     }
 
-    pub fn calculate_window_values(values: &mut [OrderBookValues], normalize_seconds: f64, trend_tau_seconds: f64) {
-        // Calculate absolute imbalances derivatives
-        let mut derivatives = vec![Vec::with_capacity(values.len()); IMBALANCE_LEVELS.len()];
-        for i in 0..values.len() {
-            let mut id = [0.0; IMBALANCE_LEVELS.len()];
-            if i > 0 {
-                let delta_time = values[i].time.timestamp_millis() - values[i - 1].time.timestamp_millis();
-                if delta_time > 0 {
-                    for imbalance_index in 0..IMBALANCE_LEVELS.len() {
-                        let d = values[i].imbalances[imbalance_index] - values[i - 1].imbalances[imbalance_index];
-                        id[imbalance_index] = d / delta_time as f64;
-                    }
-                }
-            }
-            for imbalance_index in 0..IMBALANCE_LEVELS.len() {
-                derivatives[imbalance_index].push(id[imbalance_index]);
-            }
-        }
-
-        // Normalize imbalances derivatives
-        for i in 1..values.len() {
-            if normalize_seconds > 0.1 {
-                let start_time = values[i].time - TimeDelta::milliseconds((normalize_seconds * 1000.0) as i64);
-                let mut window_start = i - 1;
-                while window_start > 0 && values[window_start].time > start_time {
-                    window_start -= 1;
-                }
-                for imbalance_index in 0..IMBALANCE_LEVELS.len() {
-                    if let Some(std) = standard_deviation(&derivatives[imbalance_index][window_start .. i]) && std > f64::MIN_POSITIVE {
-                        values[i].imbalances_derivative[imbalance_index] = derivatives[imbalance_index][i] / std;
-                    } else {
-                        values[i].imbalances_derivative[imbalance_index] = derivatives[imbalance_index][i];
-                    }
-                }
-            } else {
-                for imbalance_index in 0..IMBALANCE_LEVELS.len() {
-                    values[i].imbalances_derivative[imbalance_index] = derivatives[imbalance_index][i];
-                }
-            }
-        }
-
-        // Calculate trend
-        let mut trend = 0.0;
-        let mut prev_time = Option::<DateTime<Utc>>::None;
-
-        for value in values.iter_mut() {
-            if let Some(cur_prev_time) = prev_time {
-                let dt = (value.time - cur_prev_time).as_seconds_f64();
-                let alpha = 1.0 - (-dt / trend_tau_seconds).exp();
-                trend += alpha * (value.mid - trend);
-                value.trend_deviation = value.mid - trend;
-                prev_time = Some(value.time);
-            } else {
-                trend = value.mid;
-                prev_time = Some(value.time);
-            }
-        }
-
-        // Calculate absolute mid derivatives
-        let mut derivatives = Vec::with_capacity(values.len());
-        for i in 0..values.len() {
-            let mut derivative = 0.0;
-            if i > 0 {
-                let delta_time = (values[i].time - values[i - 1].time).as_seconds_f64();
-                if delta_time > 0.0 {
-                    let d = values[i].trend_deviation - values[i - 1].trend_deviation;
-                    derivative = d / delta_time;
-                }
-            }
-            derivatives.push(derivative);
-        }
-
-        // Normalize imbalances derivatives
-        for i in 1..values.len() {
-            if normalize_seconds > 0.1 {
-                let start_time = values[i].time - TimeDelta::milliseconds((normalize_seconds * 1000.0) as i64);
-                let mut window_start = i - 1;
-                while window_start > 0 && values[window_start].time > start_time {
-                    window_start -= 1;
-                }
-                if let Some(std) = standard_deviation(&derivatives[window_start .. i]) && std > f64::MIN_POSITIVE {
-                    values[i].trend_deviation_derivative = derivatives[i] / std;
-                } else {
-                    values[i].trend_deviation_derivative = derivatives[i];
-                }
-            } else {
-                values[i].trend_deviation_derivative = derivatives[i];
-            }
+    pub fn to_features(&self) -> TimedFeatures {
+        TimedFeatures {
+            time: self.time,
+            features: vec![self.mid, self.ask - self.bid, self.imbalances[0], self.imbalances[1], self.imbalances[2], self.imbalances[3], self.imbalances[4]],
         }
     }
 }

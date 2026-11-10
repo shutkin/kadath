@@ -19,11 +19,11 @@ unsafe impl Sync for SafeBooster {}
 
 #[derive(Copy, Clone, Debug)]
 pub enum PredictionType {
-    ClassificationPositive(f64), ClassificationNegative(f64)
+    ClassificationPositive(f32), ClassificationNegative(f32)
 }
 
 impl PredictionType {
-    pub fn get_label(&self, horizon: f64) -> f32 {
+    pub fn get_label(&self, horizon: f32) -> f32 {
         match self {
             PredictionType::ClassificationPositive(threshold) => if horizon > *threshold {1.0} else {0.0},
             PredictionType::ClassificationNegative(threshold) => if horizon < *threshold {1.0} else {0.0},
@@ -82,7 +82,7 @@ pub struct GradientBoost {
 }
 
 impl GradientBoost {
-    pub fn train(prediction_type: PredictionType, config: &MachineConfig, data: &[Vec<f32>], horizons: &[f64]) -> Result<Self, CommonError> {
+    pub fn train(prediction_type: PredictionType, config: &MachineConfig, data: &[Vec<f32>], horizons: &[f32]) -> Result<Self, CommonError> {
 
         let machine = match config {
             MachineConfig::GBDT(cfg) => {
@@ -178,9 +178,9 @@ impl LightGBMConfig {
 pub fn optimize_light_gbm (
     prediction_type: PredictionType,
     train_data: Arc<Vec<Vec<f32>>>,
-    train_horizons: Arc<Vec<f64>>,
+    train_horizons: Arc<Vec<f32>>,
     test_data: Arc<Vec<Vec<f32>>>,
-    test_horizons: Arc<Vec<f64>>,
+    test_horizons: Arc<Vec<f32>>,
 ) -> Result<MachineConfig, CommonError> {
     let num_leaves_param = IntParam::new(7, 127).name("num leaves");
     let learning_rate_param = FloatParam::new(0.005, 0.1).name("learning rate").log_scale();
@@ -233,9 +233,9 @@ pub fn optimize_light_gbm (
 pub fn optimize_gbdt (
     prediction_type: PredictionType,
     train_data: Arc<Vec<Vec<f32>>>,
-    train_horizons: Arc<Vec<f64>>,
+    train_horizons: Arc<Vec<f32>>,
     test_data: Arc<Vec<Vec<f32>>>,
-    test_horizons: Arc<Vec<f64>>,
+    test_horizons: Arc<Vec<f32>>,
 ) -> Result<MachineConfig, CommonError> {
     let max_depth_param = IntParam::new(2, 7).name("max depth");
     let iterations_param = IntParam::new(50, 200).name("iterations");
@@ -285,9 +285,9 @@ fn check(
     machine_config: &MachineConfig,
     prediction_type: PredictionType,
     train_data: &[Vec<f32>],
-    train_horizons: &[f64],
+    train_horizons: &[f32],
     test_data: &[Vec<f32>],
-    test_horizons: &[f64],
+    test_horizons: &[f32],
 ) -> Result<f64, optimizer::Error> {
     let machine = GradientBoost::train(prediction_type, machine_config, train_data, train_horizons)
         .map_err(|err| {
@@ -300,7 +300,10 @@ fn check(
             optimizer::Error::Internal("Failed to test LightGBM")
         })?;
     let score = calculate_predictions_brier(&predictions, test_horizons, prediction_type);
-    info!("{} {machine_config}: {score}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" });
+    info!("{} {machine_config}: {score}", match prediction_type {
+        PredictionType::ClassificationPositive(t) => if t > 0.0 { "PROFIT" } else { "UP" },
+        PredictionType::ClassificationNegative(_) => "DOWN",
+    });
     Ok::<_, optimizer::Error>(score)
 }
 
@@ -325,7 +328,7 @@ pub fn calculate_predictions_pnl(predictions: &[f64], horizons: &[f64], predicti
     pnl - commission
 }
 
-pub fn calculate_predictions_brier(predictions: &[f64], horizons: &[f64], prediction_type: PredictionType) -> f64 {
+pub fn calculate_predictions_brier(predictions: &[f64], horizons: &[f32], prediction_type: PredictionType) -> f64 {
     let count = predictions.len();
     let variance = predictions.iter().zip(horizons)
         .map(|(p, h)| {

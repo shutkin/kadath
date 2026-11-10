@@ -206,7 +206,7 @@ fn check(
             error!("Failed to test LightGBM: {err}");
             optimizer::Error::Internal("Failed to test LightGBM")
         })?;
-    let score = calculate_predictions_pnl(&predictions, test_horizons, prediction_type);
+    let score = calculate_predictions_brier(&predictions, test_horizons, prediction_type);
     info!("{} {config}: {score}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" });
     Ok::<_, optimizer::Error>(score)
 }

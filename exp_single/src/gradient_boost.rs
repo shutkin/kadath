@@ -1,6 +1,6 @@
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use chrono::TimeDelta;
-use crate::orderbook_values::OrderBookValues;
 use gbdt::config::Config;
 use gbdt::decision_tree::Data;
 use gbdt::gradient_boost::GBDT;
@@ -8,19 +8,22 @@ use lightgbm3::{Booster, Dataset};
 use log::{error, info, warn};
 use optimizer::prelude::{FloatParam, IntParam, Parameter};
 use optimizer::Study;
-use model::common::CommonError;
-use plotters::prelude::LogScalable;
 use serde_json::{json, Value};
+use model::common::CommonError;
 use model::math_util::{FeaturesRollingWindow, OutputType, TimedFeatures};
 use model::math_util::OutputType::{DerivativeNorm, Raw, TrendDeviation, TrendDeviationDerivativeNorm};
 
+pub struct SafeBooster(pub Booster);
+unsafe impl Send for SafeBooster {}
+unsafe impl Sync for SafeBooster {}
+
 #[derive(Copy, Clone, Debug)]
 pub enum PredictionType {
-    ClassificationPositive(f64), ClassificationNegative(f64)
+    ClassificationPositive(f32), ClassificationNegative(f32)
 }
 
 impl PredictionType {
-    pub fn get_label(&self, horizon: f64) -> f32 {
+    pub fn get_label(&self, horizon: f32) -> f32 {
         match self {
             PredictionType::ClassificationPositive(threshold) => if horizon > *threshold {1.0} else {0.0},
             PredictionType::ClassificationNegative(threshold) => if horizon < *threshold {1.0} else {0.0},
@@ -41,7 +44,7 @@ pub struct GbdtConfig {
 impl GbdtConfig {
     pub fn to_config(&self) -> Config {
         let mut cfg = Config::new();
-        cfg.set_feature_size(12);
+        cfg.set_feature_size(13);
         cfg.set_debug(false);
         cfg.set_loss("LogLikelyhood");
 
@@ -60,8 +63,17 @@ pub enum MachineConfig {
     GBDT(GbdtConfig), LightGBM(Value)
 }
 
+impl Display for MachineConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MachineConfig::GBDT(cfg) => write!(f, "{cfg:?}"),
+            MachineConfig::LightGBM(cfg) => write!(f, "{}", serde_json::to_string(cfg).unwrap_or("Invalid JSON".to_string())),
+        }
+    }
+}
+
 pub enum Machine {
-    GBDT(GBDT), LightGBM(Booster)
+    GBDT(GBDT), LightGBM(SafeBooster)
 }
 
 pub struct GradientBoost {
@@ -70,15 +82,23 @@ pub struct GradientBoost {
 }
 
 impl GradientBoost {
-    pub fn train(prediction_type: PredictionType, config: &MachineConfig, data: &[OrderBookValues], horizons: &[f64]) -> Result<Self, CommonError> {
+    pub fn train(prediction_type: PredictionType, config: &MachineConfig, data: &[Vec<f32>], horizons: &[f32]) -> Result<Self, CommonError> {
+
         let machine = match config {
             MachineConfig::GBDT(cfg) => {
-                let gbdt = Self::train_gbdt(&cfg.to_config(), data, horizons, &prediction_type);
+                let mut train_data = data.iter().zip(horizons.iter())
+                    .map(|(features, horizon)| {
+                        Data::new_training_data(features.to_vec(), 1.0, prediction_type.get_label(*horizon), None)
+                    }).collect::<Vec<_>>();
+                let mut gbdt = GBDT::new(&cfg.to_config());
+                gbdt.fit(&mut train_data);
                 Machine::GBDT(gbdt)
             }
             MachineConfig::LightGBM(cfg) => {
-                let booster = Self::train_light_gbm(cfg, data, horizons, &prediction_type)?;
-                Machine::LightGBM(booster)
+                let labels = horizons.iter().map(|&h| prediction_type.get_label(h)).collect::<Vec<_>>();
+                let dataset = Dataset::from_vec_of_vec(data.to_vec(), labels, true)?;
+                let booster = Booster::train(dataset, cfg)?;
+                Machine::LightGBM(SafeBooster(booster))
             }
         };
 
@@ -88,105 +108,21 @@ impl GradientBoost {
         })
     }
 
-    fn train_gbdt(cfg: &Config, data: &[OrderBookValues], horizons: &[f64], prediction_type: &PredictionType) -> GBDT {
-        let mut train_data = data.iter().zip(horizons.iter())
-            .map(|(values, horizon)| {
-                Data::new_training_data(values_to_features(values), 1.0, prediction_type.get_label(*horizon), None)
-            }).collect::<Vec<_>>();
-        let mut gbdt = GBDT::new(cfg);
-        gbdt.fit(&mut train_data);
-        gbdt
-    }
-
-    fn train_light_gbm(cfg: &Value, data: &[OrderBookValues], horizons: &[f64], prediction_type: &PredictionType) -> Result<Booster, CommonError> {
-        let features = data.iter().map(|values| values_to_features(values)).collect::<Vec<_>>();
-        let labels = horizons.iter().map(|&h| prediction_type.get_label(h)).collect::<Vec<_>>();
-        let dataset = Dataset::from_vec_of_vec(features, labels, true)?;
-        let booster = Booster::train(dataset, cfg)?;
-        Ok(booster)
-    }
-
-    pub fn test(&self, data: &[OrderBookValues]) -> Result<Vec<f64>, CommonError> {
+    pub fn test(&self, data: &[Vec<f32>]) -> Result<Vec<f64>, CommonError> {
         match &self.machine {
             Machine::GBDT(gbdt) => {
-                Ok(Self::test_gbdt(gbdt, data))
+                let test_data = data.iter().map(|values| {
+                    Data::new_training_data(values.to_vec(), 1.0, 0.0, None)
+                }).collect::<Vec<_>>();
+                let predict_vec = gbdt.predict(&test_data);
+                Ok(predict_vec.into_iter().map(|p| p as f64).collect())
             }
             Machine::LightGBM(booster) => {
-                Self::test_light_gbm(booster, data)
+                let output = booster.0.predict_from_vec_of_vec(data.to_vec(), true)?;
+                Ok(output.iter().map(|v| v[0]).collect())
             }
         }
     }
-
-    fn test_gbdt(gbdt: &GBDT, data: &[OrderBookValues]) -> Vec<f64> {
-        let test_data = data.iter().map(|values| {
-            Data::new_training_data(values_to_features(values), 1.0, 0.0, None)
-        }).collect::<Vec<_>>();
-        let predict_vec = gbdt.predict(&test_data);
-        predict_vec.into_iter().map(|p| p.as_f64()).collect()
-    }
-
-    fn test_light_gbm(booster: &Booster, data: &[OrderBookValues]) -> Result<Vec<f64>, CommonError> {
-        let features = data.iter().map(|values| values_to_features(values)).collect::<Vec<_>>();
-        let output = booster.predict_from_vec_of_vec(features, true)?;
-        Ok(output.iter().map(|v| v[0]).collect())
-    }
-}
-
-pub fn test_features_rolling_window(normalize_seconds: i64, trend_tau_seconds: i64, values: &[OrderBookValues]) {
-    let mut window = FeaturesRollingWindow::new(
-        TimeDelta::seconds(normalize_seconds),
-        TimeDelta::seconds(trend_tau_seconds),
-        &["mid", "i3", "i5", "i10", "i20", "i50"],
-        &[
-            TrendDeviation("mid"),
-            TrendDeviationDerivativeNorm("mid"),
-            Raw("i3"),
-            Raw("i5"),
-            Raw("i10"),
-            Raw("i20"),
-            Raw("i50"),
-            DerivativeNorm("i3"),
-            DerivativeNorm("i5"),
-            DerivativeNorm("i10"),
-            DerivativeNorm("i20"),
-            DerivativeNorm("i50"),
-        ]
-    );
-    for v in values {
-        let features = values_to_features(v);
-        let rolling_features = window.process(TimedFeatures::new(
-            v.time,
-            &[v.mid, v.imbalances[0], v.imbalances[1], v.imbalances[2], v.imbalances[3], v.imbalances[4]],
-        ));
-
-        let mut v_diffs = Vec::new();
-        for i in 0..12 {
-            if (features[i] - rolling_features[i]).abs() > 0.01 {
-                v_diffs.push(format!("[{i}] {} != {}", features[i], rolling_features[i]))
-            }
-        }
-        if !v_diffs.is_empty() {
-            warn!("{}: {}", v.time, v_diffs.join(", "));
-        }
-    }
-    info!("Test completed");
-}
-
-fn values_to_features(values: &OrderBookValues) -> Vec<f32> {
-    vec![
-        values.trend_deviation as f32,
-        values.trend_deviation_derivative as f32,
-        values.imbalances[0] as f32,
-        values.imbalances[1] as f32,
-        values.imbalances[2] as f32,
-        values.imbalances[3] as f32,
-        values.imbalances[4] as f32,
-        values.imbalances_derivative[0] as f32,
-        values.imbalances_derivative[1] as f32,
-        values.imbalances_derivative[2] as f32,
-        values.imbalances_derivative[3] as f32,
-        values.imbalances_derivative[4] as f32,
-    ]
 }
 
 struct LightGBMConfig {
@@ -241,10 +177,10 @@ impl LightGBMConfig {
 
 pub fn optimize_light_gbm (
     prediction_type: PredictionType,
-    train_data: Arc<Vec<OrderBookValues>>,
-    train_horizons: Arc<Vec<f64>>,
-    test_data: Arc<Vec<OrderBookValues>>,
-    test_horizons: Arc<Vec<f64>>,
+    train_data: Arc<Vec<Vec<f32>>>,
+    train_horizons: Arc<Vec<f32>>,
+    test_data: Arc<Vec<Vec<f32>>>,
+    test_horizons: Arc<Vec<f32>>,
 ) -> Result<MachineConfig, CommonError> {
     let num_leaves_param = IntParam::new(7, 127).name("num leaves");
     let learning_rate_param = FloatParam::new(0.005, 0.1).name("learning rate").log_scale();
@@ -258,7 +194,7 @@ pub fn optimize_light_gbm (
     info!("Starting optimization");
     let study: Study<f64> = Study::new(optimizer::Direction::Maximize);
     study
-        .optimize(100, |trial: &mut optimizer::Trial| {
+        .optimize(20, |trial: &mut optimizer::Trial| {
             let config = LightGBMConfig {
                 learning_rate: learning_rate_param.suggest(trial).ok(),
                 num_leaves: num_leaves_param.suggest(trial).ok(),
@@ -296,10 +232,10 @@ pub fn optimize_light_gbm (
 
 pub fn optimize_gbdt (
     prediction_type: PredictionType,
-    train_data: Arc<Vec<OrderBookValues>>,
-    train_horizons: Arc<Vec<f64>>,
-    test_data: Arc<Vec<OrderBookValues>>,
-    test_horizons: Arc<Vec<f64>>,
+    train_data: Arc<Vec<Vec<f32>>>,
+    train_horizons: Arc<Vec<f32>>,
+    test_data: Arc<Vec<Vec<f32>>>,
+    test_horizons: Arc<Vec<f32>>,
 ) -> Result<MachineConfig, CommonError> {
     let max_depth_param = IntParam::new(2, 7).name("max depth");
     let iterations_param = IntParam::new(50, 200).name("iterations");
@@ -309,9 +245,9 @@ pub fn optimize_gbdt (
     let feature_sample_ratio = FloatParam::new(0.5, 1.0).name("feature sample ratio");
 
     info!("Starting optimization");
-    let study: Study<f64> = Study::new(optimizer::Direction::Minimize);
+    let study: Study<f64> = Study::new(optimizer::Direction::Maximize);
     study
-        .optimize(200, |trial: &mut optimizer::Trial| {
+        .optimize(50, |trial: &mut optimizer::Trial| {
             if let Some(max_depth) = max_depth_param.suggest(trial).ok()
                 && let Some(iterations) = iterations_param.suggest(trial).ok()
                 && let Some(shrinkage) = shrinkage_param.suggest(trial).ok()
@@ -348,10 +284,10 @@ pub fn optimize_gbdt (
 fn check(
     machine_config: &MachineConfig,
     prediction_type: PredictionType,
-    train_data: &[OrderBookValues],
-    train_horizons: &[f64],
-    test_data: &[OrderBookValues],
-    test_horizons: &[f64],
+    train_data: &[Vec<f32>],
+    train_horizons: &[f32],
+    test_data: &[Vec<f32>],
+    test_horizons: &[f32],
 ) -> Result<f64, optimizer::Error> {
     let machine = GradientBoost::train(prediction_type, machine_config, train_data, train_horizons)
         .map_err(|err| {
@@ -363,12 +299,36 @@ fn check(
             error!("Failed to test LightGBM: {err}");
             optimizer::Error::Internal("Failed to test LightGBM")
         })?;
-    let error = calculate_predictions_error(&predictions, test_horizons, prediction_type);
-    info!("{} {machine_config:?}: {error}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" });
-    Ok::<_, optimizer::Error>(error)
+    let score = calculate_predictions_brier(&predictions, test_horizons, prediction_type);
+    info!("{} {machine_config}: {score}", match prediction_type {
+        PredictionType::ClassificationPositive(t) => if t > 0.0 { "PROFIT" } else { "UP" },
+        PredictionType::ClassificationNegative(_) => "DOWN",
+    });
+    Ok::<_, optimizer::Error>(score)
 }
 
-pub fn calculate_predictions_error(predictions: &[f64], horizons: &[f64], prediction_type: PredictionType) -> f64 {
+pub fn calculate_predictions_pnl(predictions: &[f64], horizons: &[f64], prediction_type: PredictionType) -> f64 {
+    let max_p = predictions.iter().copied().reduce(f64::max).unwrap();
+    let p_threshold = max_p * 0.95;
+    let (mut pnl, mut commission) = (0.0, 0.0);
+    predictions.iter().zip(horizons)
+        .filter(|(p, _)| **p >= p_threshold)
+        .for_each(|(_, h)| {
+            match prediction_type {
+                PredictionType::ClassificationPositive(_) => {
+                    pnl += *h;
+                    commission += 5.0;
+                },
+                PredictionType::ClassificationNegative(_) => {
+                    pnl -= *h;
+                    commission += 5.0;
+                },
+            };
+        });
+    pnl - commission
+}
+
+pub fn calculate_predictions_brier(predictions: &[f64], horizons: &[f32], prediction_type: PredictionType) -> f64 {
     let count = predictions.len();
     let variance = predictions.iter().zip(horizons)
         .map(|(p, h)| {
@@ -379,5 +339,6 @@ pub fn calculate_predictions_error(predictions: &[f64], horizons: &[f64], predic
             diff * diff
         })
         .sum::<f64>() / count as f64;
-    variance.sqrt()
+    let error = variance.sqrt();
+    1.0 - error
 }

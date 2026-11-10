@@ -3,6 +3,7 @@ mod simulation;
 mod stats_collector;
 mod deal;
 mod gradient_boost;
+mod nelder_mead;
 
 use std::cmp::Ordering::Equal;
 use crate::gradient_boost::{GbdtConfig, GradientBoost, MachineConfig, PredictionType, calculate_predictions_brier, calculate_predictions_pnl, optimize_gbdt, optimize_light_gbm};
@@ -13,8 +14,8 @@ use db::Db;
 use log::{error, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
-use model::math_util::OutputType::{DerivativeNorm, Raw, TrendDeviation, TrendDeviationDerivativeNorm};
-use model::math_util::{ExponentFunction, FeaturesRollingWindow, OutputType, TimedFeatures};
+use model::math_util::OutputType::{DerivativeNorm, Raw, StandardDeviation, TrendDeviation, TrendDeviationDerivativeNorm};
+use model::math_util::{percentile, ExponentFunction, FeaturesRollingWindow, OutputType, TimedFeatures};
 use model::{DataSource, Instrument, OrderBook, order_book_cache};
 use ndarray::Array1;
 use serde_json::Value;
@@ -22,6 +23,7 @@ use simplelog::{LevelFilter, SimpleLogger};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
+use crate::nelder_mead::calibrate_linear_signal;
 
 pub const IMBALANCE_LEVELS: [usize; 5] = [3, 5, 10, 20, 50];
 
@@ -56,10 +58,11 @@ async fn get_order_books(tickers: &[&str], ids: &[i32], diapason: TimeDiapason, 
     }
 }
 
-const FEATURES_NAMES: [&str; 6] = ["mid", "i3", "i5", "i10", "i20", "i50"];
-const FEATURES_OUTPUT: [OutputType; 12] = [
+const FEATURES_NAMES: [&str; 7] = ["mid", "spread", "i3", "i5", "i10", "i20", "i50"];
+const FEATURES_OUTPUT: [OutputType; 13] = [
     TrendDeviation("mid"),
     TrendDeviationDerivativeNorm("mid"),
+    StandardDeviation("spread"),
     Raw("i3"),
     Raw("i5"),
     Raw("i10"),
@@ -74,7 +77,7 @@ const FEATURES_OUTPUT: [OutputType; 12] = [
 const DERIVATIVE_NORM_DIAPASON: f64 = 57.28;
 const TREND_TAU: f64 = 614.61;
 pub const HORIZON_MS: u16 = 2000;
-const THRESHOLD: f64 = 5.0;
+const THRESHOLD: f32 = 5.0;
 
 const OPTIMIZE: bool = false;
 const OPTIMIZE_GLOBAL_PARAMS: bool = false;
@@ -88,18 +91,18 @@ async fn main() -> EmptyResult {
 
     let tickers = ["SiZ6", "SiH7"];
     let optimize_diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-22T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-22T10:00:00.07Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-28T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-28T10:00:00.07Z")?.to_utc(),
     );
-    let optimize_train_end = DateTime::parse_from_rfc3339("2026-10-22T09:00:00Z")?.to_utc();
+    let optimize_train_end = DateTime::parse_from_rfc3339("2026-10-28T09:00:00Z")?.to_utc();
     let check_diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-10-22T06:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-22T12:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-28T06:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-28T12:00:00Z")?.to_utc(),
     );
-    let check_train_end = DateTime::parse_from_rfc3339("2026-10-22T11:00:00Z")?.to_utc();
+    let check_train_end = DateTime::parse_from_rfc3339("2026-10-28T11:00:00Z")?.to_utc();
 
-    let prediction_type_up = PredictionType::ClassificationPositive(THRESHOLD);
-    let prediction_type_down = PredictionType::ClassificationNegative(0.0);
+    let prediction_type_profit = PredictionType::ClassificationPositive(THRESHOLD);
+    let prediction_type_up = PredictionType::ClassificationPositive(0.0);
 
     let all_instruments = db.get_instruments(DataSource::TInvest).await?;
     if let (Some(first_leg_id), Some(second_leg_id)) = (
@@ -108,7 +111,7 @@ async fn main() -> EmptyResult {
     ) {
         let mut global = GlobalParams::default();
 
-        let (cfg_up, cfg_down) = if OPTIMIZE {
+        let (cfg_up, cfg_profit) = if OPTIMIZE {
             let (order_books1, order_books2) = get_order_books(&tickers, &[first_leg_id, second_leg_id], optimize_diapason, Some(&db)).await?;
             info!("Got {} {} books and {} {} books for optimization", order_books1.len(), tickers[0], order_books2.len(), tickers[1]);
 
@@ -128,48 +131,6 @@ async fn main() -> EmptyResult {
                 features_with_horizons(first_leg_id, second_leg_id, &events, optimize_train_end, global);
             info!("Optimize train {} events, test {} events", train.len(), test.len());
 
-            let (mut w_train, mut w_train_h) = import_from_csv("train.csv")?;
-            let (w_test, w_test_h) = import_from_csv("test.csv")?;
-            w_train.extend(w_test);
-            w_train_h.extend(w_test_h);
-            info!("W train size: {}", w_train.len());
-
-            let last_index = find_nearest(w_train.last().unwrap(), &train);
-            let first_index = (last_index as i32 + 1 - w_train.len() as i32).max(0);
-            info!("First index: {}, event time {}", first_index, events[first_index as usize].order_book.timestamp);
-
-            if first_index >= 0 {
-                let mut warnings = 0;
-                let check = &train[first_index as usize..];
-                for (line, (check_features, w_features)) in check.iter().zip(w_train.iter()).enumerate().skip(1000) {
-                    let mut line_warnings = Vec::new();
-                    for (index, (check_feature, w_feature)) in check_features.iter().zip(w_features.iter()).enumerate() {
-                        if (check_feature - w_feature).abs() > 0.001 {
-                            line_warnings.push(format!("feature {index} {check_feature} != {w_feature}"));
-                        }
-                    }
-                    if !line_warnings.is_empty() {
-                        warn!("Line {line}: {}", line_warnings.join(", "));
-                        warnings += 1;
-                        if warnings > 100 {
-                            break;
-                        }
-                    }
-                }
-
-                let mut warnings = 0;
-                let check = &train_h[first_index as usize..];
-                for (line, (check_horizon, w_horizon)) in check.iter().zip(w_train_h.iter()).enumerate().skip(1000) {
-                    if (*check_horizon as f32 - w_horizon).abs() > 0.001 {
-                        warn!("Line {line} horizon: {check_horizon} != {w_horizon}");
-                        warnings += 1;
-                        if warnings > 100 {
-                            break;
-                        }
-                    }
-                }
-            }
-
             let train_arc = Arc::new(train);
             let train_h_arc = Arc::new(train_h);
             let test_arc = Arc::new(test);
@@ -187,27 +148,29 @@ async fn main() -> EmptyResult {
             let train_h_clone = train_h_arc.clone();
             let test_clone = test_arc.clone();
             let test_h_clone = test_h_arc.clone();
-            let h_down = thread::spawn(move || {
-                optimize_light_gbm(prediction_type_down, train_clone, train_h_clone, test_clone, test_h_clone)
+            let h_profit = thread::spawn(move || {
+                optimize_light_gbm(prediction_type_profit, train_clone, train_h_clone, test_clone, test_h_clone)
             });
 
             let cfg_up = h_up.join().unwrap()?;
-            let cfg_down = h_down.join().unwrap()?;
+            let cfg_profit = h_profit.join().unwrap()?;
 
-            info!("\nUP: {cfg_up}\nDOWN: {cfg_down}");
-            (cfg_up, cfg_down)
+            info!("\nUP: {cfg_up}\nPROFIT: {cfg_profit}");
+            (cfg_up, cfg_profit)
         } else {
             let cfg_json_up = r#"
-{"bagging_fraction":0.9180913285900155,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.6747405690264315,"lambda_l1":1.7522681012214225,"lambda_l2":0.014180900594981083,"learning_rate":0.005328566087983153,"max_depth":-1,"metric":"binary_logloss","min_child_samples":556,"n_jobs":-1,"num_iterations":2000,"num_leaves":79,"objective":"binary","random_state":42,"verbosity":-1}"#;
-            let cfg_json_down = r#"
-{"bagging_fraction":0.8361357907636818,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.9596713385375366,"lambda_l1":0.549411566785072,"lambda_l2":0.00047609572483133504,"learning_rate":0.0051143561715938065,"max_depth":-1,"metric":"binary_logloss","min_child_samples":267,"n_jobs":-1,"num_iterations":2000,"num_leaves":44,"objective":"binary","random_state":42,"verbosity":-1}"#;
+{"bagging_fraction":0.9956681735258639,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.7035543125048269,"lambda_l1":0.0056260035551993085,"lambda_l2":0.0010141596166938515,"learning_rate":0.009129879827747886,"max_depth":-1,"metric":"binary_logloss","min_child_samples":462,"n_jobs":-1,"num_iterations":2000,"num_leaves":18,"objective":"binary","random_state":42,"verbosity":-1}
+"#;
+            let cfg_json_profit = r#"
+{"bagging_fraction":0.8087537633948574,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.9759985420473922,"lambda_l1":0.04218193773157231,"lambda_l2":0.053364693959552914,"learning_rate":0.016821711543696317,"max_depth":-1,"metric":"binary_logloss","min_child_samples":326,"n_jobs":-1,"num_iterations":2000,"num_leaves":51,"objective":"binary","random_state":42,"verbosity":-1}
+"#;
 
             let value: Value = serde_json::from_str(cfg_json_up)?;
             let cfg_up = MachineConfig::LightGBM(value);
 
-            let value: Value = serde_json::from_str(cfg_json_down)?;
-            let cfg_down = MachineConfig::LightGBM(value);
-            (cfg_up, cfg_down)
+            let value: Value = serde_json::from_str(cfg_json_profit)?;
+            let cfg_profit = MachineConfig::LightGBM(value);
+            (cfg_up, cfg_profit)
         };
 
         let (order_books1, order_books2) = get_order_books(&tickers, &[first_leg_id, second_leg_id], check_diapason, Some(&db)).await?;
@@ -216,48 +179,60 @@ async fn main() -> EmptyResult {
         let (train, test, train_h, test_h) =
             features_with_horizons(first_leg_id, second_leg_id, &events, check_train_end, global);
         info!("Check train {} events, test {} events", train.len(), test.len());
+        export_to_csv(&test, &test_h, "test_data.csv");
 
-        info!("Train models...");
+        info!("Train Linear model...");
+        let linear = calibrate_linear_signal(None, &train, &train_h).ok_or("Linear Signal not calibrated")?;
+        info!("Train UP model...");
         let gb_up = GradientBoost::train(prediction_type_up, &cfg_up, &train, &train_h)?;
-        //let gb_down = GradientBoost::train(prediction_type_down, &cfg_down, &train, &train_h)?;
+        info!("Train PROFIT model...");
+        let gb_profit = GradientBoost::train(prediction_type_profit, &cfg_profit, &train, &train_h)?;
         info!("Training completed");
 
-        let h = thread::spawn(move || {
-            gb_up.test(&test)
+        let test_clone = test.clone();
+        let h_up = thread::spawn(move || {
+            gb_up.test(&test_clone)
         });
-        let predictions = h.join().unwrap()?;
+        let test_clone = test.clone();
+        let h_profit = thread::spawn(move || {
+            gb_profit.test(&test_clone)
+        });
+        let h_linear = thread::spawn(move || {
+            linear.test(&test)
+        });
+        let predictions_up = h_up.join().unwrap()?;
+        let predictions_profit = h_profit.join().unwrap()?;
+        let predictions_linear = h_linear.join().unwrap();
 
-        //let predictions_down = gb_down.test(&test)?;
-        //let predictions = predictions_up.into_iter().zip(predictions_down.into_iter())
-        //    .map(|(p_up, p_down)| p_up * (1.0 - p_down))
-        //    .collect::<Vec<f64>>();
+        const PERCENTILES: [f64; 4] = [0.97, 0.99, 0.993, 0.997];
 
-        let mut predictions_ord = predictions.clone();
-        predictions_ord.sort_by(|p1, p2| p1.partial_cmp(p2).unwrap_or(Equal));
+        for p_linear in PERCENTILES {
+            let threshold_linear = percentile(&predictions_linear, p_linear);
+            for p_up in PERCENTILES {
+                let threshold_up = percentile(&predictions_profit, p_up);
 
-        for percentile in [0.99, 0.995, 0.999, 0.9995, 0.99966, 0.9999] {
-            let index = ((predictions_ord.len() - 1) as f64 * percentile) as usize;
-            let threshold = predictions_ord[index];
-            let (mut correct, mut incorrect) = (0, 0);
-            let (mut commission, mut pnl) = (0.0, 0.0);
-            for (prediction, horizon) in predictions.iter().zip(test_h.iter()) {
-                if *prediction > threshold {
-                    if *horizon > 0.0 {
-                        correct += 1;
-                    } else {
-                        incorrect += 1;
-                    }
-
-                    pnl += horizon;
-                    commission += 5.0;
-                }
+                let pnl_vec = predictions_linear.iter().zip(predictions_profit.iter()).zip(test_h.iter())
+                    .filter(|((l, u), _)| **l >= threshold_linear && **u >= threshold_up)
+                    .map(|(_, pnl)| *pnl)
+                    .collect::<Vec<_>>();
+                let total_pnl = pnl_vec.iter().copied().sum::<f32>();
+                info!("Linear {p_linear}, Up {p_up} => {total_pnl}, {}", pnl_vec.len());
             }
-            info!("Percentile {percentile} ({threshold}): {:.2}%, PnL {pnl}, commission {commission}, gross {}",
-            correct as f64 * 100.0 / (correct + incorrect) as f64, pnl - commission);
         }
+
+        let predictions = predictions_up.into_iter()
+            .zip(predictions_profit.into_iter())
+            .zip(predictions_linear.into_iter())
+            .map(|((p1, p2), p3)| vec![p1, p2, p3])
+            .collect::<Vec<_>>();
+        export_to_csv(&predictions, &test_h, "predictions.csv");
     }
 
     Ok(())
+}
+
+fn optimize_predictions(predictions: &[Vec<f64>], horizons: &[f64]) {
+    let initial = Array1::from_vec(vec![1.0, -0.1, -0.1, -0.1]);
 }
 
 fn find_nearest(features: &[f32], data: &[Vec<f32>]) -> usize {
@@ -293,7 +268,7 @@ fn import_from_csv(filename: &str) -> Result<(Vec<Vec<f32>>, Vec<f32>), CommonEr
     Ok((features, horizons))
 }
 
-fn export_to_csv(data: &[Vec<f32>], horizons: &[f64]) {
+fn export_to_csv<D: std::fmt::Display>(data: &[Vec<D>], horizons: &[f32], filename: &str) {
     let size = data[0].len();
     let mut csv = Vec::new();
 
@@ -304,11 +279,11 @@ fn export_to_csv(data: &[Vec<f32>], horizons: &[f64]) {
         if features.len() != size {
             warn!("Feature length mismatch: expected {}, got {}", size, features.len())
         }
-        let row = format!("{},{horizon:.2}", features.iter().map(|f| format!("{f:.4}")).collect::<Vec<_>>().join(","));
+        let row = format!("{},{horizon:.2}", features.iter().map(|f| format!("{f:.6}")).collect::<Vec<_>>().join(","));
         csv.push(row);
     }
 
-    if let Err(err) = std::fs::write("spread_data.csv", csv.join("\n")) {
+    if let Err(err) = std::fs::write(filename, csv.join("\n")) {
         error!("Failed to export data to CSV: {}", err);
     }
 }
@@ -319,7 +294,7 @@ fn features_with_horizons(
     events: &[OrderBookEvent],
     train_end: DateTime<Utc>,
     global_params: GlobalParams,
-) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f64>, Vec<f64>) {
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
     let mut window1 = FeaturesRollingWindow::new(
         TimeDelta::milliseconds((1000.0 * global_params.derivatives_normalize) as i64),
         TimeDelta::milliseconds((1000.0 * global_params.trend_tau) as i64),
@@ -338,31 +313,34 @@ fn features_with_horizons(
     let mut train_horizons = Vec::new();
     let mut test_horizons = Vec::new();
 
+    let (mut v1, mut v2) = (None, None);
     let (mut f1, mut f2) = (None, None);
-    let (mut h1, mut h2) = (0.0, 0.0);
 
     for (i, event) in events.iter().enumerate() {
-        if let Some(values) = OrderBookValues::from_order_book(&event.order_book)
-            && let Some(h_price) = get_price_on_horizon(events, event.instrument_id, i) {
+        if let Some(values) = OrderBookValues::from_order_book(&event.order_book) {
 
             if event.instrument_id == first_leg_id {
                 f1 = Some(window1.process(values.to_features()));
-                h1 = h_price - values.mid;
+                v1 = Some(values);
             } else if event.instrument_id == second_leg_id {
                 f2 = Some(window2.process(values.to_features()));
-                h2 = h_price - values.mid;
+                v2 = Some(values);
             }
 
             if let Some(mut features) = f1.clone() && let Some(f2) = f2.clone() {
                 features.extend(f2);
-                let horizon = h1 - h2;
 
-                if values.time <= train_end {
-                    train_features.push(features);
-                    train_horizons.push(horizon);
-                } else {
-                    test_features.push(features);
-                    test_horizons.push(horizon);
+                if let Some((h_ask1, _h_bid1)) = get_price_on_horizon(events, first_leg_id, i)
+                    && let Some((_h_ask2, h_bid2)) = get_price_on_horizon(events, second_leg_id, i) {
+                    let pnl = (v1.unwrap().bid - h_ask1 + h_bid2 - v2.unwrap().ask) as f32;
+
+                    if values.time + TimeDelta::milliseconds(HORIZON_MS as i64) <= train_end {
+                        train_features.push(features);
+                        train_horizons.push(pnl);
+                    } else if values.time > train_end {
+                        test_features.push(features);
+                        test_horizons.push(pnl);
+                    }
                 }
             }
         }
@@ -370,14 +348,14 @@ fn features_with_horizons(
     (train_features, test_features, train_horizons, test_horizons)
 }
 
-fn get_price_on_horizon(events: &[OrderBookEvent], instrument_id: i32, index: usize) -> Option<f64> {
+fn get_price_on_horizon(events: &[OrderBookEvent], instrument_id: i32, index: usize) -> Option<(f64, f64)> {
     let mut i = index;
     let target_time = events[index].order_book.timestamp + TimeDelta::milliseconds(HORIZON_MS as i64);
     while i < events.len() {
         if events[i].instrument_id == instrument_id
             && events[i].order_book.timestamp >= target_time
             && let Some(values) = OrderBookValues::from_order_book(&events[i].order_book) {
-            return Some(values.mid)
+            return Some((values.ask, values.bid))
         }
         i += 1;
     }
@@ -440,7 +418,7 @@ impl OrderBookValues {
     pub fn to_features(&self) -> TimedFeatures {
         TimedFeatures {
             time: self.time,
-            features: vec![self.mid, self.imbalances[0], self.imbalances[1], self.imbalances[2], self.imbalances[3], self.imbalances[4]],
+            features: vec![self.mid, self.ask - self.bid, self.imbalances[0], self.imbalances[1], self.imbalances[2], self.imbalances[3], self.imbalances[4]],
         }
     }
 }

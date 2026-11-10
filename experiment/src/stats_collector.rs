@@ -52,11 +52,9 @@ pub fn future_spreads_stats(events: &[OrderBookEvent], first_leg_id: i32, second
                     v2 = OrderBookValues::from_order_book(&event.order_book);
                 }
                 if let Some(v1) = v1 && let Some(v2) = v2
-                    && let Some(h_mid1) = get_price_on_horizon(self.events, self.first_leg_id, i)
-                    && let Some(h_mid2) = get_price_on_horizon(self.events, self.second_leg_id, i) {
-                    let spread = v2.mid - v1.mid;
-                    let hspread = h_mid2 - h_mid1;
-                    let change = hspread - spread;
+                    && let Some((h_ask1, h_bid1)) = get_price_on_horizon(self.events, self.first_leg_id, i)
+                    && let Some((h_ask2, h_bid2)) = get_price_on_horizon(self.events, self.second_leg_id, i) {
+                    let change = h_ask1 - v1.bid + v2.ask - h_bid2;
                     daily.entry(event.order_book.timestamp.date_naive()).or_insert(Vec::new()).push(change);
                 }
             }

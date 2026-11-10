@@ -96,6 +96,7 @@ impl TimedFeatures {
 pub enum OutputType {
     Raw(&'static str),
     DerivativeNorm(&'static str),
+    StandardDeviation(&'static str),
     TrendDeviation(&'static str),
     TrendDeviationDerivativeNorm(&'static str),
 }
@@ -110,11 +111,13 @@ pub struct FeaturesRollingWindow {
 
     prev_features: Option<TimedFeatures>,
     times: Vec<DateTime<Utc>>,
+    raws: Vec<Vec<f64>>,
     derivatives: Vec<Vec<f64>>,
     trends: Vec<f64>,
     trend_derivatives: Vec<Vec<f64>>,
 
     derivatives_indices: Vec<usize>,
+    deviations_indices: Vec<usize>,
     trends_indices: Vec<usize>,
     trend_derivatives_indices: Vec<usize>,
 }
@@ -127,6 +130,7 @@ impl FeaturesRollingWindow {
         }
 
         let mut derivatives_indices = Vec::new();
+        let mut deviations_indices = Vec::new();
         let mut trends_indices = Vec::new();
         let mut trend_derivatives_indices = Vec::new();
         for output in outputs {
@@ -134,6 +138,9 @@ impl FeaturesRollingWindow {
                 OutputType::Raw(_) => {}
                 OutputType::DerivativeNorm(name) => {
                     derivatives_indices.push(name_to_index[*name]);
+                }
+                OutputType::StandardDeviation(name) => {
+                    deviations_indices.push(name_to_index[*name]);
                 }
                 OutputType::TrendDeviation(name) => {
                     trends_indices.push(name_to_index[*name]);
@@ -153,11 +160,13 @@ impl FeaturesRollingWindow {
 
             prev_features: None,
             times: Vec::new(),
+            raws: vec![Vec::new(); names.len()],
             derivatives: vec![Vec::new(); names.len()],
             trends: vec![0.0; names.len()],
             trend_derivatives: vec![Vec::new(); names.len()],
 
             derivatives_indices,
+            deviations_indices,
             trends_indices,
             trend_derivatives_indices,
         }
@@ -167,6 +176,10 @@ impl FeaturesRollingWindow {
         let last_time = new_data.time;
         while let Some(first_time) = self.times.first() && *first_time < last_time - self.norm_diapason {
             self.times.remove(0);
+            self.raws.iter_mut()
+                .for_each(|raw| {
+                    raw.remove(0);
+                });
             self.derivatives.iter_mut()
                 .for_each(|derivatives| {
                     derivatives.remove(0);
@@ -178,6 +191,7 @@ impl FeaturesRollingWindow {
         }
         let history_len = self.times.len();
 
+        let mut deviations = vec![0.0; self.name_to_index.len()];
         let mut derivatives = vec![0.0; self.name_to_index.len()];
         let mut derivatives_norm = vec![0.0; self.name_to_index.len()];
 
@@ -218,6 +232,18 @@ impl FeaturesRollingWindow {
                     trend_derivatives[i]
                 };
             }
+            
+            // calculate standard deviations
+            for &i in &self.deviations_indices {
+                let mut variance = 0.0;
+                if !self.raws[i].is_empty() {
+                    let sum = self.raws[i].iter()
+                        .map(|value| { value * value })
+                        .sum::<f64>() / history_len as f64;
+                    variance = sum.sqrt();
+                }
+                deviations[i] = variance;
+            }
 
             // calculate derivatives
             for &i in &self.derivatives_indices {
@@ -254,6 +280,10 @@ impl FeaturesRollingWindow {
                     let index = self.name_to_index[*name];
                     result.push(new_data.features[index]);
                 }
+                OutputType::StandardDeviation(name) => {
+                    let index = self.name_to_index[*name];
+                    result.push(deviations[index]);
+                }
                 OutputType::DerivativeNorm(name) => {
                     let index = self.name_to_index[*name];
                     result.push(derivatives_norm[index]);
@@ -270,6 +300,9 @@ impl FeaturesRollingWindow {
         }
 
         self.trends = new_trends;
+        self.raws.iter_mut().enumerate().for_each(|(i, history)| {
+            history.push(new_data.features[i]);
+        });
         self.derivatives.iter_mut().enumerate().for_each(|(i, history)| {
             history.push(derivatives[i]);
         });

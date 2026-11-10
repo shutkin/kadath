@@ -2,8 +2,10 @@ extern crate core;
 
 pub mod orderbook_values;
 mod gradient_boost;
+mod nelder_mead;
 
 use crate::gradient_boost::{DataVec, GradientBoost, PredictionType, optimize_light_gbm};
+use crate::nelder_mead::{LinearSignal, calibrate_linear_signal};
 use crate::orderbook_values::OrderBookValues;
 use chrono::{DateTime, TimeDelta, Utc};
 use log::{error, info};
@@ -12,16 +14,16 @@ use model::math_util::OutputType::{DerivativeNorm, Raw, TrendDeviation, TrendDev
 use model::math_util::{FeaturesRollingWindow, percentile};
 use model::{OrderBook, TradeDirection};
 use serde_json::Value;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
-const LAST_PREDICTIONS_INTERVAL: TimeDelta = TimeDelta::minutes(180);
+const LAST_PREDICTIONS_SIZE: usize = 50000;
 
 #[derive(Copy, Clone, Default)]
 pub enum TradeSignal {
     #[default]
     None,
-    Sell(f64),
-    Buy(f64),
+    Sell(f64, f64),
+    Buy(f64, f64),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -33,18 +35,17 @@ pub struct ModelConfig {
     pub optimize_iterations: usize,
     pub hold_time: TimeDelta,
     pub expected_delta: f32,
-    pub prediction_percentile: f64,
+    pub prediction_percentile_linear: f64,
+    pub prediction_percentile_gbm: f64,
 }
 
 pub struct WindowData {
-    last_book1: Option<OrderBookValues>,
-    last_book2: Option<OrderBookValues>,
     last_features1: Option<Vec<f32>>,
     last_features2: Option<Vec<f32>>,
     window1: FeaturesRollingWindow,
     window2: FeaturesRollingWindow,
-    last_predictions: Vec<f64>,
-    last_predictions_times: Vec<DateTime<Utc>>,
+    last_predictions_linear: Vec<f64>,
+    last_predictions_gbm: Vec<f64>,
 }
 
 impl WindowData {
@@ -69,14 +70,12 @@ impl WindowData {
             ],
         );
         Self {
-            last_book1: None,
-            last_book2: None,
             last_features1: None,
             last_features2: None,
             window1: window.clone(),
             window2: window.clone(),
-            last_predictions: Vec::new(),
-            last_predictions_times: Vec::new(),
+            last_predictions_linear: Vec::new(),
+            last_predictions_gbm: Vec::new(),
         }
     }
 }
@@ -118,8 +117,8 @@ impl DealData {
 struct PriceHistory {
     instrument_id: i32,
     time: DateTime<Utc>,
-    price: f32,
-    price_horizon: f32,
+    ask: f32,
+    bid: f32,
 }
 
 #[derive(Clone)]
@@ -129,6 +128,7 @@ pub struct WalkForwardModel {
     config: ModelConfig,
     booster_config: Arc<RwLock<Option<Value>>>,
     booster: Arc<RwLock<Option<GradientBoost>>>,
+    linear_signal: Arc<RwLock<Option<LinearSignal>>>,
     features_buffer: Arc<Mutex<Vec<Vec<f32>>>>,
     prices_buffer: Arc<Mutex<Vec<PriceHistory>>>,
 }
@@ -141,6 +141,7 @@ impl WalkForwardModel {
             config,
             booster_config: Arc::new(RwLock::new(None)),
             booster: Arc::new(RwLock::new(None)),
+            linear_signal: Arc::new(RwLock::new(None)),
             features_buffer: Arc::new(Mutex::new(Vec::new())),
             prices_buffer: Arc::new(Mutex::new(Vec::new())),
         }
@@ -155,28 +156,6 @@ impl WalkForwardModel {
         cur_time > deal_data.open_time + self.config.hold_time
     }
 
-    fn write_prices_to_history(&self, mut buffer: MutexGuard<Vec<PriceHistory>>, prices: PriceHistory) {
-        let mut i = buffer.len() as i32 - 1;
-        buffer.push(prices);
-        /*let horizon_target = prices.time - self.config.hold_time;
-        while i >= 0 {
-            let prev_price = &mut buffer[i as usize];
-            i -= 1;
-
-            if prev_price.instrument_id != prices.instrument_id {
-                continue;
-            }
-
-            if prev_price.price_horizon > 0.0 {
-                break;
-            }
-
-            if prev_price.time <= horizon_target {
-                prev_price.price_horizon = prices.price;
-            }
-        }*/
-    }
-
     pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {
         let price;
 
@@ -185,43 +164,47 @@ impl WalkForwardModel {
             price = PriceHistory {
                 instrument_id: event.instrument_id,
                 time: event.order_book.timestamp,
-                price: book.mid as f32,
-                price_horizon: 0.0,
+                ask: book.ask as f32,
+                bid: book.bid as f32,
             };
             window_data.last_features1 = Some(window_data.window1.process(book.to_features()));
-            window_data.last_book1 = Some(book);
         } else if self.second_leg_id == event.instrument_id {
             let book = OrderBookValues::from_order_book(&event.order_book);
             price = PriceHistory {
                 instrument_id: event.instrument_id,
                 time: event.order_book.timestamp,
-                price: book.mid as f32,
-                price_horizon: 0.0,
+                ask: book.ask as f32,
+                bid: book.bid as f32,
             };
             window_data.last_features2 = Some(window_data.window2.process(book.to_features()));
-            window_data.last_book2 = Some(book);
         } else {
             return TradeSignal::None;
         };
 
-        let mut prediction = None;
+        let mut prediction_gbm = None;
+        let mut prediction_linear = None;
 
-        if let Some(book1) = &window_data.last_book1
-            && let Some(book2) = &window_data.last_book2 {
-            let mut features = window_data.last_features1.clone().unwrap();
-            features.extend(window_data.last_features2.clone().unwrap());
+        if let Some(features1) = &window_data.last_features1
+            && let Some(features2) = &window_data.last_features2 {
+            let mut features = features1.clone();
+            features.extend(features2.clone());
             if let Ok(mut lock) = self.features_buffer.lock() {
                 lock.push(features.clone());
             }
-            if let Ok(lock) = self.prices_buffer.lock() {
-                self.write_prices_to_history(lock, price);
+            if let Ok(mut lock) = self.prices_buffer.lock() {
+                lock.push(price);
+            }
+
+            if let Ok(read) = self.linear_signal.read()
+                && let Some(linear) = read.as_ref() {
+                prediction_linear = Some(linear.calculate(&features));
             }
 
             if let Ok(read) = self.booster.read()
                 && let Some(booster) = read.as_ref() {
                 match booster.test(&[features]) {
                     Ok(predictions) => {
-                        prediction = predictions.into_iter().next();
+                        prediction_gbm = predictions.into_iter().next();
                     }
                     Err(err) => {
                         error!("Failed to make prediction: {err}");
@@ -230,33 +213,35 @@ impl WalkForwardModel {
             }
         }
 
-        if let Some(prediction) = prediction {
-            window_data.last_predictions.push(prediction);
-            window_data.last_predictions_times.push(event.order_book.timestamp);
+        if let Some(prediction_linear) = prediction_linear && let Some(prediction_gbm) = prediction_gbm {
+            if window_data.last_predictions_linear.len() == LAST_PREDICTIONS_SIZE {
+                let linear_threshold = percentile(&window_data.last_predictions_linear, self.config.prediction_percentile_linear);
+                let gbm_threshold = percentile(&window_data.last_predictions_gbm, self.config.prediction_percentile_gbm);
 
-            let threshold = event.order_book.timestamp - LAST_PREDICTIONS_INTERVAL;
-            while let Some(first_time) = window_data.last_predictions_times.first() && *first_time < threshold {
-                window_data.last_predictions_times.remove(0);
-                window_data.last_predictions.remove(0);
-            }
+                window_data.last_predictions_linear.remove(0);
+                window_data.last_predictions_gbm.remove(0);
+                window_data.last_predictions_linear.push(prediction_linear);
+                window_data.last_predictions_gbm.push(prediction_gbm);
 
-            let p_threshold = percentile(&window_data.last_predictions, self.config.prediction_percentile);
-            if prediction > p_threshold {
-                return TradeSignal::Buy(prediction)
+                if prediction_linear >= linear_threshold && prediction_gbm >= gbm_threshold {
+                    return TradeSignal::Sell(prediction_linear, prediction_gbm)
+                }
+            } else {
+                window_data.last_predictions_linear.push(prediction_linear);
+                window_data.last_predictions_gbm.push(prediction_gbm);
             }
         }
 
         TradeSignal::None
     }
 
-    fn get_price_on_horizon(&self, prices: &[PriceHistory], index: usize) -> Option<f32> {
+    fn get_price_on_horizon(&self, prices: &[PriceHistory], index: usize, instrument_id: i32) -> Option<(f32, f32)> {
         let mut i = index + 1;
         let target_time = prices[index].time + self.config.hold_time;
-        let instrument_id = prices[index].instrument_id;
         while i < prices.len() {
             if prices[i].instrument_id == instrument_id
                 && prices[i].time >= target_time {
-                return Some(prices[i].price)
+                return Some((prices[i].ask, prices[i].bid));
             }
             i += 1;
         }
@@ -271,26 +256,22 @@ impl WalkForwardModel {
                 if prices.len() < self.config.train_min_size {
                     (Vec::new(), 0)
                 } else {
-                    let (mut price1, mut price2, mut horizon1, mut horizon2) = (0.0, 0.0, 0.0, 0.0);
+                    let (mut price1, mut price2) = (None, None);
                     let mut horizons = Vec::with_capacity(prices.len());
                     
                     for (i, price) in prices.iter().enumerate() {
-                        if let Some(horizon_price) = self.get_price_on_horizon(&prices, i) {
-                            if prices[i].instrument_id == self.first_leg_id {
-                                price1 = prices[i].price;
-                                horizon1 = horizon_price;
-                            } else {
-                                price2 = prices[i].price;
-                                horizon2 = horizon_price;
-                            }
+                        if price.instrument_id == self.first_leg_id {
+                            price1 = Some(price.bid);
+                        } else {
+                            price2 = Some(price.ask);
                         }
 
-                        if price1 > 0.0 && price2 > 0.0 && horizon1 > 0.0 && horizon2 > 0.0 {
-                            let horizon = match direction {
-                                TradeDirection::Buy => horizon1 - price1 + price2 - horizon2,
-                                TradeDirection::Sell => price1 - horizon1 + horizon2 - price2,
-                            };
-                            horizons.push(horizon);
+                        if let Some(price1) = price1 && let Some(price2) = price2 {
+                            if let Some((h_ask1, h_bid1)) = self.get_price_on_horizon(&prices, i, self.first_leg_id)
+                                && let Some((h_ask2, h_bid2)) = self.get_price_on_horizon(&prices, i, self.second_leg_id) {
+                                let pnl = price1 - h_ask1 + h_bid2 - price2;
+                                horizons.push(pnl);
+                            }
                         } else {
                             skipped += 1;
                         }
@@ -304,6 +285,7 @@ impl WalkForwardModel {
         self.shrink_buffer();
 
         let mut booster = None;
+        let mut linear = None;
 
         let (horizons, skipped) = self.get_horizons(TradeDirection::Buy);
         info!("Skipped {} first events", skipped);
@@ -312,8 +294,12 @@ impl WalkForwardModel {
         if horizons.len() >= self.config.train_min_size {
             let features = self.features_buffer.lock()
                 .map(|buf| buf[skipped..skipped + horizons.len()].to_vec());
+
             let config = self.booster_config.read().map(|cfg| cfg.clone());
             if let Ok(Some(config)) = &config && let Ok(features_train) = features {
+
+                linear = calibrate_linear_signal(None, &features_train, &horizons);
+
                 info!("Start training on {} events", features_train.len());
                 match GradientBoost::train(
                     PredictionType::ClassificationPositive(self.config.expected_delta),
@@ -322,32 +308,6 @@ impl WalkForwardModel {
                     &horizons,
                 ) {
                     Ok(boost) => {
-                        /*info!("Start testing on {} events", features_test.len());
-                        let predictions = boost.test(&features_test).unwrap();
-                        let mut predictions_ord = predictions.clone();
-                        predictions_ord.sort_by(|p1, p2| p1.partial_cmp(p2).unwrap_or(Equal));
-
-                        for percentile in [0.99, 0.995, 0.999, 0.9995, 0.99966, 0.9999] {
-                            let index = ((predictions_ord.len() - 1) as f64 * percentile) as usize;
-                            let threshold = predictions_ord[index];
-                            let (mut correct, mut incorrect) = (0, 0);
-                            let (mut commission, mut pnl) = (0.0, 0.0);
-                            for (prediction, horizon) in predictions.iter().zip(horizons_test.iter()) {
-                                if *prediction > threshold {
-                                    if *horizon > self.config.expected_delta {
-                                        correct += 1;
-                                    } else {
-                                        incorrect += 1;
-                                    }
-
-                                    pnl += horizon;
-                                    commission += 5.0;
-                                }
-                            }
-                            info!("Percentile {percentile} ({threshold}): {:.2}%, PnL {pnl}, commission {commission}, gross {}",
-                                correct as f64 * 100.0 / (correct + incorrect) as f64, pnl - commission);
-                        }*/
-                        
                         booster = Some(boost);
                         info!("New booster trained");
                     }
@@ -356,6 +316,10 @@ impl WalkForwardModel {
                     }
                 }
             }
+        }
+
+        if let Some(linear) = linear && let Ok(mut write) = self.linear_signal.write() {
+            *write = Some(linear);
         }
 
         if let Some(booster) = booster

@@ -1,5 +1,4 @@
-use crate::filter_values_with_horizons;
-use crate::gradient_boost::{GradientBoost, MachineConfig, PredictionType, calculate_predictions_error};
+use crate::gradient_boost::{GradientBoost, MachineConfig, PredictionType};
 use crate::orderbook_values::OrderBookValues;
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
@@ -103,7 +102,7 @@ impl CostFunction for GlobalProblem<'_> {
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
         let global = GlobalParams::from_param(param, self.functions);
         let mut values = self.values.to_vec();
-        OrderBookValues::calculate_window_values(&mut values, global.derivatives_normalize, global.trend_tau);
+        /*OrderBookValues::calculate_window_values(&mut values, global.derivatives_normalize, global.trend_tau);
 
         let (train_values, train_horizons) = filter_values_with_horizons(&values, self.horizons, self.train_diapason);
         let machine = GradientBoost::train(self.prediction_type, &self.machine_config, &train_values, &train_horizons).unwrap();
@@ -115,6 +114,7 @@ impl CostFunction for GlobalProblem<'_> {
 
         let count = self.count.fetch_add(1, Ordering::Relaxed);
         info!("{count}: {global:?} => {error}");
-        Ok(error)
+        Ok(error)*/
+        Ok(0.0)
     }
 }

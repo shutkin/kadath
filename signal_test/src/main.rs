@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Copy, Clone)]
 struct TestDeal {
-    prediction: f64,
+    prediction: (f64, f64),
     open_index: usize,
     close_index: Option<usize>,
     open_time: DateTime<Utc>,
@@ -30,14 +30,14 @@ struct TestDeal {
 }
 
 impl TestDeal {
-    fn open(prediction: f64, index: usize, book1: &OrderBook, book2: &OrderBook) -> Self {
+    fn open(prediction: (f64, f64), index: usize, book1: &OrderBook, book2: &OrderBook) -> Self {
         let cur_time = book1.timestamp.max(book2.timestamp);
         TestDeal {
             prediction,
             open_index: index,
             open_time: cur_time,
-            open_price1: (get_best_ask(book1).as_f64(), get_mid_price(book1).as_f64()),
-            open_price2: (get_best_bid(book2).as_f64(), get_mid_price(book2).as_f64()),
+            open_price1: (get_best_bid(book1).as_f64(), get_mid_price(book1).as_f64()),
+            open_price2: (get_best_ask(book2).as_f64(), get_mid_price(book2).as_f64()),
             close_price1: None,
             close_price2: None,
             close_index: None,
@@ -53,13 +53,13 @@ impl TestDeal {
         let cur_time = book1.timestamp.max(book2.timestamp);
         self.close_index = Some(index);
 
-        self.close_price1 = Some((get_best_bid(book1).as_f64(), get_mid_price(book1).as_f64()));
-        self.close_price2 = Some((get_best_ask(book2).as_f64(), get_mid_price(book2).as_f64()));
+        self.close_price1 = Some((get_best_ask(book1).as_f64(), get_mid_price(book1).as_f64()));
+        self.close_price2 = Some((get_best_bid(book2).as_f64(), get_mid_price(book2).as_f64()));
     }
 
     fn pnl(&self) -> (f64, f64) {
-        let real = self.close_price1.unwrap_or_default().0 - self.open_price1.0 + self.open_price2.0 - self.close_price2.unwrap_or_default().0;
-        let mid = self.close_price1.unwrap_or_default().1 - self.open_price1.1 + self.open_price2.1 - self.close_price2.unwrap_or_default().1;
+        let real = self.open_price1.0 - self.close_price1.unwrap_or_default().0 + self.close_price2.unwrap_or_default().0 - self.open_price2.0;
+        let mid = self.open_price1.1 - self.close_price1.unwrap_or_default().1 + self.close_price2.unwrap_or_default().1 - self.open_price2.1;
         (real, mid)
     }
 }
@@ -98,15 +98,7 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
 }
 
-const OPTIMIZED_CONFIGS: [&str; 4] = [
-    // 524.5
-    r#"{"bagging_fraction":0.6386075676720108,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.544681408481552,"lambda_l1":0.0033663336109842493,"lambda_l2":0.0030419858206211766,"learning_rate":0.012175936248179512,"max_depth":-1,"metric":"binary_logloss","min_child_samples":417,"n_jobs":-1,"num_iterations":2000,"num_leaves":7,"objective":"binary","random_state":42,"verbosity":-1}"#,
-    // 500.0
-    r#"{"bagging_fraction":0.8501447639977895,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.9911339978504541,"lambda_l1":0.00015294800252169967,"lambda_l2":0.04051994711392981,"learning_rate":0.015465367095512543,"max_depth":-1,"metric":"binary_logloss","min_child_samples":662,"n_jobs":-1,"num_iterations":2000,"num_leaves":76,"objective":"binary","random_state":42,"verbosity":-1}"#,
-    // 211.5
-    r#"{"bagging_fraction":0.6084273107464666,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.8949861393174053,"lambda_l1":2.2720624087028414,"lambda_l2":0.019776956507091253,"learning_rate":0.022871386032990118,"max_depth":-1,"metric":"binary_logloss","min_child_samples":292,"n_jobs":-1,"num_iterations":2000,"num_leaves":13,"objective":"binary","random_state":42,"verbosity":-1}"#,
-    // 452.5
-    r#"{"bagging_fraction":0.7084166428878502,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.7230323815664548,"lambda_l1":0.00010333215848430679,"lambda_l2":1.3731071818467322,"learning_rate":0.011448575073488674,"max_depth":-1,"metric":"binary_logloss","min_child_samples":1245,"n_jobs":-1,"num_iterations":2000,"num_leaves":63,"objective":"binary","random_state":42,"verbosity":-1}"#,
+const OPTIMIZED_CONFIGS: [&str; 0] = [
 ];
 
 #[tokio::main]
@@ -128,9 +120,10 @@ async fn main() -> EmptyResult {
         train_buf_size: 285000,
         train_min_size: 200000,
         optimize_iterations: 20,
-        hold_time: TimeDelta::milliseconds(3000),
-        expected_delta: 8.0,
-        prediction_percentile: 0.99966,
+        hold_time: TimeDelta::milliseconds(2000),
+        expected_delta: 5.0,
+        prediction_percentile_linear: 0.996,
+        prediction_percentile_gbm: 0.9975,
     };
 
     let mut window_data = WindowData::new(&config);
@@ -197,7 +190,7 @@ async fn main() -> EmptyResult {
                     last_train_time = event.order_book.timestamp;
                 }
 
-                let signal_buy = model.process(&mut window_data, event);
+                let signal = model.process(&mut window_data, event);
 
                 if let Some(book1) = &last_book1 && let Some(book2) = &last_book2 {
                     if let Some(deal) = active_deal.as_mut() {
@@ -205,7 +198,7 @@ async fn main() -> EmptyResult {
                             deal.close(i, book1, book2);
                             let pnl = deal.pnl();
                             info!(
-                                "{} Prediction {}: {:?}",
+                                "{} Prediction {:?}: {:?}",
                                 deal.open_time,
                                 deal.prediction,
                                 pnl,
@@ -225,8 +218,8 @@ async fn main() -> EmptyResult {
                             .unwrap_or(true);
                         if do_trade {
                             do_not_trade_until = None;
-                            if let TradeSignal::Buy(prediction) = signal_buy {
-                                let deal = TestDeal::open(prediction, i, book1, book2);
+                            if let TradeSignal::Sell(p0, p1) = signal {
+                                let deal = TestDeal::open((p0, p1), i, book1, book2);
                                 active_deal = Some(deal);
                             }
                         }

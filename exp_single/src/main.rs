@@ -1,32 +1,47 @@
-use std::io::Write;
 mod orderbook_values;
-mod signal_calculator;
 mod charts;
 mod global_optimizer;
 mod gradient_boost;
+mod nelder_mead;
 
-use crate::global_optimizer::{global_optimize, GlobalParams};
-use crate::gradient_boost::{optimize_gbdt, optimize_light_gbm, GradientBoost, MachineConfig, PredictionType, GbdtConfig, test_features_rolling_window};
+use crate::global_optimizer::global_optimize;
+use crate::gradient_boost::{GbdtConfig, GradientBoost, MachineConfig, PredictionType, optimize_gbdt};
 use crate::orderbook_values::OrderBookValues;
-use chrono::{DateTime, Duration, TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use db::Db;
-use log::{LevelFilter, debug, error, info};
+use log::{LevelFilter, debug, info};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
-use model::math_util::median;
+use model::math_util::OutputType::{DerivativeNorm, Raw, StandardDeviation, TrendDeviation, TrendDeviationDerivativeNorm};
+use model::math_util::{percentile, FeaturesRollingWindow, OutputType};
 use model::{DataSource, Instrument, OrderBook, order_book_cache};
 use simplelog::SimpleLogger;
-use std::collections::HashMap;
-use std::fs::File;
 use std::sync::Arc;
 use std::thread;
-use gbdt::config::Config;
-use serde_json::Value;
+use crate::nelder_mead::calibrate_linear_signal;
 
 const HOLD_TIME: i32 = 4_000;
 const TRAIN_DIAPASON: i64 = 5 * 60;
 const TEST_DIAPASON: i64 = 45;
-const THRESHOLD_POSITIVE: f64 = 5.0;
-const THRESHOLD_NEGATIVE: f64 = 0.0;
+const THRESHOLD_POSITIVE: f32 = 5.0;
+const THRESHOLD_NEGATIVE: f32 = 0.0;
+
+const FEATURES_NAMES: [&str; 7] = ["mid", "spread", "i3", "i5", "i10", "i20", "i50"];
+const FEATURES_OUTPUT: [OutputType; 13] = [
+    TrendDeviation("mid"),
+    TrendDeviationDerivativeNorm("mid"),
+    StandardDeviation("spread"),
+    Raw("i3"),
+    Raw("i5"),
+    Raw("i10"),
+    Raw("i20"),
+    Raw("i50"),
+    DerivativeNorm("i3"),
+    DerivativeNorm("i5"),
+    DerivativeNorm("i10"),
+    DerivativeNorm("i20"),
+    DerivativeNorm("i50"),
+];
+
 
 #[tokio::main]
 async fn main() -> EmptyResult {
@@ -41,28 +56,21 @@ async fn main() -> EmptyResult {
 
     let all_instruments = db.get_instruments(DataSource::TInvest).await?;
     let inst_id = find_instrument_id(&all_instruments, ticker).expect("Instrument not found");
+
     let diapason = TimeDiapason::new(
         DateTime::parse_from_rfc3339("2026-10-22T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-10-22T13:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-10-22T11:00:00Z")?.to_utc(),
     );
-
-    let mut values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
+    let train_end = DateTime::parse_from_rfc3339("2026-10-22T10:00:00Z")?.to_utc();
+    let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
     info!("Got {} order book values", values.len());
-    OrderBookValues::calculate_window_values(&mut values, 90.0, 300.0);
+    let (train_values, test_values, train_horizons, test_horizons) =
+        features_with_horizons(&values, train_end, 57.28, 614.61, TimeDelta::milliseconds(HOLD_TIME as i64));
 
-    test_features_rolling_window(90, 300, &values);
-
-    let horizons = build_horizon(&values, HOLD_TIME);
-
-    let mut predictions_with_horizons = Vec::new();
     let mut train_diapason = TimeDiapason::new(diapason.from, diapason.from + TimeDelta::minutes(TRAIN_DIAPASON));
 
     let (mut config_positive, mut config_negative) = (None, Option::<MachineConfig>::None);
 
-    let optimizer_train_diapason = TimeDiapason::new(diapason.from, diapason.from + TimeDelta::minutes(TRAIN_DIAPASON));
-    let optimizer_test_diapason = TimeDiapason::new(optimizer_train_diapason.to + TimeDelta::seconds(1), optimizer_train_diapason.to + TimeDelta::minutes(30));
-    let (train_values, train_horizons) = filter_values_with_horizons(&values, &horizons, optimizer_train_diapason);
-    let (test_values, test_horizons) = filter_values_with_horizons(&values, &horizons, optimizer_test_diapason);
     let train_values_arc = Arc::new(train_values);
     let train_horizons_arc = Arc::new(train_horizons);
     let test_values_arc = Arc::new(test_values);
@@ -95,89 +103,126 @@ async fn main() -> EmptyResult {
     train_diapason.from += TimeDelta::minutes(30);
     train_diapason.to += TimeDelta::minutes(30);
 
-    while train_diapason.to <= diapason.to - TimeDelta::minutes(TEST_DIAPASON) {
-        let test_diapason = TimeDiapason::new(train_diapason.to + TimeDelta::seconds(1), train_diapason.to + TimeDelta::minutes(TEST_DIAPASON));
-        info!("Train diapason {train_diapason:?}, test diapason {test_diapason:?}");
 
-        let (train_values, train_horizons) = filter_values_with_horizons(&values, &horizons, train_diapason);
-        let (test_values, test_horizons) = filter_values_with_horizons(&values, &horizons, test_diapason);
+    if let Some(config_positive) = &config_positive && let Some(config_negative) = &config_negative {
+        let diapason = TimeDiapason::new(
+            DateTime::parse_from_rfc3339("2026-10-22T06:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-22T12:00:00Z")?.to_utc(),
+        );
+        let train_end = DateTime::parse_from_rfc3339("2026-10-22T11:00:00Z")?.to_utc();
+        let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
+        info!("Got {} order book values", values.len());
+        let (train_values, test_values, train_horizons, test_horizons) =
+            features_with_horizons(&values, train_end, 57.28, 614.61, TimeDelta::milliseconds(HOLD_TIME as i64));
+        let classificator_positive = GradientBoost::train(positive, config_positive, &train_values, &train_horizons)?;
+        let classificator_negative = GradientBoost::train(negative, config_negative, &train_values, &train_horizons)?;
+        let linear = calibrate_linear_signal(None, &train_values, &train_horizons).ok_or("Unable to calibrate linear signal")?;
 
-        if let Some(config_positive) = &config_positive && let Some(config_negative) = &config_negative {
-            let classificator_positive = GradientBoost::train(positive, config_positive, &train_values, &train_horizons)?;
-            let classificator_negative = GradientBoost::train(negative, config_negative, &train_values, &train_horizons)?;
+        info!("Train Linear model...");
+        let predictions_linear = linear.test(&test_values);
+        info!("Train UP model...");
+        let predictions_positive = classificator_positive.test(&test_values)?;
+        info!("Train DOWN model...");
+        let predictions_negative = classificator_negative.test(&test_values)?;
 
-            let predictions_positive = classificator_positive.test(&test_values)?;
-            let predictions_negative = classificator_negative.test(&test_values)?;
+        let n = predictions_positive.len();
+        info!("{n} predictions");
 
-            let n = predictions_positive.len();
-            info!("{n} predictions");
-
-            // Helper для получения нормированных рангов (от 0.0 до 1.0)
-            // Принимает вектор значений и признак инверсии (для негативного классификатора)
-            let get_normalized_ranks = |preds: &[f64], invert: bool| -> Vec<f64> {
-                // Храним пары (исходный_индекс, значение)
-                let mut indexed: Vec<(usize, f64)> = preds.iter()
-                    .enumerate()
-                    .map(|(i, &v)| if invert { (i, 1.0 - v) } else { (i, v) })
-                    .collect();
-
-                // Сортируем по значению (от худшего к лучшему)
-                indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-                // Записываем нормированный ранг на позицию исходного индекса
-                let mut ranks = vec![0.0; n];
-                for (rank_idx, &(original_idx, _)) in indexed.iter().enumerate() {
-                    // Ранг от 0.0 (худший результат) до 1.0 (лучший результат)
-                    ranks[original_idx] = rank_idx as f64 / (n as f64);
-                }
-                ranks
-            };
-
-            let ranks_pos = get_normalized_ranks(&predictions_positive, true);
-            debug!("ranks_pos: {:?}", &ranks_pos[0..32]);
-            let ranks_neg = get_normalized_ranks(&predictions_negative, false);
-            debug!("ranks_neg: {:?}", &ranks_neg[0..32]);
-
-            // 3. Комбинируем ранги через перемножение
-            let predictions: Vec<f64> = ranks_pos.iter()
-                .zip(ranks_neg.iter())
-                .map(|(&r_pos, &r_neg)| r_pos * (0.5 + 0.5 * r_neg))
+        // Helper для получения нормированных рангов (от 0.0 до 1.0)
+        // Принимает вектор значений и признак инверсии (для негативного классификатора)
+        let get_normalized_ranks = |preds: &[f64], invert: bool| -> Vec<f64> {
+            // Храним пары (исходный_индекс, значение)
+            let mut indexed: Vec<(usize, f64)> = preds.iter()
+                .enumerate()
+                .map(|(i, &v)| if invert { (i, 1.0 - v) } else { (i, v) })
                 .collect();
-            predictions_with_horizons.extend(
-                predictions.into_iter().zip(test_horizons.iter().copied())
-            );
-        }
 
-        train_diapason.from += TimeDelta::minutes(TEST_DIAPASON);
-        train_diapason.to += TimeDelta::minutes(TEST_DIAPASON);
-    }
+            // Сортируем по значению (от худшего к лучшему)
+            indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
 
-    let min = predictions_with_horizons.iter().map(|(p, _)| *p).reduce(f64::min).unwrap();
-    let max = predictions_with_horizons.iter().map(|(p, _)| *p).reduce(f64::max).unwrap();
-    info!("Min {min:?}, Max {max:?}");
+            // Записываем нормированный ранг на позицию исходного индекса
+            let mut ranks = vec![0.0; n];
+            for (rank_idx, &(original_idx, _)) in indexed.iter().enumerate() {
+                // Ранг от 0.0 (худший результат) до 1.0 (лучший результат)
+                ranks[original_idx] = rank_idx as f64 / (n as f64);
+            }
+            ranks
+        };
 
-    for i in 0..32 {
-        let threshold = min + (i + 1) as f64 * (max - min) / 33.0;
-        let (mut correct, mut incorrect) = (0, 0);
-        let (mut commission, mut pnl) = (0.0, 0.0);
-        for (prediction, horizon) in &predictions_with_horizons {
-            if *prediction > threshold {
-                if *horizon < 0.0 {
-                    correct += 1;
-                } else {
-                    incorrect += 1;
-                }
+        let ranks_pos = get_normalized_ranks(&predictions_positive, true);
+        debug!("ranks_pos: {:?}", &ranks_pos[0..32]);
+        let ranks_neg = get_normalized_ranks(&predictions_negative, false);
+        debug!("ranks_neg: {:?}", &ranks_neg[0..32]);
 
-                pnl += -horizon;
-                commission += 1.0;
+        // 3. Комбинируем ранги через перемножение
+        let predictions_gbm: Vec<f64> = ranks_pos.iter()
+            .zip(ranks_neg.iter())
+            .map(|(&r_pos, &r_neg)| r_pos * (0.5 + 0.5 * r_neg))
+            .collect();
+
+        const PERCENTILES: [f64; 4] = [0.97, 0.99, 0.993, 0.997];
+
+        for p_linear in PERCENTILES {
+            let threshold_linear = percentile(&predictions_linear, p_linear);
+            for p_up in PERCENTILES {
+                let threshold_up = percentile(&predictions_gbm, p_up);
+
+                let pnl_vec = predictions_linear.iter().zip(predictions_gbm.iter()).zip(test_horizons.iter())
+                    .filter(|((l, u), _)| **l >= threshold_linear && **u >= threshold_up)
+                    .map(|(_, pnl)| *pnl)
+                    .collect::<Vec<_>>();
+                let total_pnl = pnl_vec.iter().copied().sum::<f32>();
+                info!("Linear {p_linear}, Up {p_up} => {total_pnl}, {}", pnl_vec.len());
             }
         }
-        info!("Threshold {threshold}: {:.2}%, PnL {pnl}, commission {commission}, gross {}",
-            correct as f64 * 100.0 / (correct + incorrect) as f64, pnl - commission);
     }
 
     Ok(())
 }
+
+fn features_with_horizons(
+    events: &[OrderBookValues],
+    train_end: DateTime<Utc>,
+    derivatives_normalize: f64,
+    trend_tau: f64,
+    hold: TimeDelta,
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+    let mut window1 = FeaturesRollingWindow::new(
+        TimeDelta::milliseconds((1000.0 * derivatives_normalize) as i64),
+        TimeDelta::milliseconds((1000.0 * trend_tau) as i64),
+        &FEATURES_NAMES,
+        &FEATURES_OUTPUT,
+    );
+    let mut window2 = FeaturesRollingWindow::new(
+        TimeDelta::milliseconds((1000.0 * derivatives_normalize) as i64),
+        TimeDelta::milliseconds((1000.0 * trend_tau) as i64),
+        &FEATURES_NAMES,
+        &FEATURES_OUTPUT,
+    );
+
+    let mut train_features = Vec::new();
+    let mut test_features = Vec::new();
+    let mut train_horizons = Vec::new();
+    let mut test_horizons = Vec::new();
+
+    for (i, values) in events.iter().enumerate() {
+        let features = window1.process(values.to_features());
+
+        if let Some(h_values) = find_value_on_horizon(events, i, values.time + hold) {
+            let pnl = (h_values.bid - values.ask) as f32;
+
+            if values.time + hold <= train_end {
+                train_features.push(features);
+                train_horizons.push(pnl);
+            } else if values.time > train_end {
+                test_features.push(features);
+                test_horizons.push(pnl);
+            }
+        }
+    }
+    (train_features, test_features, train_horizons, test_horizons)
+}
+
 
 #[tokio::main]
 async fn _main() -> EmptyResult {
@@ -217,18 +262,6 @@ async fn _main() -> EmptyResult {
     Ok(())
 }
 
-pub fn filter_values_with_horizons(all_values: &[OrderBookValues], all_horizons: &[f64], diapason: TimeDiapason) -> (Vec<OrderBookValues>, Vec<f64>) {
-    all_values.iter().zip(all_horizons.iter())
-        .filter(|(v, _)| v.time >= diapason.from && v.time < diapason.to)
-        .map(|(v, h)| (v.clone(), *h))
-        .collect()
-}
-
-pub fn scale_prediction(data: &[f64], scale: f64) -> Option<Vec<f64>> {
-    Some(data.iter().copied().map(|x| {
-        x.clamp(-1.0, 1.0) * scale
-    }).collect())
-}
 fn build_horizon(values: &[OrderBookValues], hold: i32) -> Vec<f64> {
     let mut result = Vec::with_capacity(values.len());
 
@@ -289,30 +322,4 @@ async fn get_order_books(
         order_book_cache::write(ticker, diapason, &order_books, true)?;
         Ok(order_books)
     }
-}
-
-fn export_to_csv(filename: &str, order_book_values: &[OrderBookValues], horizons: &[f64]) -> Result<usize, CommonError> {
-    let mut file = File::create(filename)?;
-
-    writeln!(file, "timestamp_ms,imbalance_3,imbalance_5,imbalance_10,imbalance_20,imbalance_50,imbalance_derivative_norm_3,imbalance_derivative_norm_5,imbalance_derivative_norm_10,imbalance_derivative_norm_20,imbalance_derivative_norm_50,mid_price_minus_trend,mid_price_minus_trend_derivative_norm,horizon")?;
-
-    let mut written_count = 0;
-
-    for (i, book) in order_book_values.iter().enumerate() {
-        let timestamp_ms = book.time.timestamp_millis();
-        let imbalances = &book.imbalances;
-        let imbalances_derivatives = &book.imbalances_derivative;
-        writeln!(file, "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
-                 timestamp_ms,
-                 imbalances[0], imbalances[1], imbalances[2], imbalances[3], imbalances[4],
-                 imbalances_derivatives[0], imbalances_derivatives[1], imbalances_derivatives[2], imbalances_derivatives[3], imbalances_derivatives[4],
-                 book.trend_deviation,
-                 book.trend_deviation_derivative,
-                 horizons[i],
-        )?;
-
-        written_count += 1;
-    }
-
-    Ok(written_count)
 }
