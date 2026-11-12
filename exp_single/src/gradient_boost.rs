@@ -213,6 +213,7 @@ pub fn optimize_light_gbm (
         })?;
 
     let best = study.best_trial()?;
+    info!("{} best: {}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" }, best.value);
     let best_config = LightGBMConfig {
         learning_rate: best.get(&learning_rate_param),
         num_leaves: best.get(&num_leaves_param),

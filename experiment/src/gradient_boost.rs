@@ -44,7 +44,7 @@ pub struct GbdtConfig {
 impl GbdtConfig {
     pub fn to_config(&self) -> Config {
         let mut cfg = Config::new();
-        cfg.set_feature_size(24);
+        cfg.set_feature_size(26);
         cfg.set_debug(false);
         cfg.set_loss("LogLikelyhood");
 

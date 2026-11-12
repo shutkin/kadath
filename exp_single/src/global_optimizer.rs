@@ -1,10 +1,13 @@
 use crate::gradient_boost::{GradientBoost, MachineConfig, PredictionType};
+use crate::nelder_mead::calibrate_linear_signal;
 use crate::orderbook_values::OrderBookValues;
+use crate::{features_with_horizons, get_normalized_ranks};
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
+use chrono::{DateTime, TimeDelta, Utc};
 use log::{error, info};
-use model::common::TimeDiapason;
-use model::math_util::ExponentFunction;
+use model::TradeDirection;
+use model::math_util::{ExponentFunction, percentile};
 use ndarray::Array1;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -24,12 +27,12 @@ impl GlobalParams {
 }
 
 pub fn global_optimize(
-    machine_config: MachineConfig,
+    config_up: MachineConfig,
+    config_down: MachineConfig,
     prediction_type: PredictionType,
     values: &[OrderBookValues],
-    horizons: &[f64],
-    train_diapason: TimeDiapason,
-    test_diapason: TimeDiapason,
+    train_end: DateTime<Utc>,
+    hold_ms: u16,
 ) -> Option<GlobalParams> {
     let functions = [
         Some(ExponentFunction::find(40.0, 200.0, 800.0)),
@@ -37,12 +40,12 @@ pub fn global_optimize(
     ];
 
     let problem = GlobalProblem {
-        machine_config,
+        config_up,
+        config_down,
         prediction_type,
         values,
-        horizons,
-        train_diapason,
-        test_diapason,
+        train_end,
+        hold_ms,
         functions: &functions,
         count: AtomicU8::new(0)
     };
@@ -85,12 +88,12 @@ fn execute(problem: GlobalProblem, functions: &[Option<ExponentFunction>]) -> Op
 }
 
 struct GlobalProblem<'a> {
-    machine_config: MachineConfig,
+    config_up: MachineConfig,
+    config_down: MachineConfig,
     prediction_type: PredictionType,
     values: &'a [OrderBookValues],
-    horizons: &'a [f64],
-    train_diapason: TimeDiapason,
-    test_diapason: TimeDiapason,
+    train_end: DateTime<Utc>,
+    hold_ms: u16,
     functions: &'a [Option<ExponentFunction>],
     count: AtomicU8,
 }
@@ -101,20 +104,37 @@ impl CostFunction for GlobalProblem<'_> {
 
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
         let global = GlobalParams::from_param(param, self.functions);
-        let mut values = self.values.to_vec();
-        /*OrderBookValues::calculate_window_values(&mut values, global.derivatives_normalize, global.trend_tau);
 
-        let (train_values, train_horizons) = filter_values_with_horizons(&values, self.horizons, self.train_diapason);
-        let machine = GradientBoost::train(self.prediction_type, &self.machine_config, &train_values, &train_horizons).unwrap();
+        let (train_values, test_values, train_horizons, test_horizons) =
+            features_with_horizons(self.values, self.train_end, global, TimeDelta::milliseconds(self.hold_ms as i64), TradeDirection::Buy);
 
-        let (test_values, test_horizons) = filter_values_with_horizons(&values, self.horizons, self.test_diapason);
-        let predictions = machine.test(&test_values).unwrap();
+        let linear = calibrate_linear_signal(None, &train_values, &train_horizons).unwrap();
+        let predictions_linear = linear.test(&test_values);
 
-        let error = calculate_predictions_error(&predictions, &test_horizons, self.prediction_type);
+        //let up = GradientBoost::train(self.prediction_type, &self.config_up, &train_values, &train_horizons).unwrap();
+        //let predictions_up = up.test(&test_values).unwrap();
+        //let down = GradientBoost::train(self.prediction_type, &self.config_down, &train_values, &train_horizons).unwrap();
+        //let predictions_down = down.test(&test_values).unwrap();
+
+        //let n = predictions_up.len();
+        //let ranks_pos = get_normalized_ranks(&predictions_up, false, n);
+        //let ranks_neg = get_normalized_ranks(&predictions_down, true, n);
+
+        //let predictions_gbm: Vec<f64> = ranks_pos.iter()
+        //    .zip(ranks_neg.iter())
+        //    .map(|(&r_pos, &r_neg)| r_pos * (0.0 + 1.0 * r_neg))
+        //    .collect();
+
+        let threshold_linear = percentile(&predictions_linear, 0.96);
+        //let threshold_gbm = percentile(&predictions_gbm, 0.93);
+
+        let pnl = predictions_linear.iter().zip(test_horizons.iter())
+                .filter(|(p, _)| **p >= threshold_linear)
+                .map(|(_, pnl)| *pnl)
+                .sum::<f32>();
 
         let count = self.count.fetch_add(1, Ordering::Relaxed);
-        info!("{count}: {global:?} => {error}");
-        Ok(error)*/
-        Ok(0.0)
+        info!("{count}: {global:?} => {pnl}");
+        Ok(-pnl as f64)
     }
 }

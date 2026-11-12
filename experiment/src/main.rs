@@ -76,10 +76,10 @@ const FEATURES_OUTPUT: [OutputType; 13] = [
 ];
 const DERIVATIVE_NORM_DIAPASON: f64 = 57.28;
 const TREND_TAU: f64 = 614.61;
-pub const HORIZON_MS: u16 = 2000;
+pub const HORIZON_MS: u16 = 4000;
 const THRESHOLD: f32 = 5.0;
 
-const OPTIMIZE: bool = false;
+const OPTIMIZE: bool = true;
 const OPTIMIZE_GLOBAL_PARAMS: bool = false;
 
 #[tokio::main]
@@ -141,7 +141,7 @@ async fn main() -> EmptyResult {
             let test_clone = test_arc.clone();
             let test_h_clone = test_h_arc.clone();
             let h_up = thread::spawn(move || {
-                optimize_light_gbm(prediction_type_up, train_clone, train_h_clone, test_clone, test_h_clone)
+                optimize_gbdt(prediction_type_up, train_clone, train_h_clone, test_clone, test_h_clone)
             });
 
             let train_clone = train_arc.clone();
@@ -149,7 +149,7 @@ async fn main() -> EmptyResult {
             let test_clone = test_arc.clone();
             let test_h_clone = test_h_arc.clone();
             let h_profit = thread::spawn(move || {
-                optimize_light_gbm(prediction_type_profit, train_clone, train_h_clone, test_clone, test_h_clone)
+                optimize_gbdt(prediction_type_profit, train_clone, train_h_clone, test_clone, test_h_clone)
             });
 
             let cfg_up = h_up.join().unwrap()?;
