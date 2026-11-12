@@ -5,7 +5,7 @@ mod gradient_boost;
 mod nelder_mead;
 
 use crate::global_optimizer::{GlobalParams, global_optimize};
-use crate::gradient_boost::{GbdtConfig, GradientBoost, MachineConfig, PredictionType, optimize_gbdt};
+use crate::gradient_boost::{optimize_gbdt, optimize_light_gbm, GbdtConfig, GradientBoost, MachineConfig, PredictionType};
 use crate::nelder_mead::calibrate_linear_signal;
 use crate::orderbook_values::OrderBookValues;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -68,10 +68,10 @@ async fn main() -> EmptyResult {
 
     if OPTIMIZE_GBM {
         let diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-11-11T05:00:00Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-11-11T11:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-27T05:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-27T11:00:00Z")?.to_utc(),
         );
-        let train_end = DateTime::parse_from_rfc3339("2026-11-11T10:00:00Z")?.to_utc();
+        let train_end = DateTime::parse_from_rfc3339("2026-10-27T10:00:00Z")?.to_utc();
         let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
         info!("Got {} order book values", values.len());
         let (train_values, test_values, train_horizons, test_horizons) =
@@ -87,7 +87,7 @@ async fn main() -> EmptyResult {
         let test_values_clone = test_values_arc.clone();
         let test_horizons_clone = test_horizons_arc.clone();
         let h1 = thread::spawn(move || {
-            optimize_gbdt(positive, train_values_clone, train_horizons_clone, test_values_clone, test_horizons_clone)
+            optimize_light_gbm(positive, train_values_clone, train_horizons_clone, test_values_clone, test_horizons_clone)
         });
 
         let train_values_clone = train_values_arc.clone();
@@ -95,7 +95,7 @@ async fn main() -> EmptyResult {
         let test_values_clone = test_values_arc.clone();
         let test_horizons_clone = test_horizons_arc.clone();
         let h2 = thread::spawn(move || {
-            optimize_gbdt(negative, train_values_clone, train_horizons_clone, test_values_clone, test_horizons_clone)
+            optimize_light_gbm(negative, train_values_clone, train_horizons_clone, test_values_clone, test_horizons_clone)
         });
 
         let config = h1.join().unwrap()?;
@@ -112,10 +112,10 @@ async fn main() -> EmptyResult {
 
     if let Some(config_positive) = &config_positive && let Some(config_negative) = &config_negative {
         let diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-11-11T06:00:00Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-27T06:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-10-27T12:00:00Z")?.to_utc(),
         );
-        let train_end = DateTime::parse_from_rfc3339("2026-11-11T11:00:00Z")?.to_utc();
+        let train_end = DateTime::parse_from_rfc3339("2026-10-27T11:00:00Z")?.to_utc();
         let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
         info!("Got {} order book values", values.len());
 

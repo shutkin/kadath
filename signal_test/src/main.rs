@@ -6,7 +6,7 @@ use linfa_clustering::KMeans;
 use log::{LevelFilter, debug, error, info};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
-use model::math_util::{mean, median, p05_p95, p10_p90};
+use model::math_util::{mean};
 use model::{DataSource, Instrument, OrderBook, TradeDirection, order_book_cache};
 use ndarray::Array2;
 use plotters::prelude::*;
@@ -14,6 +14,7 @@ use rust_decimal::Decimal;
 use signal::{DealData, ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use simplelog::SimpleLogger;
 use std::collections::{HashMap, HashSet};
+use signal::gradient_boost::GbdtConfig;
 
 #[derive(Copy, Clone)]
 struct TestDeal {
@@ -21,45 +22,38 @@ struct TestDeal {
     open_index: usize,
     close_index: Option<usize>,
     open_time: DateTime<Utc>,
-    open_price1: (f64, f64),
-    open_price2: (f64, f64),
-    close_price1: Option<(f64, f64)>,
-    close_price2: Option<(f64, f64)>,
+    open_price: (f64, f64),
+    close_price: Option<(f64, f64)>,
 
     deal_data: DealData,
 }
 
 impl TestDeal {
-    fn open(prediction: (f64, f64), index: usize, book1: &OrderBook, book2: &OrderBook) -> Self {
-        let cur_time = book1.timestamp.max(book2.timestamp);
+    fn open(prediction: (f64, f64), index: usize, book: &OrderBook) -> Self {
+        let cur_time = book.timestamp;
         TestDeal {
             prediction,
             open_index: index,
             open_time: cur_time,
-            open_price1: (get_best_bid(book1).as_f64(), get_mid_price(book1).as_f64()),
-            open_price2: (get_best_ask(book2).as_f64(), get_mid_price(book2).as_f64()),
-            close_price1: None,
-            close_price2: None,
+            open_price: (get_best_ask(book).as_f64(), get_mid_price(book).as_f64()),
+            close_price: None,
             close_index: None,
-            deal_data: DealData::new(book1, book2, TradeDirection::Buy),
+            deal_data: DealData::new(book, TradeDirection::Buy),
         }
     }
 
-    fn close(&mut self, index: usize, book1: &OrderBook, book2: &OrderBook) {
-        if self.close_price1.is_some() {
+    fn close(&mut self, index: usize, book: &OrderBook) {
+        if self.close_price.is_some() {
             return;
         }
 
-        let cur_time = book1.timestamp.max(book2.timestamp);
         self.close_index = Some(index);
-
-        self.close_price1 = Some((get_best_ask(book1).as_f64(), get_mid_price(book1).as_f64()));
-        self.close_price2 = Some((get_best_bid(book2).as_f64(), get_mid_price(book2).as_f64()));
+        self.close_price = Some((get_best_ask(book).as_f64(), get_mid_price(book).as_f64()));
     }
 
     fn pnl(&self) -> (f64, f64) {
-        let real = self.open_price1.0 - self.close_price1.unwrap_or_default().0 + self.close_price2.unwrap_or_default().0 - self.open_price2.0;
-        let mid = self.open_price1.1 - self.close_price1.unwrap_or_default().1 + self.close_price2.unwrap_or_default().1 - self.open_price2.1;
+        let real = self.close_price.unwrap_or_default().0 - self.open_price.0;
+        let mid = self.close_price.unwrap_or_default().1 - self.open_price.1;
         (real, mid)
     }
 }
@@ -98,7 +92,7 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
 }
 
-const OPTIMIZED_CONFIGS: [&str; 0] = [
+const OPTIMIZED_CONFIGS: [(GbdtConfig, GbdtConfig); 0] = [
 ];
 
 #[tokio::main]
@@ -108,26 +102,25 @@ async fn main() -> EmptyResult {
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
     let db = Db::new(&db_url).await?;
 
-    let tickers = ["SiZ6", "SiH7"];
+    let ticker = "SiZ6";
 
     let all_instruments = db.get_instruments(DataSource::TInvest).await?;
-    let first_leg_id = find_instrument_id(&all_instruments, tickers[0]).ok_or("Failed to find instrument")?;
-    let second_leg_id = find_instrument_id(&all_instruments, tickers[1]).ok_or("Failed to find instrument")?;
+    let instrument_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to find instrument")?;
 
     let config = ModelConfig {
         derivatives_normalize_diapason_s: 57.28,
         trend_tau_s: 614.61,
-        train_buf_size: 285000,
-        train_min_size: 200000,
-        optimize_iterations: 20,
+        train_buf_size: 142000,
+        train_min_size: 100000,
+        optimize_iterations: 50,
         hold_time: TimeDelta::milliseconds(2000),
         expected_delta: 5.0,
-        prediction_percentile_linear: 0.996,
-        prediction_percentile_gbm: 0.9975,
+        prediction_percentile_linear: 0.96,
+        prediction_percentile_gbm: 0.93,
     };
 
     let mut window_data = WindowData::new(&config);
-    let model = WalkForwardModel::new(first_leg_id, second_leg_id, config);
+    let model = WalkForwardModel::new(instrument_id, config);
 
     let mut diapason = TimeDiapason::new(
         DateTime::parse_from_rfc3339("2026-10-22T05:00:00Z")?.to_utc(),
@@ -141,8 +134,6 @@ async fn main() -> EmptyResult {
 
     let mut do_not_trade_until = None;
 
-    let (mut last_book1, mut last_book2) = (None, None);
-
     let mut optimized_config_index = 0;
     let mut last_optimize_time = diapason.from;
     let mut last_train_time = diapason.from + TimeDelta::hours(6);
@@ -151,28 +142,19 @@ async fn main() -> EmptyResult {
         if !matches!(diapason.from.weekday().number_from_monday(), 6 | 7) {
             info!("DAY {}", diapason.from.date_naive());
 
-            let books1 = get_order_books(tickers[0], first_leg_id, diapason, Some(&db)).await?;
-            if books1.is_empty() {
+            let books = get_order_books(ticker, instrument_id, diapason, Some(&db)).await?;
+            if books.is_empty() {
                 diapason.from += TimeDelta::days(1);
                 diapason.to += TimeDelta::days(1);
                 continue;
             }
-            info!("{} {} order books", books1.len(), tickers[0]);
+            info!("{} {} order books", books.len(), ticker);
 
-            let books2 = get_order_books(tickers[1], second_leg_id, diapason, Some(&db)).await?;
-            info!("{} {} order books", books2.len(), tickers[1]);
-
-            let events = merge_events(&[first_leg_id, second_leg_id], &[&books1, &books2]);
+            let events = merge_events(&[instrument_id], &[&books]);
             debug!("Total events: {}", events.len());
 
             let mut prev_hour = events[0].order_book.timestamp.hour();
             for (i, event) in events.iter().enumerate() {
-                if event.instrument_id == first_leg_id {
-                    last_book1 = Some(event.order_book.clone());
-                } else if event.instrument_id == second_leg_id {
-                    last_book2 = Some(event.order_book.clone());
-                }
-
                 if event.order_book.timestamp.hour() != prev_hour {
                     prev_hour = event.order_book.timestamp.hour();
                     info!("Hour {prev_hour}");
@@ -192,36 +174,34 @@ async fn main() -> EmptyResult {
 
                 let signal = model.process(&mut window_data, event);
 
-                if let Some(book1) = &last_book1 && let Some(book2) = &last_book2 {
-                    if let Some(deal) = active_deal.as_mut() {
-                        if model.is_it_time_to_close_deal(book1, book2, &mut deal.deal_data) {
-                            deal.close(i, book1, book2);
-                            let pnl = deal.pnl();
-                            info!(
-                                "{} Prediction {:?}: {:?}",
-                                deal.open_time,
-                                deal.prediction,
-                                pnl,
-                            );
-                            if pnl.1 < -5.0 {
-                                do_not_trade_until = Some(event.order_book.timestamp + TimeDelta::minutes(4));
-                            }
-                            deals.push(*deal);
-                            if let Some(visualization) = build_deal_visualization(first_leg_id, second_leg_id, &events, deal) {
-                                deals_visualizations.push(visualization);
-                            }
-                            active_deal = None;
+                if let Some(deal) = active_deal.as_mut() {
+                    if model.is_it_time_to_close_deal(&event.order_book, &mut deal.deal_data) {
+                        deal.close(i, &event.order_book);
+                        let pnl = deal.pnl();
+                        info!(
+                            "{} Prediction {:?}: {:?}",
+                            deal.open_time,
+                            deal.prediction,
+                            pnl,
+                        );
+                        if pnl.1 < -5.0 {
+                            do_not_trade_until = Some(event.order_book.timestamp + TimeDelta::minutes(4));
                         }
-                    } else {
-                        let do_trade = do_not_trade_until
-                            .map(|until| event.order_book.timestamp > until)
-                            .unwrap_or(true);
-                        if do_trade {
-                            do_not_trade_until = None;
-                            if let TradeSignal::Sell(p0, p1) = signal {
-                                let deal = TestDeal::open((p0, p1), i, book1, book2);
-                                active_deal = Some(deal);
-                            }
+                        deals.push(*deal);
+                        if let Some(visualization) = build_deal_visualization(&events, deal) {
+                            deals_visualizations.push(visualization);
+                        }
+                        active_deal = None;
+                    }
+                } else {
+                    let do_trade = do_not_trade_until
+                        .map(|until| event.order_book.timestamp > until)
+                        .unwrap_or(true);
+                    if do_trade {
+                        do_not_trade_until = None;
+                        if let TradeSignal::Sell(p0, p1) = signal {
+                            let deal = TestDeal::open((p0, p1), i, &event.order_book);
+                            active_deal = Some(deal);
                         }
                     }
                 }
@@ -310,7 +290,7 @@ fn average_deal_visual(deals: &[Vec<f64>]) -> Result<Vec<(usize, Vec<f64>)>, Com
     Ok(result)
 }
 
-fn build_deal_visualization(first_leg_id: i32, second_leg_id: i32, events: &[OrderBookEvent], deal: &TestDeal) -> Option<Vec<f64>> {
+fn build_deal_visualization(events: &[OrderBookEvent], deal: &TestDeal) -> Option<Vec<f64>> {
     if let Some(close_index) = deal.close_index {
         let start = (deal.open_index as i32 - 1000).max(0) as usize;
         let end = (close_index + 5000).min(events.len() - 1);
@@ -319,18 +299,11 @@ fn build_deal_visualization(first_leg_id: i32, second_leg_id: i32, events: &[Ord
         let end_timestamp = (deal.open_time + TimeDelta::seconds(40)).timestamp_millis() / 500;
 
         let mut half_second_map = HashMap::new();
-        let (mut mid1, mut mid2) = (0.0, 0.0);
         for event in &events[start..=end] {
-            if event.instrument_id == first_leg_id {
-                mid1 = get_mid_price(&event.order_book);
-            } else if event.instrument_id == second_leg_id {
-                mid2 = get_mid_price(&event.order_book);
-            }
-
+            let mid = get_mid_price(&event.order_book);
             let t = event.order_book.timestamp.timestamp_millis() / 500;
-            if mid1 > 0.0 && mid2 > 0.0 && t >= start_timestamp && t <= end_timestamp {
-                let delta = mid2 - mid1;
-                half_second_map.entry(t).or_insert_with(Vec::new).push(delta);
+            if mid > 0.0 && t >= start_timestamp && t <= end_timestamp {
+                half_second_map.entry(t).or_insert_with(Vec::new).push(mid);
             }
         }
 
