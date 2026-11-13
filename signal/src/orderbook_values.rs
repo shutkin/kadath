@@ -52,7 +52,7 @@ impl OrderBookValues {
     pub fn to_features(&self) -> TimedFeatures {
         TimedFeatures {
             time: self.time,
-            features: vec![self.mid, self.imbalances[0], self.imbalances[1], self.imbalances[2], self.imbalances[3], self.imbalances[4]],
+            features: vec![self.mid, self.ask - self.bid, self.imbalances[0], self.imbalances[1], self.imbalances[2], self.imbalances[3], self.imbalances[4]],
         }
     }
     

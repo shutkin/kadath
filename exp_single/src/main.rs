@@ -3,6 +3,7 @@ mod charts;
 mod global_optimizer;
 mod gradient_boost;
 mod nelder_mead;
+mod trend_filter;
 
 use crate::global_optimizer::{GlobalParams, global_optimize};
 use crate::gradient_boost::{optimize_gbdt, optimize_light_gbm, GbdtConfig, GradientBoost, MachineConfig, PredictionType};
@@ -18,6 +19,7 @@ use model::{DataSource, Instrument, OrderBook, TradeDirection, order_book_cache}
 use simplelog::SimpleLogger;
 use std::sync::Arc;
 use std::thread;
+use crate::trend_filter::TrendFilter;
 
 const HOLD_TIME: i32 = 4_000;
 const TRAIN_DIAPASON: i64 = 5 * 60;
@@ -68,10 +70,10 @@ async fn main() -> EmptyResult {
 
     if OPTIMIZE_GBM {
         let diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-10-27T05:00:00Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-10-27T11:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-11-12T05:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-11-12T11:00:00Z")?.to_utc(),
         );
-        let train_end = DateTime::parse_from_rfc3339("2026-10-27T10:00:00Z")?.to_utc();
+        let train_end = DateTime::parse_from_rfc3339("2026-11-12T10:00:00Z")?.to_utc();
         let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
         info!("Got {} order book values", values.len());
         let (train_values, test_values, train_horizons, test_horizons) =
@@ -87,7 +89,7 @@ async fn main() -> EmptyResult {
         let test_values_clone = test_values_arc.clone();
         let test_horizons_clone = test_horizons_arc.clone();
         let h1 = thread::spawn(move || {
-            optimize_light_gbm(positive, train_values_clone, train_horizons_clone, test_values_clone, test_horizons_clone)
+            optimize_gbdt(positive, train_values_clone, train_horizons_clone, test_values_clone, test_horizons_clone)
         });
 
         let train_values_clone = train_values_arc.clone();
@@ -95,7 +97,7 @@ async fn main() -> EmptyResult {
         let test_values_clone = test_values_arc.clone();
         let test_horizons_clone = test_horizons_arc.clone();
         let h2 = thread::spawn(move || {
-            optimize_light_gbm(negative, train_values_clone, train_horizons_clone, test_values_clone, test_horizons_clone)
+            optimize_gbdt(negative, train_values_clone, train_horizons_clone, test_values_clone, test_horizons_clone)
         });
 
         let config = h1.join().unwrap()?;
@@ -112,10 +114,10 @@ async fn main() -> EmptyResult {
 
     if let Some(config_positive) = &config_positive && let Some(config_negative) = &config_negative {
         let diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-10-27T06:00:00Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-10-27T12:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-11-12T06:00:00Z")?.to_utc(),
+            DateTime::parse_from_rfc3339("2026-11-12T12:00:00Z")?.to_utc(),
         );
-        let train_end = DateTime::parse_from_rfc3339("2026-10-27T11:00:00Z")?.to_utc();
+        let train_end = DateTime::parse_from_rfc3339("2026-11-12T11:00:00Z")?.to_utc();
         let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
         info!("Got {} order book values", values.len());
 
@@ -149,19 +151,25 @@ async fn main() -> EmptyResult {
             .map(|(&r_pos, &r_neg)| r_pos * (0.0 + 1.0 * r_neg))
             .collect();
 
-        const PERCENTILES: [f64; 6] = [0.9, 0.93, 0.96, 0.99, 0.993, 0.997];
+        for trend_length in [0, 3, 5, 10] {
+            info!("Trend Filter length {trend_length:?}");
+            let mut trend_filter = TrendFilter::new(TradeDirection::Buy, trend_length);
+            let trend_filters = trend_filter.test(&values[values.len() - test_values.len()..]);
+            
+            const PERCENTILES: [f64; 6] = [0.9, 0.93, 0.96, 0.99, 0.993, 0.997];
 
-        for p_linear in PERCENTILES {
-            let threshold_linear = percentile(&predictions_linear, p_linear);
-            for p_up in PERCENTILES {
-                let threshold_gbm = percentile(&predictions_gbm, p_up);
+            for p_linear in PERCENTILES {
+                let threshold_linear = percentile(&predictions_linear, p_linear);
+                for p_up in PERCENTILES {
+                    let threshold_gbm = percentile(&predictions_gbm, p_up);
 
-                let pnl_vec = predictions_linear.iter().zip(predictions_gbm.iter()).zip(test_horizons.iter())
-                    .filter(|((l, gbm), _)| **l >= threshold_linear && **gbm >= threshold_gbm)
-                    .map(|(_, pnl)| *pnl)
-                    .collect::<Vec<_>>();
-                let total_pnl = pnl_vec.iter().copied().sum::<f32>();
-                info!("Linear {p_linear}, Up {p_up} => {total_pnl}, {}", pnl_vec.len());
+                    let pnl_vec = trend_filters.iter().zip(predictions_linear.iter()).zip(predictions_gbm.iter()).zip(test_horizons.iter())
+                        .filter(|(((tf, l), gbm), _)| **tf && **l >= threshold_linear && **gbm >= threshold_gbm)
+                        .map(|(_, pnl)| *pnl)
+                        .collect::<Vec<_>>();
+                    let total_pnl = pnl_vec.iter().copied().sum::<f32>();
+                    info!("Linear {p_linear}, Up {p_up} => {total_pnl}, {} ({})", pnl_vec.len(), total_pnl / pnl_vec.len() as f32);
+                }
             }
         }
     }

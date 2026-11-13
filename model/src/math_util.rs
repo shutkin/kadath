@@ -53,7 +53,19 @@ pub fn percentile(data: &[f64], percentile: f64) -> f64 {
 }
 
 pub fn mean(data: &[f64]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+
     data.iter().sum::<f64>() / data.len() as f64
+}
+
+pub fn mean_f32(data: &[f32]) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+
+    data.iter().sum::<f32>() / data.len() as f32
 }
 
 pub fn get_normalized_ranks(preds: &[f64], invert: bool) -> Vec<f64> {

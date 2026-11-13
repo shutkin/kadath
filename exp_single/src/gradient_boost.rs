@@ -248,7 +248,7 @@ pub fn optimize_gbdt (
     info!("Starting optimization");
     let study: Study<f64> = Study::new(optimizer::Direction::Maximize);
     study
-        .optimize(50, |trial: &mut optimizer::Trial| {
+        .optimize(30, |trial: &mut optimizer::Trial| {
             if let Some(max_depth) = max_depth_param.suggest(trial).ok()
                 && let Some(iterations) = iterations_param.suggest(trial).ok()
                 && let Some(shrinkage) = shrinkage_param.suggest(trial).ok()

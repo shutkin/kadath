@@ -3,6 +3,7 @@ extern crate core;
 pub mod orderbook_values;
 pub mod gradient_boost;
 mod nelder_mead;
+mod trend_filter;
 
 use crate::gradient_boost::{DataVec, GbdtConfig, GradientBoost, PredictionType, optimize_gbdt};
 use crate::nelder_mead::{LinearSignal, calibrate_linear_signal};
@@ -10,13 +11,14 @@ use crate::orderbook_values::OrderBookValues;
 use chrono::{DateTime, TimeDelta, Utc};
 use log::{error, info};
 use model::events::OrderBookEvent;
-use model::math_util::OutputType::{DerivativeNorm, Raw, TrendDeviation, TrendDeviationDerivativeNorm};
+use model::math_util::OutputType::{DerivativeNorm, Raw, StandardDeviation, TrendDeviation, TrendDeviationDerivativeNorm};
 use model::math_util::{FeaturesRollingWindow, get_normalized_ranks, percentile};
 use model::{OrderBook, TradeDirection};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use crate::trend_filter::TrendFilter;
 
-const LAST_PREDICTIONS_SIZE: usize = 50000;
+const LAST_PREDICTIONS_SIZE: usize = 25000;
 
 #[derive(Copy, Clone, Default)]
 pub enum TradeSignal {
@@ -37,6 +39,7 @@ pub struct ModelConfig {
     pub expected_delta: f32,
     pub prediction_percentile_linear: f64,
     pub prediction_percentile_gbm: f64,
+    pub trend_filter_length: f64,
 }
 
 pub struct WindowData {
@@ -45,6 +48,7 @@ pub struct WindowData {
     last_predictions_gbm: Vec<f64>,
     last_predictions_gbm_positive: Vec<f64>,
     last_predictions_gbm_negative: Vec<f64>,
+    trend_filter: TrendFilter,
 }
 
 impl WindowData {
@@ -52,10 +56,11 @@ impl WindowData {
         let window = FeaturesRollingWindow::new(
             TimeDelta::milliseconds((config.derivatives_normalize_diapason_s * 1000.0) as i64),
             TimeDelta::milliseconds((config.trend_tau_s * 1000.0) as i64),
-            &["mid", "i3", "i5", "i10", "i20", "i50"],
+            &["mid", "spread", "i3", "i5", "i10", "i20", "i50"],
             &[
                 TrendDeviation("mid"),
                 TrendDeviationDerivativeNorm("mid"),
+                StandardDeviation("spread"),
                 Raw("i3"),
                 Raw("i5"),
                 Raw("i10"),
@@ -74,6 +79,7 @@ impl WindowData {
             last_predictions_gbm: Vec::new(),
             last_predictions_gbm_negative: Vec::new(),
             last_predictions_gbm_positive: Vec::new(),
+            trend_filter: TrendFilter::new(TradeDirection::Buy, config.trend_filter_length),
         }
     }
 }
@@ -145,12 +151,23 @@ impl WalkForwardModel {
 
     pub fn is_it_time_to_close_deal(&self, book: &OrderBook, deal_data: &mut DealData) -> bool {
         let cur_time = book.timestamp;
+        
+        let cur_price = OrderBookValues::from_order_book(book).mid;
+        let is_loss = match deal_data.direction {
+            TradeDirection::Buy => cur_price < deal_data.open_price - 0.5,
+            TradeDirection::Sell => cur_price > deal_data.max_trend + 0.5,
+        };
+        if is_loss {
+            return true;
+        }
+        
         cur_time > deal_data.open_time + self.config.hold_time
     }
 
     pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {
         let price;
         let features;
+        let is_filtered_by_trend;
         if self.instrument_id == event.instrument_id {
             let book = OrderBookValues::from_order_book(&event.order_book);
             price = PriceHistory {
@@ -159,6 +176,7 @@ impl WalkForwardModel {
                 bid: book.bid as f32,
             };
             features = window_data.window.process(book.to_features());
+            is_filtered_by_trend = window_data.trend_filter.process(&book);
         } else {
             return TradeSignal::None;
         };
@@ -181,7 +199,7 @@ impl WalkForwardModel {
 
         if let Ok(read) = self.gbm_positive.read()
             && let Some(booster) = read.as_ref() {
-            match booster.test(&[features.clone()]) {
+            match booster.test(std::slice::from_ref(&features)) {
                 Ok(predictions) => {
                     prediction_gbm_positive = predictions.into_iter().next();
                 }
@@ -228,7 +246,7 @@ impl WalkForwardModel {
                 window_data.last_predictions_gbm.remove(0);
                 window_data.last_predictions_linear.remove(0);
 
-                if prediction_linear >= linear_threshold && prediction_gbm >= gbm_threshold {
+                if is_filtered_by_trend && prediction_linear >= linear_threshold && prediction_gbm >= gbm_threshold {
                     return TradeSignal::Sell(prediction_linear, prediction_gbm)
                 }
             }
@@ -295,8 +313,8 @@ impl WalkForwardModel {
             let features = self.features_buffer.lock()
                 .map(|buf| buf[..horizons.len()].to_vec());
 
-            let cfg_positive = self.gbm_config_positive.read().map(|cfg| cfg.clone());
-            let cfg_negative = self.gbm_config_negative.read().map(|cfg| cfg.clone());
+            let cfg_positive = self.gbm_config_positive.read().map(|cfg| *cfg);
+            let cfg_negative = self.gbm_config_negative.read().map(|cfg| *cfg);
             if let Ok(Some(cfg_positive)) = cfg_positive
                 && let Ok(Some(cfg_negative)) = cfg_negative
                 && let Ok(features_train) = features {
@@ -399,8 +417,8 @@ impl WalkForwardModel {
                     if let Ok(mut write_positive) = self.gbm_config_positive.write() {
                         *write_positive = Some(positive)
                     }
-                    if let Ok(mut write_positive) = self.gbm_config_positive.write() {
-                        *write_positive = Some(positive)
+                    if let Ok(mut write_negative) = self.gbm_config_negative.write() {
+                        *write_negative = Some(negative)
                     }
                     info!("New GBM configs saved");
                     return true;
