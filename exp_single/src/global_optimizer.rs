@@ -1,10 +1,10 @@
 use crate::gradient_boost::{GradientBoost, MachineConfig, PredictionType};
 use crate::nelder_mead::calibrate_linear_signal;
 use crate::orderbook_values::OrderBookValues;
-use crate::{get_features_with_horizons, get_normalized_ranks};
+use crate::{get_features_with_horizons};
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use log::{error, info};
 use model::TradeDirection;
 use model::math_util::{ExponentFunction, percentile};
@@ -32,7 +32,7 @@ pub fn global_optimize(
     prediction_type: PredictionType,
     values: &[OrderBookValues],
     train_end: DateTime<Utc>,
-    hold_ms: u16,
+    hold_ms: f64,
 ) -> Option<GlobalParams> {
     let functions = [
         Some(ExponentFunction::find(40.0, 200.0, 800.0)),
@@ -93,7 +93,7 @@ struct GlobalProblem<'a> {
     prediction_type: PredictionType,
     values: &'a [OrderBookValues],
     train_end: DateTime<Utc>,
-    hold_ms: u16,
+    hold_ms: f64,
     functions: &'a [Option<ExponentFunction>],
     count: AtomicU8,
 }
@@ -105,7 +105,7 @@ impl CostFunction for GlobalProblem<'_> {
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
         let global = GlobalParams::from_param(param, self.functions);
 
-        let fh = get_features_with_horizons(self.values, self.train_end, global, TimeDelta::milliseconds(self.hold_ms as i64), TradeDirection::Buy);
+        let fh = get_features_with_horizons(self.values, self.train_end, global, self.hold_ms, TradeDirection::Buy);
 
         let linear = calibrate_linear_signal(None, &fh.train_features, &fh.train_horizons).unwrap();
         let predictions_linear = linear.test(&fh.test_features);

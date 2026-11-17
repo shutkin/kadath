@@ -86,8 +86,9 @@ impl ScoreProvider for HorizonProblem {
         if count < 8 {
             f32::NEG_INFINITY
         } else {
-            debug!("Linear score: {sum}");
-            sum
+            let score = sum - count as f32;
+            debug!("Linear score: {score}");
+            score
         }
     }
 }

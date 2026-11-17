@@ -4,7 +4,7 @@ use linfa::DatasetBase;
 use linfa::prelude::{Fit, Predict};
 use linfa_clustering::KMeans;
 use log::{debug, error, info, LevelFilter};
-use model::common::{CommonError, EmptyResult, TimeDiapason};
+use model::common::{CommonError, EmptyResult, PredictionDebugInfo, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
 use model::math_util::mean;
 use model::{DataSource, Instrument, OrderBook, TradeDirection, order_book_cache};
@@ -22,7 +22,7 @@ use signal::orderbook_values::OrderBookValues;
 
 #[derive(Copy, Clone)]
 struct TestDeal {
-    prediction: (f64, f64),
+    prediction_info: PredictionDebugInfo,
     horizon: f64,
     open_index: usize,
     close_index: Option<usize>,
@@ -34,10 +34,10 @@ struct TestDeal {
 }
 
 impl TestDeal {
-    fn open(prediction: (f64, f64), horizon: f64, index: usize, book: &OrderBook) -> Self {
+    fn open(prediction_info: PredictionDebugInfo, horizon: f64, index: usize, book: &OrderBook) -> Self {
         let cur_time = book.timestamp;
         TestDeal {
-            prediction,
+            prediction_info,
             horizon,
             open_index: index,
             open_time: cur_time,
@@ -130,8 +130,8 @@ async fn main() -> EmptyResult {
         optimize_iterations: 30,
         hold_time: TimeDelta::milliseconds(14144),
         expected_delta: 4.88,
-        prediction_percentile_linear: 0.8,// 0.9952885296720112,
-        prediction_percentile_gbm: 0.93,// 0.9295626462672655,
+        prediction_percentile_linear: 0.99,
+        prediction_percentile_gbm: 0.95,
         trend_filter_length: 5.0,// 2.242490085551831,
     };
 
@@ -181,7 +181,13 @@ async fn main() -> EmptyResult {
     let (pnl, deals, visualizations) = rolling_test(&events, instrument_id, config, diapason, end);
     info!("Total pnl {pnl} on {deals} deals");
 
-    match average_deal_visual(&visualizations) {
+    for (i, visualization) in visualizations.iter().enumerate() {
+        if let Err(err) = visualize_deal(visualization, &format!("Deal {i}"), &format!("deal_{i}.png")) {
+            error!("Failed to print deals visualisation {err}");
+        }
+    }
+
+    /*match average_deal_visual(&visualizations) {
         Ok(visualizations) => {
             for (i, (deals, data)) in visualizations.iter().enumerate() {
                 if let Err(err) = visualize_deal(data, &format!("{deals} deals"), &format!("deals_{i}.png")) {
@@ -192,7 +198,7 @@ async fn main() -> EmptyResult {
         Err(err) => {
             error!("Average deal visualizations failed: {err}");
         }
-    }
+    }*/
 
     Ok(())
 }
@@ -347,6 +353,9 @@ fn rolling_test(
                         && model.train(event.order_book.timestamp) {
                         last_train_time = event.order_book.timestamp;
                         train_index += 1;
+                        if train_index == 2 {
+                            break;
+                        }
                     }
 
                     let signal = model.process(&mut window_data, event);
@@ -356,15 +365,15 @@ fn rolling_test(
                         && let Some(horizon) = get_horizon_pnl(events, i, event.order_book.timestamp + config.hold_time) {
                         cur_horizon = horizon;
                         match signal {
-                            TradeSignal::None(filter, prediction_linear, prediction_gbm) => {
-                                if prediction_linear >= 0.0 && prediction_gbm >= 0.0 {
-                                    predictions.push((event.order_book.timestamp, filter, prediction_linear, prediction_gbm, horizon));
+                            TradeSignal::None(info) => {
+                                if info.linear_ranked >= 0.0 && info.gbm_ranked >= 0.0 {
+                                    predictions.push((event.order_book.timestamp, info, horizon));
                                 }
                             }
-                            TradeSignal::Sell(_, _) => {}
-                            TradeSignal::Buy(prediction_linear, prediction_gbm) => {
-                                if prediction_linear >= 0.0 && prediction_gbm >= 0.0 {
-                                    predictions.push((event.order_book.timestamp, true, prediction_linear, prediction_gbm, horizon));
+                            TradeSignal::Sell(_) => {}
+                            TradeSignal::Buy(info) => {
+                                if info.linear_ranked >= 0.0 && info.gbm_ranked >= 0.0 {
+                                    predictions.push((event.order_book.timestamp, info, horizon));
                                 }
                             }
                         }
@@ -375,9 +384,9 @@ fn rolling_test(
                             deal.close(i, &event.order_book);
                             let pnl = deal.pnl();
                             info!(
-                                "{} Prediction {:?}: {:?}, horizon {}",
+                                "{} {:?}: {:?}, horizon {}",
                                 deal.open_time,
-                                deal.prediction,
+                                deal.prediction_info,
                                 pnl,
                                 deal.horizon,
                             );
@@ -396,8 +405,8 @@ fn rolling_test(
                             .unwrap_or(true);
                         if do_trade {
                             do_not_trade_until = None;
-                            if let TradeSignal::Buy(p0, p1) = signal {
-                                let deal = TestDeal::open((p0, p1), cur_horizon, i, &event.order_book);
+                            if let TradeSignal::Buy(info) = signal {
+                                let deal = TestDeal::open(info, cur_horizon, i, &event.order_book);
                                 active_deal = Some(deal);
                             }
                         }
@@ -595,12 +604,14 @@ async fn get_order_books(ticker: &str, id: i32, diapason: TimeDiapason, db: Opti
     }
 }
 
-fn save_predictions_csv(data: &[(DateTime<Utc>, bool, f64, f64, f64)], filename: &str) -> Result<(), CommonError> {
+fn save_predictions_csv(data: &[(DateTime<Utc>, PredictionDebugInfo, f64)], filename: &str) -> Result<(), CommonError> {
     let mut csv = Vec::with_capacity(data.len() + 1);
-    csv.push("time,trend_filter,linear,gbm,horizon".to_string());
+    csv.push("time,trend_filter,linear,gbm positive,gbm negative,linear ranked,gbm ranked,horizon".to_string());
 
-    for (time, filter, linear, gbm, horizon) in data {
-        csv.push(format!("{time},{filter},{linear:.6},{gbm:.6},{horizon:.1}"));
+    for (time, info, horizon) in data {
+        csv.push(format!("{time},{},{:.6},{:.6},{:.6},{:.6},{:.6},{horizon:.1}",
+                         info.is_filtered_by_trend, info.linear_raw, info.gbm_positive_raw,
+                         info.gbm_negative_raw, info.linear_ranked, info.gbm_ranked));
     }
 
     std::fs::write(filename, csv.join("\n"))?;

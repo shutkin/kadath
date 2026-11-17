@@ -68,7 +68,7 @@ pub fn mean_f32(data: &[f32]) -> f32 {
     data.iter().sum::<f32>() / data.len() as f32
 }
 
-pub fn get_normalized_ranks(preds: &[f64], invert: bool) -> Vec<f64> {
+pub fn get_normalized_rank(preds: &[f64], invert: bool) -> f64 {
     let size = preds.len();
     
     // Храним пары (исходный_индекс, значение)
@@ -80,13 +80,13 @@ pub fn get_normalized_ranks(preds: &[f64], invert: bool) -> Vec<f64> {
     // Сортируем по значению (от худшего к лучшему)
     indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
 
-    // Записываем нормированный ранг на позицию исходного индекса
-    let mut ranks = vec![0.0; size];
-    for (rank_idx, &(original_idx, _)) in indexed.iter().enumerate() {
-        // Ранг от 0.0 (худший результат) до 1.0 (лучший результат)
-        ranks[original_idx] = rank_idx as f64 / (size as f64);
-    }
-    ranks
+    let rank = indexed.iter().enumerate()
+        .find(|(_, (original_idx, _))| {
+            *original_idx == size - 1
+        })
+        .map(|(idx, _)| idx)
+        .unwrap_or_default();
+    rank as f64 / size as f64
 }
 
 

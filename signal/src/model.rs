@@ -12,36 +12,14 @@ use chrono::{DateTime, TimeDelta, Utc};
 use log::{error, info};
 use model::events::OrderBookEvent;
 use model::math_util::OutputType::{DerivativeNorm, Raw, StandardDeviation, TrendDeviation, TrendDeviationDerivativeNorm};
-use model::math_util::{FeaturesRollingWindow, get_normalized_ranks, percentile};
+use model::math_util::{get_normalized_rank, FeaturesRollingWindow};
 use model::{OrderBook, TradeDirection};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use model::common::PredictionDebugInfo;
 use crate::trend_filter::TrendFilter;
 
 const LAST_PREDICTIONS_SIZE: usize = 25000;
-
-#[derive(Copy, Clone, Debug)]
-pub struct PredictionDebugInfo {
-    pub is_filtered_by_trend: bool,
-    pub linear_raw: f64,
-    pub gbm_positive_raw: f64,
-    pub gbm_negative_raw: f64,
-    pub linear_ranked: f64,
-    pub gbm_ranked: f64,
-}
-
-impl Default for PredictionDebugInfo {
-    fn default() -> Self {
-        Self {
-            is_filtered_by_trend: false,
-            linear_raw: 0.0,
-            gbm_negative_raw: 0.0,
-            gbm_positive_raw: 0.0,
-            linear_ranked: -1.0,
-            gbm_ranked: -1.0,
-        }
-    }
-}
 
 #[derive(Copy, Clone)]
 pub enum TradeSignal {
@@ -178,14 +156,14 @@ impl WalkForwardModel {
     pub fn is_it_time_to_close_deal(&self, book: &OrderBook, deal_data: &mut DealData) -> bool {
         let cur_time = book.timestamp;
         
-        let cur_price = OrderBookValues::from_order_book(book).mid;
+        /*let cur_price = OrderBookValues::from_order_book(book).mid;
         let is_loss = match deal_data.direction {
             TradeDirection::Buy => cur_price < deal_data.open_price - 0.5,
             TradeDirection::Sell => cur_price > deal_data.open_price + 0.5,
         };
         if is_loss {
             return true;
-        }
+        }*/
         
         cur_time > deal_data.open_time + self.config.hold_time
     }
@@ -193,8 +171,8 @@ impl WalkForwardModel {
     pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {
         let price;
         let features;
+        let is_filtered_by_trend;
 
-        let mut is_filtered_by_trend = false;
         let mut prediction_debug = PredictionDebugInfo::default();
 
         if self.instrument_id == event.instrument_id {
@@ -205,14 +183,12 @@ impl WalkForwardModel {
                 bid: book.bid as f32,
             };
             features = window_data.window.process(book.to_features());
-            is_filtered_by_trend = window_data.trend_filter.process(&book);
+            window_data.trend_filter.process(&book);
+            is_filtered_by_trend = true;
+            prediction_debug.is_filtered_by_trend = is_filtered_by_trend;
         } else {
             return TradeSignal::None(PredictionDebugInfo::default());
         };
-
-        let mut prediction_gbm_positive_opt = None;
-        let mut prediction_gbm_negative_opt = None;
-        let mut prediction_linear_opt = None;
 
         if let Ok(mut lock) = self.features_buffer.lock() {
             lock.push(features.clone());
@@ -220,6 +196,10 @@ impl WalkForwardModel {
         if let Ok(mut lock) = self.prices_buffer.lock() {
             lock.push(price);
         }
+
+        let mut prediction_gbm_positive_opt = None;
+        let mut prediction_gbm_negative_opt = None;
+        let mut prediction_linear_opt = None;
 
         if let Ok(read) = self.linear_signal.read()
             && let Some(linear) = read.as_ref() {
@@ -257,13 +237,18 @@ impl WalkForwardModel {
             window_data.last_predictions_gbm_positive.push(prediction_gbm_positive_raw);
             window_data.last_predictions_gbm_negative.push(prediction_gbm_negative_raw);
 
-            if window_data.last_predictions_linear.len() == LAST_PREDICTIONS_SIZE {
-                let ranks = get_normalized_ranks(&window_data.last_predictions_linear, false);
-                let prediction_linear = ranks[ranks.len() - 1];
+            prediction_debug.linear_raw = prediction_linear_raw;
+            prediction_debug.gbm_positive_raw = prediction_gbm_positive_raw;
+            prediction_debug.gbm_negative_raw = prediction_gbm_negative_raw;
 
-                let ranks_positive = get_normalized_ranks(&window_data.last_predictions_gbm_positive, false);
-                let ranks_negative = get_normalized_ranks(&window_data.last_predictions_gbm_negative, true);
-                let prediction_gbm = ranks_positive[ranks_positive.len() - 1] * ranks_negative[ranks_negative.len() - 1];
+            if window_data.last_predictions_linear.len() == LAST_PREDICTIONS_SIZE {
+                let prediction_linear = get_normalized_rank(&window_data.last_predictions_linear, false);
+                let positive_ranked = get_normalized_rank(&window_data.last_predictions_gbm_positive, false);
+                let negative_ranked = get_normalized_rank(&window_data.last_predictions_gbm_negative, true);
+                let prediction_gbm = positive_ranked * (0.75 + 0.25 * negative_ranked);
+
+                prediction_debug.linear_ranked = prediction_linear;
+                prediction_debug.gbm_ranked = prediction_gbm;
 
                 window_data.last_predictions_gbm_positive.remove(0);
                 window_data.last_predictions_gbm_negative.remove(0);
@@ -272,12 +257,12 @@ impl WalkForwardModel {
                 if is_filtered_by_trend
                     && prediction_linear >= self.config.prediction_percentile_linear
                     && prediction_gbm >= self.config.prediction_percentile_gbm {
-                    return TradeSignal::Buy(prediction_linear, prediction_gbm)
+                    return TradeSignal::Buy(prediction_debug)
                 }
             }
         }
 
-        TradeSignal::None(is_filtered_by_trend, prediction_linear, prediction_gbm)
+        TradeSignal::None(prediction_debug)
     }
 
     fn get_price_on_horizon(&self, prices: &[PriceHistory], index: usize) -> Option<(f32, f32)> {
