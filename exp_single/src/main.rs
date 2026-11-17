@@ -11,7 +11,7 @@ use crate::nelder_mead::calibrate_linear_signal;
 use crate::orderbook_values::OrderBookValues;
 use chrono::{DateTime, TimeDelta, Utc};
 use db::Db;
-use log::{LevelFilter, info};
+use log::{error, info, LevelFilter};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::math_util::OutputType::{DerivativeNorm, Raw, StandardDeviation, TrendDeviation, TrendDeviationDerivativeNorm};
 use model::math_util::{get_normalized_ranks, percentile, FeaturesRollingWindow, OutputType};
@@ -63,7 +63,6 @@ async fn main() -> EmptyResult {
     let all_instruments = db.get_instruments(DataSource::TInvest).await?;
     let inst_id = find_instrument_id(&all_instruments, ticker).expect("Instrument not found");
 
-    //let global_params = GlobalParams { derivatives_normalize: 185.1804471910355, trend_tau: 207.2308381991384 };
     //let global_params = GlobalParams { derivatives_normalize: 57.28, trend_tau: 614.61 };
     let global_params = GlobalParams { derivatives_normalize: 434.58, trend_tau: 49.9 };
 
@@ -155,37 +154,44 @@ async fn main() -> EmptyResult {
         let mut best_threshold_linear = 0.0;
         let mut best_threshold_gbm = 0.0;
 
-        for trend_length in [0.0, 2.25, 5.0, 10.0] {
-            info!("Trend Filter length {trend_length:?}");
-            let mut trend_filter = TrendFilter::new(TradeDirection::Buy, trend_length);
-            let trend_filters = trend_filter.test(&values[values.len() - fh.test_features.len()..]);
-            
-            const PERCENTILES: [f64; 6] = [0.9, 0.93, 0.96, 0.99, 0.993, 0.997];
+        let trend_length = 5.0;
+        //for trend_length in [0.0, 2.25, 5.0, 10.0] {
+        info!("Trend Filter length {trend_length:?}");
+        let mut trend_filter = TrendFilter::new(TradeDirection::Buy, trend_length);
+        let trend_filters = trend_filter.test(&values[values.len() - fh.test_features.len()..]);
 
-            for p_linear in PERCENTILES {
-                let threshold_linear = p_linear;// percentile(&predictions_linear, p_linear);
-                for p_gbm in PERCENTILES {
-                    let threshold_gbm = p_gbm;// percentile(&ranks_gbm, p_gbm);
+        let predictions = trend_filters.iter().skip(NORMALIZE_WINDOW_SIZE)
+            .zip(ranks_linear.iter())
+            .zip(ranks_gbm.iter())
+            .zip(fh.test_horizons.iter().skip(NORMALIZE_WINDOW_SIZE))
+            .zip(fh.test_timestamps.iter().skip(NORMALIZE_WINDOW_SIZE))
+            .map(|((((trend, linear), gbm), horizon), timestamp)| {
+                (*timestamp, *trend, *linear, *gbm, *horizon)
+            })
+            .collect::<Vec<_>>();
+        if let Err(err) = save_predictions_csv(&predictions, "experimental_predictions.csv") {
+            error!("Error saving predictions csv: {err}");
+        }
 
-                    let pnl_vec = trend_filters.iter().skip(NORMALIZE_WINDOW_SIZE)
-                        .zip(ranks_linear.iter())
-                        .zip(ranks_gbm.iter())
-                        .zip(fh.test_horizons.iter().skip(NORMALIZE_WINDOW_SIZE))
-                        .filter(|(((tf, l), gbm), _)| **tf && **l >= threshold_linear && **gbm >= threshold_gbm)
-                        .map(|(_, pnl)| *pnl)
-                        .collect::<Vec<_>>();
-                    let total_pnl = pnl_vec.iter().copied().sum::<f32>();
-                    info!("Linear {p_linear}, GBM {p_gbm} => {total_pnl}, {} ({})", pnl_vec.len(), total_pnl / pnl_vec.len() as f32);
+        const PERCENTILES: [f64; 6] = [0.8, 0.9, 0.93, 0.96, 0.99, 0.993];
+        for threshold_linear in PERCENTILES {
+            for threshold_gbm in PERCENTILES {
+                let pnls = predictions.iter()
+                    .filter(|(_, trend, linear, gbm, _)| *trend && *linear >= threshold_linear && *gbm >= threshold_gbm)
+                    .map(|(_, _, _, _, horizon)| *horizon)
+                    .collect::<Vec<_>>();
+                let total_pnl = pnls.iter().copied().sum::<f32>();
+                info!("Linear {threshold_linear}, GBM {threshold_gbm} => {total_pnl}, {} ({})", pnls.len(), total_pnl / pnls.len() as f32);
 
-                    let score = total_pnl - pnl_vec.len() as f32;
-                    if score > best_score {
-                        best_score = score;
-                        best_trend_length = trend_length;
-                        best_threshold_linear = threshold_linear;
-                        best_threshold_gbm = threshold_gbm;
-                    }
+                let score = total_pnl - pnls.len() as f32;
+                if score > best_score {
+                    best_score = score;
+                    best_trend_length = trend_length;
+                    best_threshold_linear = threshold_linear;
+                    best_threshold_gbm = threshold_gbm;
                 }
             }
+            //}
         }
 
         info!("Best score {best_score} on trend_length {best_trend_length}, threshold_linear {best_threshold_linear}, threshold_gbm {best_threshold_gbm}");
@@ -205,6 +211,19 @@ fn rolling_normalize(x: &[f64], invert: bool) -> Vec<f64> {
     }
 
     result
+}
+
+fn save_predictions_csv(data: &[(DateTime<Utc>, bool, f64, f64, f32)], filename: &str) -> Result<(), CommonError> {
+    let mut csv = Vec::with_capacity(data.len() + 1);
+    csv.push("time,trend_filter,linear,gbm,horizon".to_string());
+
+    for (time, filter, linear, gbm, horizon) in data {
+        csv.push(format!("{time},{filter},{linear:.6},{gbm:.6},{horizon:.1}"));
+    }
+
+    std::fs::write(filename, csv.join("\n"))?;
+
+    Ok(())
 }
 
 struct FeaturesWithHorizons {

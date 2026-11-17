@@ -18,10 +18,12 @@ use signal::gradient_boost::GbdtConfig;
 use signal::{DealData, ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use std::collections::{HashMap, HashSet};
 use simplelog::SimpleLogger;
+use signal::orderbook_values::OrderBookValues;
 
 #[derive(Copy, Clone)]
 struct TestDeal {
     prediction: (f64, f64),
+    horizon: f64,
     open_index: usize,
     close_index: Option<usize>,
     open_time: DateTime<Utc>,
@@ -32,10 +34,11 @@ struct TestDeal {
 }
 
 impl TestDeal {
-    fn open(prediction: (f64, f64), index: usize, book: &OrderBook) -> Self {
+    fn open(prediction: (f64, f64), horizon: f64, index: usize, book: &OrderBook) -> Self {
         let cur_time = book.timestamp;
         TestDeal {
             prediction,
+            horizon,
             open_index: index,
             open_time: cur_time,
             open_price: (get_best_ask(book).as_f64(), get_mid_price(book).as_f64()),
@@ -127,7 +130,7 @@ async fn main() -> EmptyResult {
         optimize_iterations: 30,
         hold_time: TimeDelta::milliseconds(14144),
         expected_delta: 4.88,
-        prediction_percentile_linear: 0.93,// 0.9952885296720112,
+        prediction_percentile_linear: 0.8,// 0.9952885296720112,
         prediction_percentile_gbm: 0.93,// 0.9295626462672655,
         trend_filter_length: 5.0,// 2.242490085551831,
     };
@@ -321,8 +324,9 @@ fn rolling_test(
     let mut do_not_trade_until = None;
 
     let mut optimized_config_index = 0;
+    let mut train_index = 0;
     let mut last_optimize_time = diapason.from;
-    let mut last_train_time = diapason.from + TimeDelta::hours(6);
+    let mut last_train_time = diapason.from + TimeDelta::hours(5);
 
     let mut predictions = Vec::new();
 
@@ -339,22 +343,29 @@ fn rolling_test(
                         optimized_config_index += 1;
                     }
 
-                    if last_train_time < event.order_book.timestamp - TimeDelta::minutes(30)
+                    if last_train_time < event.order_book.timestamp - TimeDelta::minutes(120)
                         && model.train(event.order_book.timestamp) {
                         last_train_time = event.order_book.timestamp;
+                        train_index += 1;
                     }
 
                     let signal = model.process(&mut window_data, event);
-                    match signal {
-                        TradeSignal::None(filter, prediction_linear, prediction_gbm) => {
-                            if prediction_linear >= 0.0 && prediction_gbm >= 0.0 {
-                                predictions.push((event.order_book.timestamp, filter, prediction_linear, prediction_gbm));
+                    let mut cur_horizon = f64::NAN;
+
+                    if train_index == 1
+                        && let Some(horizon) = get_horizon_pnl(events, i, event.order_book.timestamp + config.hold_time) {
+                        cur_horizon = horizon;
+                        match signal {
+                            TradeSignal::None(filter, prediction_linear, prediction_gbm) => {
+                                if prediction_linear >= 0.0 && prediction_gbm >= 0.0 {
+                                    predictions.push((event.order_book.timestamp, filter, prediction_linear, prediction_gbm, horizon));
+                                }
                             }
-                        }
-                        TradeSignal::Sell(_, _) => {}
-                        TradeSignal::Buy(prediction_linear, prediction_gbm) => {
-                            if prediction_linear >= 0.0 && prediction_gbm >= 0.0 {
-                                predictions.push((event.order_book.timestamp, true, prediction_linear, prediction_gbm));
+                            TradeSignal::Sell(_, _) => {}
+                            TradeSignal::Buy(prediction_linear, prediction_gbm) => {
+                                if prediction_linear >= 0.0 && prediction_gbm >= 0.0 {
+                                    predictions.push((event.order_book.timestamp, true, prediction_linear, prediction_gbm, horizon));
+                                }
                             }
                         }
                     }
@@ -364,10 +375,11 @@ fn rolling_test(
                             deal.close(i, &event.order_book);
                             let pnl = deal.pnl();
                             info!(
-                                "{} Prediction {:?}: {:?}",
+                                "{} Prediction {:?}: {:?}, horizon {}",
                                 deal.open_time,
                                 deal.prediction,
                                 pnl,
+                                deal.horizon,
                             );
                             if pnl.1 < -5.0 {
                                 do_not_trade_until = Some(event.order_book.timestamp + TimeDelta::minutes(4));
@@ -385,7 +397,7 @@ fn rolling_test(
                         if do_trade {
                             do_not_trade_until = None;
                             if let TradeSignal::Buy(p0, p1) = signal {
-                                let deal = TestDeal::open((p0, p1), i, &event.order_book);
+                                let deal = TestDeal::open((p0, p1), cur_horizon, i, &event.order_book);
                                 active_deal = Some(deal);
                             }
                         }
@@ -418,6 +430,25 @@ fn rolling_test(
     }
     
     (pnl, deals.len(), deals_visualizations)
+}
+
+fn get_horizon_pnl(events: &[OrderBookEvent], index: usize, target_time: DateTime<Utc>) -> Option<f64> {
+    if let Some(horizon_values) = find_value_on_horizon(events, index, target_time) {
+        let cur_values = OrderBookValues::from_order_book(&events[index].order_book);
+        Some(horizon_values.bid - cur_values.ask)
+    } else {
+        None
+    }
+}
+
+fn find_value_on_horizon(events: &[OrderBookEvent], mut index: usize, target_time: DateTime<Utc>) -> Option<OrderBookValues> {
+    while index < events.len() {
+        if events[index].order_book.timestamp >= target_time {
+            return Some(OrderBookValues::from_order_book(&events[index].order_book));
+        }
+        index += 1;
+    }
+    None
 }
 
 fn average_deal_visual(deals: &[Vec<f64>]) -> Result<Vec<(usize, Vec<f64>)>, CommonError> {
@@ -564,12 +595,12 @@ async fn get_order_books(ticker: &str, id: i32, diapason: TimeDiapason, db: Opti
     }
 }
 
-fn save_predictions_csv(data: &[(DateTime<Utc>, bool, f64, f64)], filename: &str) -> Result<(), CommonError> {
+fn save_predictions_csv(data: &[(DateTime<Utc>, bool, f64, f64, f64)], filename: &str) -> Result<(), CommonError> {
     let mut csv = Vec::with_capacity(data.len() + 1);
-    csv.push("time,trend_filter,linear,gbm".to_string());
+    csv.push("time,trend_filter,linear,gbm,horizon".to_string());
 
-    for (time, filter, linear, gbm) in data {
-        csv.push(format!("{time},{filter},{linear:.6},{gbm:.6}"));
+    for (time, filter, linear, gbm, horizon) in data {
+        csv.push(format!("{time},{filter},{linear:.6},{gbm:.6},{horizon:.1}"));
     }
 
     std::fs::write(filename, csv.join("\n"))?;

@@ -20,16 +20,39 @@ use crate::trend_filter::TrendFilter;
 
 const LAST_PREDICTIONS_SIZE: usize = 25000;
 
+#[derive(Copy, Clone, Debug)]
+pub struct PredictionDebugInfo {
+    pub is_filtered_by_trend: bool,
+    pub linear_raw: f64,
+    pub gbm_positive_raw: f64,
+    pub gbm_negative_raw: f64,
+    pub linear_ranked: f64,
+    pub gbm_ranked: f64,
+}
+
+impl Default for PredictionDebugInfo {
+    fn default() -> Self {
+        Self {
+            is_filtered_by_trend: false,
+            linear_raw: 0.0,
+            gbm_negative_raw: 0.0,
+            gbm_positive_raw: 0.0,
+            linear_ranked: -1.0,
+            gbm_ranked: -1.0,
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub enum TradeSignal {
-    None(bool, f64, f64),
-    Sell(f64, f64),
-    Buy(f64, f64),
+    None(PredictionDebugInfo),
+    Sell(PredictionDebugInfo),
+    Buy(PredictionDebugInfo),
 }
 
 impl Default for TradeSignal {
     fn default() -> Self {
-        TradeSignal::None(false, -1.0, -1.0)
+        TradeSignal::None(PredictionDebugInfo::default())
     }
 }
 
@@ -155,14 +178,14 @@ impl WalkForwardModel {
     pub fn is_it_time_to_close_deal(&self, book: &OrderBook, deal_data: &mut DealData) -> bool {
         let cur_time = book.timestamp;
         
-        /*let cur_price = OrderBookValues::from_order_book(book).mid;
+        let cur_price = OrderBookValues::from_order_book(book).mid;
         let is_loss = match deal_data.direction {
             TradeDirection::Buy => cur_price < deal_data.open_price - 0.5,
             TradeDirection::Sell => cur_price > deal_data.open_price + 0.5,
         };
         if is_loss {
             return true;
-        }*/
+        }
         
         cur_time > deal_data.open_time + self.config.hold_time
     }
@@ -172,8 +195,7 @@ impl WalkForwardModel {
         let features;
 
         let mut is_filtered_by_trend = false;
-        let mut prediction_linear = -1.0;
-        let mut prediction_gbm = -1.0;
+        let mut prediction_debug = PredictionDebugInfo::default();
 
         if self.instrument_id == event.instrument_id {
             let book = OrderBookValues::from_order_book(&event.order_book);
@@ -185,7 +207,7 @@ impl WalkForwardModel {
             features = window_data.window.process(book.to_features());
             is_filtered_by_trend = window_data.trend_filter.process(&book);
         } else {
-            return TradeSignal::None(is_filtered_by_trend, prediction_linear, prediction_gbm);
+            return TradeSignal::None(PredictionDebugInfo::default());
         };
 
         let mut prediction_gbm_positive_opt = None;
@@ -228,37 +250,28 @@ impl WalkForwardModel {
             }
         }
 
-        if let Some(prediction_linear_real) = prediction_linear_opt
-            && let Some(prediction_gbm_positive) = prediction_gbm_positive_opt
-            && let Some(prediction_gbm_negative) = prediction_gbm_negative_opt {
-
-            window_data.last_predictions_gbm_positive.push(prediction_gbm_positive);
-            window_data.last_predictions_gbm_negative.push(prediction_gbm_negative);
-            prediction_gbm = if window_data.last_predictions_gbm_positive.len() > 3 {
-                let ranks_positive = get_normalized_ranks(&window_data.last_predictions_gbm_positive, false);
-                let ranks_negative = get_normalized_ranks(&window_data.last_predictions_gbm_negative, true);
-                ranks_positive[ranks_positive.len() - 1] * ranks_negative[ranks_negative.len() - 1]
-            } else {
-                0.0
-            };
-
-            window_data.last_predictions_linear.push(prediction_linear_real);
-            prediction_linear = if window_data.last_predictions_linear.len() > 3 {
-                let ranks = get_normalized_ranks(&window_data.last_predictions_linear, false);
-                ranks[ranks.len() - 1]
-            } else {
-                0.0
-            };
+        if let Some(prediction_linear_raw) = prediction_linear_opt
+            && let Some(prediction_gbm_positive_raw) = prediction_gbm_positive_opt
+            && let Some(prediction_gbm_negative_raw) = prediction_gbm_negative_opt {
+            window_data.last_predictions_linear.push(prediction_linear_raw);
+            window_data.last_predictions_gbm_positive.push(prediction_gbm_positive_raw);
+            window_data.last_predictions_gbm_negative.push(prediction_gbm_negative_raw);
 
             if window_data.last_predictions_linear.len() == LAST_PREDICTIONS_SIZE {
-                let linear_threshold = self.config.prediction_percentile_linear;// percentile(&window_data.last_predictions_linear, self.config.prediction_percentile_linear);
-                let gbm_threshold = self.config.prediction_percentile_gbm;// percentile(&window_data.last_predictions_gbm, self.config.prediction_percentile_gbm);
+                let ranks = get_normalized_ranks(&window_data.last_predictions_linear, false);
+                let prediction_linear = ranks[ranks.len() - 1];
+
+                let ranks_positive = get_normalized_ranks(&window_data.last_predictions_gbm_positive, false);
+                let ranks_negative = get_normalized_ranks(&window_data.last_predictions_gbm_negative, true);
+                let prediction_gbm = ranks_positive[ranks_positive.len() - 1] * ranks_negative[ranks_negative.len() - 1];
 
                 window_data.last_predictions_gbm_positive.remove(0);
                 window_data.last_predictions_gbm_negative.remove(0);
                 window_data.last_predictions_linear.remove(0);
 
-                if is_filtered_by_trend && prediction_linear >= linear_threshold && prediction_gbm >= gbm_threshold {
+                if is_filtered_by_trend
+                    && prediction_linear >= self.config.prediction_percentile_linear
+                    && prediction_gbm >= self.config.prediction_percentile_gbm {
                     return TradeSignal::Buy(prediction_linear, prediction_gbm)
                 }
             }
