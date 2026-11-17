@@ -3,7 +3,7 @@ use db::Db;
 use linfa::DatasetBase;
 use linfa::prelude::{Fit, Predict};
 use linfa_clustering::KMeans;
-use log::{LevelFilter, debug, info};
+use log::{debug, error, info, LevelFilter};
 use model::common::{CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
 use model::math_util::mean;
@@ -17,6 +17,7 @@ use rust_decimal::Decimal;
 use signal::gradient_boost::GbdtConfig;
 use signal::{DealData, ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use std::collections::{HashMap, HashSet};
+use simplelog::SimpleLogger;
 
 #[derive(Copy, Clone)]
 struct TestDeal {
@@ -50,7 +51,7 @@ impl TestDeal {
         }
 
         self.close_index = Some(index);
-        self.close_price = Some((get_best_ask(book).as_f64(), get_mid_price(book).as_f64()));
+        self.close_price = Some((get_best_bid(book).as_f64(), get_mid_price(book).as_f64()));
     }
 
     fn pnl(&self) -> (f64, f64) {
@@ -94,11 +95,107 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
 }
 
-const OPTIMIZED_CONFIGS: [(GbdtConfig, GbdtConfig); 0] = [
+const OPTIMIZED_CONFIGS: [(GbdtConfig, GbdtConfig); 3] = [
+    (
+        GbdtConfig { max_depth: 7, iterations: 98, shrinkage: 0.0053386633647191485, min_leaf_size: 378, data_sample_ratio: 0.7917056472120758, feature_sample_ratio: 0.5066184969063494 },
+        GbdtConfig { max_depth: 6, iterations: 95, shrinkage: 0.005878415064157608, min_leaf_size: 243, data_sample_ratio: 0.6650489555889336, feature_sample_ratio: 0.8102900523207806 },
+    ),
+    (
+        GbdtConfig { max_depth: 7, iterations: 98, shrinkage: 0.0053386633647191485, min_leaf_size: 378, data_sample_ratio: 0.7917056472120758, feature_sample_ratio: 0.5066184969063494 },
+        GbdtConfig { max_depth: 6, iterations: 95, shrinkage: 0.005878415064157608, min_leaf_size: 243, data_sample_ratio: 0.6650489555889336, feature_sample_ratio: 0.8102900523207806 },
+    ),
+    (
+        GbdtConfig { max_depth: 7, iterations: 98, shrinkage: 0.0053386633647191485, min_leaf_size: 378, data_sample_ratio: 0.7917056472120758, feature_sample_ratio: 0.5066184969063494 },
+        GbdtConfig { max_depth: 6, iterations: 95, shrinkage: 0.005878415064157608, min_leaf_size: 243, data_sample_ratio: 0.6650489555889336, feature_sample_ratio: 0.8102900523207806 },
+    ),
 ];
 
 #[tokio::main]
 async fn main() -> EmptyResult {
+    dotenv::dotenv().ok();
+    SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
+    let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
+    let db = Db::new(&db_url).await?;
+
+    let ticker = "SiZ6";
+
+    let config = ModelConfig {
+        derivatives_normalize_diapason_s: 434.57978286751774,
+        trend_tau_s: 49.90139948829677,
+        train_buf_size: 138000,
+        train_min_size: 100000,
+        optimize_iterations: 30,
+        hold_time: TimeDelta::milliseconds(14144),
+        expected_delta: 4.88,
+        prediction_percentile_linear: 0.93,// 0.9952885296720112,
+        prediction_percentile_gbm: 0.93,// 0.9295626462672655,
+        trend_filter_length: 5.0,// 2.242490085551831,
+    };
+
+    /*let config = ModelConfig {
+        derivatives_normalize_diapason_s: 57.28,
+        trend_tau_s: 614.61,
+        train_buf_size: 142000,
+        train_min_size: 100000,
+        optimize_iterations: 30,
+        hold_time: TimeDelta::milliseconds(4000),
+        expected_delta: 5.0,
+        prediction_percentile_linear: 0.993,
+        prediction_percentile_gbm: 0.99,
+        trend_filter_length: 0.0,
+    };*/
+
+    let diapason = TimeDiapason::new(
+        DateTime::parse_from_rfc3339("2026-11-13T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-11-13T20:00:00Z")?.to_utc(),
+    );
+    let end = DateTime::parse_from_rfc3339("2026-11-14T00:00:00Z")?.to_utc();
+
+    let all_instruments = db.get_instruments(DataSource::TInvest).await?;
+    let instrument_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to find instrument")?;
+    let mut events = HashMap::new();
+    let mut d = diapason;
+    while d.from < end {
+        if !matches!(d.from.weekday().number_from_monday(), 6 | 7) {
+            info!("DAY {}", d.from.date_naive());
+
+            let books = get_order_books(ticker, instrument_id, d, Some(&db)).await?;
+            if books.is_empty() {
+                d.from += TimeDelta::days(1);
+                d.to += TimeDelta::days(1);
+                continue;
+            }
+            info!("{} {} order books", books.len(), ticker);
+
+            let day_events = merge_events(&[instrument_id], &[&books]);
+            debug!("Total events: {}", day_events.len());
+            events.insert(d.from.date_naive(), day_events);
+
+            d.from += TimeDelta::days(1);
+            d.to += TimeDelta::days(1);
+        }
+    }
+    let (pnl, deals, visualizations) = rolling_test(&events, instrument_id, config, diapason, end);
+    info!("Total pnl {pnl} on {deals} deals");
+
+    match average_deal_visual(&visualizations) {
+        Ok(visualizations) => {
+            for (i, (deals, data)) in visualizations.iter().enumerate() {
+                if let Err(err) = visualize_deal(data, &format!("{deals} deals"), &format!("deals_{i}.png")) {
+                    error!("Failed to print deals visualisation {err}");
+                }
+            }
+        }
+        Err(err) => {
+            error!("Average deal visualizations failed: {err}");
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn _main() -> EmptyResult {
     dotenv::dotenv().ok();
     setup_logging("config_opt.log")?;
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
@@ -130,10 +227,10 @@ async fn main() -> EmptyResult {
     let mut events = HashMap::new();
     let mut d = diapason;
     while d.from < end {
-        if !matches!(diapason.from.weekday().number_from_monday(), 6 | 7) {
-            info!("DAY {}", diapason.from.date_naive());
+        if !matches!(d.from.weekday().number_from_monday(), 6 | 7) {
+            info!("DAY {}", d.from.date_naive());
 
-            let books = get_order_books(ticker, instrument_id, diapason, Some(&db)).await?;
+            let books = get_order_books(ticker, instrument_id, d, Some(&db)).await?;
             if books.is_empty() {
                 d.from += TimeDelta::days(1);
                 d.to += TimeDelta::days(1);
@@ -152,7 +249,7 @@ async fn main() -> EmptyResult {
 
     let derivatives_normalize_diapason_s = FloatParam::new(15.0, 600.0).name("derivatives_normalize_diapason_s").log_scale();
     let trend_tau_s = FloatParam::new(30.0, 1200.0).name("trend_tau_s").log_scale();
-    let hold_time = IntParam::new(500, 15000).name("hold_time").log_scale();
+    let hold_time = IntParam::new(1000, 15000).name("hold_time").log_scale();
     let expected_delta = FloatParam::new(1.0, 10.0).name("expected_delta");
     let prediction_percentile_linear = FloatParam::new(10.0, 500.0).name("prediction_percentile_linear").log_scale();
     let prediction_percentile_gbm = FloatParam::new(10.0, 500.0).name("prediction_percentile_linear").log_scale();
@@ -207,19 +304,6 @@ async fn main() -> EmptyResult {
     };
     info!("Best config: {best_config:?}");
 
-    /*match average_deal_visual(&deals_visualizations) {
-        Ok(visualizations) => {
-            for (i, (deals, data)) in visualizations.iter().enumerate() {
-                if let Err(err) = visualize_deal(data, &format!("{deals} deals"), &format!("deals_{i}.png")) {
-                    error!("Failed to print deals visualisation {err}");
-                }
-            }
-        }
-        Err(err) => {
-            error!("Average deal visualizations failed: {err}");
-        }
-    }*/
-
     Ok(())
 }
 
@@ -240,6 +324,8 @@ fn rolling_test(
     let mut last_optimize_time = diapason.from;
     let mut last_train_time = diapason.from + TimeDelta::hours(6);
 
+    let mut predictions = Vec::new();
+
     while diapason.from < end {
         if !matches!(diapason.from.weekday().number_from_monday(), 6 | 7) {
             info!("DAY {}", diapason.from.date_naive());
@@ -254,11 +340,24 @@ fn rolling_test(
                     }
 
                     if last_train_time < event.order_book.timestamp - TimeDelta::minutes(30)
-                        && model.train() {
+                        && model.train(event.order_book.timestamp) {
                         last_train_time = event.order_book.timestamp;
                     }
 
                     let signal = model.process(&mut window_data, event);
+                    match signal {
+                        TradeSignal::None(filter, prediction_linear, prediction_gbm) => {
+                            if prediction_linear >= 0.0 && prediction_gbm >= 0.0 {
+                                predictions.push((event.order_book.timestamp, filter, prediction_linear, prediction_gbm));
+                            }
+                        }
+                        TradeSignal::Sell(_, _) => {}
+                        TradeSignal::Buy(prediction_linear, prediction_gbm) => {
+                            if prediction_linear >= 0.0 && prediction_gbm >= 0.0 {
+                                predictions.push((event.order_book.timestamp, true, prediction_linear, prediction_gbm));
+                            }
+                        }
+                    }
 
                     if let Some(deal) = active_deal.as_mut() {
                         if model.is_it_time_to_close_deal(&event.order_book, &mut deal.deal_data) {
@@ -285,7 +384,7 @@ fn rolling_test(
                             .unwrap_or(true);
                         if do_trade {
                             do_not_trade_until = None;
-                            if let TradeSignal::Sell(p0, p1) = signal {
+                            if let TradeSignal::Buy(p0, p1) = signal {
                                 let deal = TestDeal::open((p0, p1), i, &event.order_book);
                                 active_deal = Some(deal);
                             }
@@ -313,6 +412,10 @@ fn rolling_test(
     }
     info!("Total PnL {pnl}, PnL per deal {}", pnl / deals.len() as f64);
     info!("Positives {positives}, negatives {negatives}, neutrals {neutrals}");
+
+    if let Err(err) = save_predictions_csv(&predictions, "signal_test_predictions.csv") {
+        error!("Error while saving predictions csv: {err}");
+    }
     
     (pnl, deals.len(), deals_visualizations)
 }
@@ -459,4 +562,17 @@ async fn get_order_books(ticker: &str, id: i32, diapason: TimeDiapason, db: Opti
         order_book_cache::write(ticker, diapason, &order_books, true)?;
         Ok(order_books)
     }
+}
+
+fn save_predictions_csv(data: &[(DateTime<Utc>, bool, f64, f64)], filename: &str) -> Result<(), CommonError> {
+    let mut csv = Vec::with_capacity(data.len() + 1);
+    csv.push("time,trend_filter,linear,gbm".to_string());
+
+    for (time, filter, linear, gbm) in data {
+        csv.push(format!("{time},{filter},{linear:.6},{gbm:.6}"));
+    }
+
+    std::fs::write(filename, csv.join("\n"))?;
+
+    Ok(())
 }

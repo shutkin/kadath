@@ -1,7 +1,7 @@
 use gbdt::config::Config;
 use gbdt::decision_tree::Data;
 use gbdt::gradient_boost::GBDT;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use model::common::CommonError;
 use model::math_util::percentile;
 use optimizer::Study;
@@ -125,7 +125,6 @@ pub fn optimize_gbdt (
     let data_sample_ratio = FloatParam::new(0.5, 1.0).name("data sample ratio");
     let feature_sample_ratio = FloatParam::new(0.5, 1.0).name("feature sample ratio");
 
-    info!("Starting optimization");
     let study: Study<f64> = Study::new(optimizer::Direction::Maximize);
     study
         .optimize(iterations, |trial: &mut optimizer::Trial| {
@@ -150,7 +149,6 @@ pub fn optimize_gbdt (
         })?;
 
     let best = study.best_trial()?;
-    info!("{} best: {}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" }, best.value);
     let config = GbdtConfig {
         max_depth: best.get(&max_depth_param).ok_or("max_depth")?,
         iterations: best.get(&iterations_param).ok_or("iterations")?,
@@ -159,6 +157,7 @@ pub fn optimize_gbdt (
         data_sample_ratio: best.get(&data_sample_ratio).ok_or("data_sample_ratio")?,
         feature_sample_ratio: best.get(&feature_sample_ratio).ok_or("feature_sample_ratio")?,
     };
+    info!("{} best: {} {config:?}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" }, best.value);
     Ok(config)
 }
 
@@ -181,7 +180,7 @@ fn check(
             optimizer::Error::Internal("Failed to test LightGBM")
         })?;
     let score = calculate_predictions_brier(&predictions, test_horizons, prediction_type);
-    info!("{} {config:?}: {score}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" });
+    debug!("{} {config:?}: {score}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" });
     Ok::<_, optimizer::Error>(score)
 }
 

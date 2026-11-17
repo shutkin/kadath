@@ -11,10 +11,10 @@ pub struct TrendFilter {
 }
 
 impl TrendFilter {
-    pub fn new(direction: TradeDirection, length_seconds: u16) -> Self {
+    pub fn new(direction: TradeDirection, length_seconds: f64) -> Self {
         Self {
             direction,
-            length: TimeDelta::seconds(length_seconds as i64),
+            length: TimeDelta::milliseconds((1000.0 * length_seconds) as i64),
             buffer_prices: Vec::new(),
             buffer_times: Vec::new(),
         }

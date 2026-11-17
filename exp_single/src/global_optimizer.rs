@@ -1,7 +1,7 @@
 use crate::gradient_boost::{GradientBoost, MachineConfig, PredictionType};
 use crate::nelder_mead::calibrate_linear_signal;
 use crate::orderbook_values::OrderBookValues;
-use crate::{features_with_horizons, get_normalized_ranks};
+use crate::{get_features_with_horizons, get_normalized_ranks};
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -105,11 +105,10 @@ impl CostFunction for GlobalProblem<'_> {
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
         let global = GlobalParams::from_param(param, self.functions);
 
-        let (train_values, test_values, train_horizons, test_horizons) =
-            features_with_horizons(self.values, self.train_end, global, TimeDelta::milliseconds(self.hold_ms as i64), TradeDirection::Buy);
+        let fh = get_features_with_horizons(self.values, self.train_end, global, TimeDelta::milliseconds(self.hold_ms as i64), TradeDirection::Buy);
 
-        let linear = calibrate_linear_signal(None, &train_values, &train_horizons).unwrap();
-        let predictions_linear = linear.test(&test_values);
+        let linear = calibrate_linear_signal(None, &fh.train_features, &fh.train_horizons).unwrap();
+        let predictions_linear = linear.test(&fh.test_features);
 
         //let up = GradientBoost::train(self.prediction_type, &self.config_up, &train_values, &train_horizons).unwrap();
         //let predictions_up = up.test(&test_values).unwrap();
@@ -128,7 +127,7 @@ impl CostFunction for GlobalProblem<'_> {
         let threshold_linear = percentile(&predictions_linear, 0.96);
         //let threshold_gbm = percentile(&predictions_gbm, 0.93);
 
-        let pnl = predictions_linear.iter().zip(test_horizons.iter())
+        let pnl = predictions_linear.iter().zip(fh.test_horizons.iter())
                 .filter(|(p, _)| **p >= threshold_linear)
                 .map(|(_, pnl)| *pnl)
                 .sum::<f32>();
