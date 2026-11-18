@@ -5,7 +5,7 @@ pub mod gradient_boost;
 mod nelder_mead;
 mod trend_filter;
 
-use crate::gradient_boost::{DataVec, GbdtConfig, GradientBoost, PredictionType, optimize_gbdt};
+use crate::gradient_boost::{optimize_light_gbm, DataVec, GradientBoost, PredictionType};
 use crate::nelder_mead::{LinearSignal, calibrate_linear_signal};
 use crate::orderbook_values::OrderBookValues;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -16,7 +16,8 @@ use model::math_util::{get_normalized_rank, FeaturesRollingWindow};
 use model::{OrderBook, TradeDirection};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use model::common::PredictionDebugInfo;
+use serde_json::Value;
+use model::common::{export_features_to_csv, PredictionDebugInfo};
 use crate::trend_filter::TrendFilter;
 
 const LAST_PREDICTIONS_SIZE: usize = 25000;
@@ -125,9 +126,9 @@ struct PriceHistory {
 pub struct WalkForwardModel {
     instrument_id: i32,
     config: ModelConfig,
-    gbm_config_positive: Arc<RwLock<Option<GbdtConfig>>>,
+    gbm_config_positive: Arc<RwLock<Option<Value>>>,
     gbm_positive: Arc<RwLock<Option<GradientBoost>>>,
-    gbm_config_negative: Arc<RwLock<Option<GbdtConfig>>>,
+    gbm_config_negative: Arc<RwLock<Option<Value>>>,
     gbm_negative: Arc<RwLock<Option<GradientBoost>>>,
     linear_signal: Arc<RwLock<Option<LinearSignal>>>,
     features_buffer: Arc<Mutex<Vec<Vec<f32>>>>,
@@ -278,13 +279,16 @@ impl WalkForwardModel {
         None
     }
 
-    fn get_horizons(&self, direction: TradeDirection) -> Vec<f32> {
+    fn get_horizons(&self, direction: TradeDirection) -> (Vec<f32>, f64) {
         self.prices_buffer.lock()
             .map(|prices| {
                 if prices.len() < self.config.train_min_size {
-                    Vec::new()
+                    (Vec::new(), 1.0)
                 } else {
                     let mut horizons = Vec::with_capacity(prices.len());
+
+                    let millis = (prices[prices.len() - 1].time - prices[0].time).num_milliseconds();
+                    let events_per_hold = self.config.hold_time.num_milliseconds() as f64 * prices.len() as f64 / millis as f64;
                     
                     for (i, price) in prices.iter().enumerate() {
                         if let Some((h_ask, h_bid)) = self.get_price_on_horizon(&prices, i) {
@@ -295,12 +299,12 @@ impl WalkForwardModel {
                             horizons.push(pnl);
                         }
                     }
-                    horizons
+                    (horizons, events_per_hold)
                 } 
             }).unwrap_or_default()
     }
 
-    fn train_gbm(features: &[Vec<f32>], horizons: &[f32], cfg: GbdtConfig, prediction_type: PredictionType) -> Option<GradientBoost> {
+    fn do_gbm_training(features: &[Vec<f32>], horizons: &[f32], cfg: Value, prediction_type: PredictionType) -> Option<GradientBoost> {
         match GradientBoost::train(
             prediction_type,
             &cfg,
@@ -318,24 +322,39 @@ impl WalkForwardModel {
         }
     }
 
-    pub fn train(&self, cur_time: DateTime<Utc>) -> bool {
-        self.shrink_buffer();
-
-        let horizons = self.get_horizons(TradeDirection::Buy);
+    pub fn train_linear(&self) -> bool {
+        let (horizons, events_per_hold) = self.get_horizons(TradeDirection::Buy);
         if horizons.len() >= self.config.train_min_size {
             let features = self.features_buffer.lock()
                 .map(|buf| buf[..horizons.len()].to_vec());
 
-            let cfg_positive = self.gbm_config_positive.read().map(|cfg| *cfg);
-            let cfg_negative = self.gbm_config_negative.read().map(|cfg| *cfg);
+            if let Ok(features_train) = features {
+                let prev = self.linear_signal.read().ok().and_then(|s| s.clone());
+                let linear = calibrate_linear_signal(prev.as_ref(), &features_train, &horizons, events_per_hold as usize);
+                if let Some(linear) = linear && let Ok(mut write) = self.linear_signal.write() {
+                    *write = Some(linear);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn train_gbm(&self, cur_time: DateTime<Utc>) -> bool {
+        self.shrink_buffer();
+
+        let (horizons, _) = self.get_horizons(TradeDirection::Buy);
+        if horizons.len() >= self.config.train_min_size {
+            let features = self.features_buffer.lock()
+                .map(|buf| buf[..horizons.len()].to_vec());
+
+            let cfg_positive = self.gbm_config_positive.read().map(|cfg| cfg.clone());
+            let cfg_negative = self.gbm_config_negative.read().map(|cfg| cfg.clone());
             if let Ok(Some(cfg_positive)) = cfg_positive
                 && let Ok(Some(cfg_negative)) = cfg_negative
                 && let Ok(features_train) = features {
 
-                let linear = calibrate_linear_signal(None, &features_train, &horizons);
-                if let Some(linear) = linear && let Ok(mut write) = self.linear_signal.write() {
-                    *write = Some(linear);
-                }
+                //export_features_to_csv(&features_train, &horizons, "signal_train_data.csv");
 
                 info!("Start training on {} events", features_train.len());
                 let features_arc = Arc::new(features_train);
@@ -345,11 +364,11 @@ impl WalkForwardModel {
                 let features_clone = features_arc.clone();
                 let horizons_clone = horizons_arc.clone();
                 let h_positive = thread::spawn(move || {
-                    Self::train_gbm(features_clone.as_ref(), horizons_clone.as_ref(), cfg_positive, PredictionType::ClassificationPositive(expected_delta))
+                    Self::do_gbm_training(features_clone.as_ref(), horizons_clone.as_ref(), cfg_positive, PredictionType::ClassificationPositive(expected_delta))
                 });
 
                 let h_negative = thread::spawn(move || {
-                    Self::train_gbm(features_arc.as_ref(), horizons_arc.as_ref(), cfg_negative, PredictionType::ClassificationNegative(0.0))
+                    Self::do_gbm_training(features_arc.as_ref(), horizons_arc.as_ref(), cfg_negative, PredictionType::ClassificationNegative(0.0))
                 });
 
                 if let Ok(gbm_positive)  = h_positive.join() && let Ok(gbm_negative)  = h_negative.join()
@@ -368,17 +387,17 @@ impl WalkForwardModel {
         false
     }
 
-    pub fn optimize_config(&self, predefined_configs: Option<(GbdtConfig, GbdtConfig)>) -> bool {
+    pub fn optimize_config(&self, predefined_configs: Option<(&str, &str)>) -> bool {
         if let Some((positive, negative)) = predefined_configs
             && let Ok(mut write_positive) = self.gbm_config_positive.write()
             && let Ok(mut write_negative) = self.gbm_config_negative.write() {
-            *write_positive = Some(positive);
-            *write_negative = Some(negative);
+            *write_positive = Some(serde_json::from_str(positive).unwrap());
+            *write_negative = Some(serde_json::from_str(negative).unwrap());
             info!("New predefined booster config saved");
             return true;
         }
 
-        let horizons = self.get_horizons(TradeDirection::Buy);
+        let (horizons, _) = self.get_horizons(TradeDirection::Buy);
         if horizons.len() >= self.config.train_min_size {
             let train_size = horizons.len() * 4 / 5;
             let features = self.features_buffer.lock()
@@ -400,7 +419,7 @@ impl WalkForwardModel {
                 let train_horizons_clone = train_horizons_arc.clone();
                 let test_horizons_clone = test_horizons_arc.clone();
                 let h_positive = thread::spawn(move || {
-                    match optimize_gbdt(
+                    match optimize_light_gbm(
                         PredictionType::ClassificationPositive(expected_delta),
                         train_data_clone, train_horizons_clone, test_data_clone, test_horizons_clone, optimize_iterations,
                     ) {
@@ -413,7 +432,7 @@ impl WalkForwardModel {
                 });
 
                 let h_negative = thread::spawn(move || {
-                    match optimize_gbdt(
+                    match optimize_light_gbm(
                         PredictionType::ClassificationNegative(0.0),
                         train_data_arc, train_horizons_arc, test_data_arc, test_horizons_arc, optimize_iterations,
                     ) {
@@ -428,9 +447,11 @@ impl WalkForwardModel {
                 if let Ok(positive) = h_positive.join() && let Ok(negative) = h_negative.join()
                     && let Some(positive) = positive && let Some(negative) = negative {
                     if let Ok(mut write_positive) = self.gbm_config_positive.write() {
+                        info!("Optimized positive: {positive}");
                         *write_positive = Some(positive)
                     }
                     if let Ok(mut write_negative) = self.gbm_config_negative.write() {
+                        info!("Optimized negative: {negative}");
                         *write_negative = Some(negative)
                     }
                     info!("New GBM configs saved");

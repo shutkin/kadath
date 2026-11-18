@@ -12,7 +12,7 @@ use argmin::solver::neldermead::NelderMead;
 use chrono::{DateTime, TimeDelta, Utc};
 use db::Db;
 use log::{error, info, warn};
-use model::common::{CommonError, EmptyResult, TimeDiapason};
+use model::common::{export_features_to_csv, CommonError, EmptyResult, TimeDiapason};
 use model::events::{OrderBookEvent, merge_events};
 use model::math_util::OutputType::{DerivativeNorm, Raw, StandardDeviation, TrendDeviation, TrendDeviationDerivativeNorm};
 use model::math_util::{percentile, ExponentFunction, FeaturesRollingWindow, OutputType, TimedFeatures};
@@ -179,7 +179,7 @@ async fn main() -> EmptyResult {
         let (train, test, train_h, test_h) =
             features_with_horizons(first_leg_id, second_leg_id, &events, check_train_end, global);
         info!("Check train {} events, test {} events", train.len(), test.len());
-        export_to_csv(&test, &test_h, "test_data.csv");
+        export_features_to_csv(&test, &test_h, "test_data.csv");
 
         info!("Train Linear model...");
         let linear = calibrate_linear_signal(None, &train, &train_h).ok_or("Linear Signal not calibrated")?;
@@ -225,7 +225,7 @@ async fn main() -> EmptyResult {
             .zip(predictions_linear.into_iter())
             .map(|((p1, p2), p3)| vec![p1, p2, p3])
             .collect::<Vec<_>>();
-        export_to_csv(&predictions, &test_h, "predictions.csv");
+        export_features_to_csv(&predictions, &test_h, "predictions.csv");
     }
 
     Ok(())
@@ -266,26 +266,6 @@ fn import_from_csv(filename: &str) -> Result<(Vec<Vec<f32>>, Vec<f32>), CommonEr
     }
 
     Ok((features, horizons))
-}
-
-fn export_to_csv<D: std::fmt::Display>(data: &[Vec<D>], horizons: &[f32], filename: &str) {
-    let size = data[0].len();
-    let mut csv = Vec::new();
-
-    let header = format!("{},horizon", (0..size).map(|i| format!("f{i}")).collect::<Vec<_>>().join(","));
-    csv.push(header);
-
-    for (features, horizon) in data.iter().zip(horizons.iter()) {
-        if features.len() != size {
-            warn!("Feature length mismatch: expected {}, got {}", size, features.len())
-        }
-        let row = format!("{},{horizon:.2}", features.iter().map(|f| format!("{f:.6}")).collect::<Vec<_>>().join(","));
-        csv.push(row);
-    }
-
-    if let Err(err) = std::fs::write(filename, csv.join("\n")) {
-        error!("Failed to export data to CSV: {}", err);
-    }
 }
 
 fn features_with_horizons(

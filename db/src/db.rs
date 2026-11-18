@@ -1,3 +1,5 @@
+pub mod test_db;
+
 use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use model::common::{CommonError, EmptyResult, TimeDiapason};

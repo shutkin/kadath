@@ -1,12 +1,12 @@
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
-use chrono::{DateTime, Utc};
 use log::{debug, error, info};
 use model::common::CommonError;
 use ndarray::Array1;
 
-const COMMISSION: f64 = 0.5;
+const COMMISSION: f32 = 0.5;
 
+#[derive(Debug)]
 pub struct LinearSignal {
     factors: Vec<f32>,
     threshold: f32,
@@ -71,22 +71,25 @@ impl ScoreProvider for HorizonProblem {
     fn score(&self, param: &Array1<f32>) -> f32 {
         let calculator = LinearSignal::from_param(param);
 
-        let mut count = 0;
-        let sum = self.values.iter().zip(self.horizons.iter())
-            .map(|(v, &horizon)| {
+        let mut sum_weight = 0.0;
+        let mut sum_weighted_horizons = 0.0;
+        self.values.iter()
+            .zip(self.horizons.iter())
+            .enumerate()
+            .for_each(|(i, (v, &horizon))| {
                 let signal = calculator.calculate(v);
                 if signal > 0.0 {
-                    count += 1;
-                    horizon
-                } else {
-                    0.0
+                    let weight = i as f32 / self.values.len() as f32;
+                    let weight = weight * weight;
+                    sum_weight += weight;
+                    sum_weighted_horizons += horizon * weight;
                 }
-            }).sum::<f32>();
+            });
 
-        if count < 8 {
+        if sum_weight < 2.0 {
             f32::NEG_INFINITY
         } else {
-            let score = sum - count as f32;
+            let score = sum_weighted_horizons / sum_weight;
             debug!("Linear score: {score}");
             score
         }
@@ -96,22 +99,45 @@ impl ScoreProvider for HorizonProblem {
 struct TradingProblem {
     values: Vec<Vec<f32>>,
     horizons: Vec<f32>,
+    events_per_hold: usize,
 }
 
 impl ScoreProvider for TradingProblem {
     fn score(&self, param: &Array1<f32>) -> f32 {
-        struct Deal {
-            closing_at: DateTime<Utc>,
-            open_price: f64,
+        let calculator = LinearSignal::from_param(param);
+        
+        let mut pnl = 0.0;
+        let mut skip_counter = 0;
+        let mut deals = 0;
+
+        self.values.iter()
+            .zip(self.horizons.iter())
+            .for_each(|(v, horizon)| {
+                if skip_counter > 0 {
+                    skip_counter -= 1;
+                } else {
+                    let signal = calculator.calculate(v);
+                    if signal > 0.0 {
+                        pnl += horizon - COMMISSION;
+                        skip_counter = self.events_per_hold;
+                        deals += 1;
+                    }
+                }
+            });
+
+        debug!("{calculator:?}: {pnl} on {deals} deals");
+        if deals > 0 {
+            pnl
+        } else {
+            f32::NEG_INFINITY
         }
-        0.0
     }
 }
 
-pub fn calibrate_linear_signal(prev: Option<&LinearSignal>, values: &[Vec<f32>], horizons: &[f32]) -> Option<LinearSignal> {
+pub fn calibrate_linear_signal(prev: Option<&LinearSignal>, values: &[Vec<f32>], horizons: &[f32], events_per_hold: usize) -> Option<LinearSignal> {
     let size = values[0].len();
     let initial = prev.map(|calc| calc.to_param()).unwrap_or(Array1::from_vec(vec![0.0; size]));
-    match execute_optimization(initial, values, horizons, ProblemKind::HORIZON) {
+    match execute_optimization(initial, values, horizons, events_per_hold, ProblemKind::TRADING) {
         Ok(result) => {
             info!("Calibration score: {}", result.train_score);
             Some(result)
@@ -127,6 +153,7 @@ fn execute_optimization(
     initial: Array1<f32>,
     values: &[Vec<f32>],
     horizons: &[f32],
+    events_per_hold: usize,
     problem_kind: ProblemKind,
 ) -> Result<LinearSignal, CommonError> {
     let problem = match problem_kind {
@@ -135,7 +162,7 @@ fn execute_optimization(
         })
         },
         ProblemKind::TRADING => ProblemWrapper { provider: Box::new(TradingProblem {
-            values: values.to_vec(), horizons: horizons.to_vec(),
+            values: values.to_vec(), horizons: horizons.to_vec(), events_per_hold,
         })
         }
     };
@@ -146,13 +173,13 @@ fn execute_optimization(
 
     for i in 0..initial.len() {
         let mut point = initial.clone();
-        point[i] += 0.25;
+        point[i] += 0.5;
         simplex.push(point);
     }
 
     let solver = NelderMead::<Array1<f32>, f32>::new(simplex.clone());
     let result = Executor::new(problem, solver)
-        .configure(|state| state.max_iters(4096))
+        .configure(|state| state.max_iters(2048))
         .run()?;
 
     let best_score = -result.state().get_best_cost();

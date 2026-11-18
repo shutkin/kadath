@@ -194,7 +194,7 @@ pub fn optimize_light_gbm (
     info!("Starting optimization");
     let study: Study<f64> = Study::new(optimizer::Direction::Maximize);
     study
-        .optimize(20, |trial: &mut optimizer::Trial| {
+        .optimize(50, |trial: &mut optimizer::Trial| {
             let config = LightGBMConfig {
                 learning_rate: learning_rate_param.suggest(trial).ok(),
                 num_leaves: num_leaves_param.suggest(trial).ok(),

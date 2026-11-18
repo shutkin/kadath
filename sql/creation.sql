@@ -75,3 +75,34 @@ comment on column instrument.source is 'A - Alor, T - T-Invest';
 alter table instrument add column external_id varchar;
 
 alter table signal_calculator add column train_time_ms int;
+
+create table test_session
+(
+    id serial primary key,
+    started timestamp with time zone not null,
+    instrument_id integer not null
+);
+
+create table test_signals
+(
+    id bigserial primary key,
+    session_id integer not null,
+    event_time timestamp with time zone not null,
+    signal1 float4,
+    signal2 float4,
+    signal3 float4
+);
+create index on test_signals (session_id);
+create index on test_signals (event_time);
+
+create table test_deal
+(
+    id serial primary key,
+    session_id integer not null,
+    direction char not null,
+    open_time timestamp with time zone not null,
+    close_time timestamp with time zone,
+    open_price float4,
+    close_price float4
+);
+create index on test_deal (session_id);

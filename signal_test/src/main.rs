@@ -14,7 +14,6 @@ use optimizer::parameter::{FloatParam, IntParam};
 use optimizer::prelude::Parameter;
 use plotters::prelude::*;
 use rust_decimal::Decimal;
-use signal::gradient_boost::GbdtConfig;
 use signal::{DealData, ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use std::collections::{HashMap, HashSet};
 use simplelog::SimpleLogger;
@@ -98,19 +97,19 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
 }
 
-const OPTIMIZED_CONFIGS: [(GbdtConfig, GbdtConfig); 3] = [
-    (
-        GbdtConfig { max_depth: 7, iterations: 98, shrinkage: 0.0053386633647191485, min_leaf_size: 378, data_sample_ratio: 0.7917056472120758, feature_sample_ratio: 0.5066184969063494 },
-        GbdtConfig { max_depth: 6, iterations: 95, shrinkage: 0.005878415064157608, min_leaf_size: 243, data_sample_ratio: 0.6650489555889336, feature_sample_ratio: 0.8102900523207806 },
+const OPTIMIZED_CONFIGS: [(&str, &str); 0] = [
+    /*(
+        r#"{"bagging_fraction":0.9935068555416049,"bagging_freq":4,"boosting_type":"gbdt","feature_fraction":0.7353956006111915,"lambda_l1":0.004835634691281931,"lambda_l2":0.08677622023365808,"learning_rate":0.01739334599447901,"max_depth":-1,"metric":"binary_logloss","min_child_samples":107,"n_jobs":-1,"num_iterations":2000,"num_leaves":7,"objective":"binary","random_state":42,"verbosity":-1}"#,
+        r#"{"bagging_fraction":0.8225036017134486,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.6935680940734733,"lambda_l1":0.0372767394349404,"lambda_l2":0.0002387386018516706,"learning_rate":0.008426934107383165,"max_depth":-1,"metric":"binary_logloss","min_child_samples":1125,"n_jobs":-1,"num_iterations":2000,"num_leaves":10,"objective":"binary","random_state":42,"verbosity":-1}"#,
     ),
     (
-        GbdtConfig { max_depth: 7, iterations: 98, shrinkage: 0.0053386633647191485, min_leaf_size: 378, data_sample_ratio: 0.7917056472120758, feature_sample_ratio: 0.5066184969063494 },
-        GbdtConfig { max_depth: 6, iterations: 95, shrinkage: 0.005878415064157608, min_leaf_size: 243, data_sample_ratio: 0.6650489555889336, feature_sample_ratio: 0.8102900523207806 },
+        r#"{"bagging_fraction":0.7348924472483985,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.5598798946712412,"lambda_l1":0.00013137942540926634,"lambda_l2":0.01833097440970101,"learning_rate":0.008480676750000433,"max_depth":-1,"metric":"binary_logloss","min_child_samples":427,"n_jobs":-1,"num_iterations":2000,"num_leaves":12,"objective":"binary","random_state":42,"verbosity":-1}"#,
+        r#"{"bagging_fraction":0.9299833245094198,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.9052532226346467,"lambda_l1":0.0007166624155583156,"lambda_l2":0.005054111952699828,"learning_rate":0.0051878076001226365,"max_depth":-1,"metric":"binary_logloss","min_child_samples":74,"n_jobs":-1,"num_iterations":2000,"num_leaves":16,"objective":"binary","random_state":42,"verbosity":-1}"#,
     ),
     (
-        GbdtConfig { max_depth: 7, iterations: 98, shrinkage: 0.0053386633647191485, min_leaf_size: 378, data_sample_ratio: 0.7917056472120758, feature_sample_ratio: 0.5066184969063494 },
-        GbdtConfig { max_depth: 6, iterations: 95, shrinkage: 0.005878415064157608, min_leaf_size: 243, data_sample_ratio: 0.6650489555889336, feature_sample_ratio: 0.8102900523207806 },
-    ),
+        r#"{"bagging_fraction":0.7348924472483985,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.5598798946712412,"lambda_l1":0.00013137942540926634,"lambda_l2":0.01833097440970101,"learning_rate":0.008480676750000433,"max_depth":-1,"metric":"binary_logloss","min_child_samples":427,"n_jobs":-1,"num_iterations":2000,"num_leaves":12,"objective":"binary","random_state":42,"verbosity":-1}"#,
+        r#"{"bagging_fraction":0.9299833245094198,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.9052532226346467,"lambda_l1":0.0007166624155583156,"lambda_l2":0.005054111952699828,"learning_rate":0.0051878076001226365,"max_depth":-1,"metric":"binary_logloss","min_child_samples":74,"n_jobs":-1,"num_iterations":2000,"num_leaves":16,"objective":"binary","random_state":42,"verbosity":-1}"#,
+    ),*/
 ];
 
 #[tokio::main]
@@ -123,16 +122,16 @@ async fn main() -> EmptyResult {
     let ticker = "SiZ6";
 
     let config = ModelConfig {
-        derivatives_normalize_diapason_s: 434.57978286751774,
-        trend_tau_s: 49.90139948829677,
+        derivatives_normalize_diapason_s: 434.58,// 434.57978286751774,
+        trend_tau_s: 49.9,// 49.90139948829677,
         train_buf_size: 138000,
         train_min_size: 100000,
-        optimize_iterations: 30,
-        hold_time: TimeDelta::milliseconds(14144),
+        optimize_iterations: 35,
+        hold_time: TimeDelta::milliseconds(8000),
         expected_delta: 4.88,
-        prediction_percentile_linear: 0.99,
-        prediction_percentile_gbm: 0.95,
-        trend_filter_length: 5.0,// 2.242490085551831,
+        prediction_percentile_linear: 0.996,
+        prediction_percentile_gbm: 0.96,
+        trend_filter_length: 0.0,// 2.242490085551831,
     };
 
     /*let config = ModelConfig {
@@ -149,8 +148,8 @@ async fn main() -> EmptyResult {
     };*/
 
     let diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-11-13T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-11-13T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-11-11T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-11-11T20:00:00Z")?.to_utc(),
     );
     let end = DateTime::parse_from_rfc3339("2026-11-14T00:00:00Z")?.to_utc();
 
@@ -332,7 +331,8 @@ fn rolling_test(
     let mut optimized_config_index = 0;
     let mut train_index = 0;
     let mut last_optimize_time = diapason.from;
-    let mut last_train_time = diapason.from + TimeDelta::hours(5);
+    let mut last_train_linear_time = diapason.from + TimeDelta::hours(5);
+    let mut last_train_gbm_time = diapason.from + TimeDelta::hours(5);
 
     let mut predictions = Vec::new();
 
@@ -349,21 +349,25 @@ fn rolling_test(
                         optimized_config_index += 1;
                     }
 
-                    if last_train_time < event.order_book.timestamp - TimeDelta::minutes(120)
-                        && model.train(event.order_book.timestamp) {
-                        last_train_time = event.order_book.timestamp;
-                        train_index += 1;
-                        if train_index == 2 {
-                            break;
+                    if last_train_linear_time < event.order_book.timestamp - TimeDelta::minutes(30)
+                        && model.train_linear() {
+                        last_train_linear_time = event.order_book.timestamp;
+                    }
+
+                    if last_train_gbm_time < event.order_book.timestamp - TimeDelta::minutes(60) {
+                        //if train_index == 1 {
+                        //    break;
+                        //}
+                        if model.train_gbm(event.order_book.timestamp) {
+                            last_train_gbm_time = event.order_book.timestamp;
+                            train_index += 1;
                         }
                     }
 
                     let signal = model.process(&mut window_data, event);
-                    let mut cur_horizon = f64::NAN;
 
                     if train_index == 1
                         && let Some(horizon) = get_horizon_pnl(events, i, event.order_book.timestamp + config.hold_time) {
-                        cur_horizon = horizon;
                         match signal {
                             TradeSignal::None(info) => {
                                 if info.linear_ranked >= 0.0 && info.gbm_ranked >= 0.0 {
@@ -394,7 +398,7 @@ fn rolling_test(
                                 do_not_trade_until = Some(event.order_book.timestamp + TimeDelta::minutes(4));
                             }
                             deals.push(*deal);
-                            if let Some(visualization) = build_deal_visualization(&events, deal) {
+                            if let Some(visualization) = build_deal_visualization(events, deal) {
                                 deals_visualizations.push(visualization);
                             }
                             active_deal = None;
@@ -406,7 +410,8 @@ fn rolling_test(
                         if do_trade {
                             do_not_trade_until = None;
                             if let TradeSignal::Buy(info) = signal {
-                                let deal = TestDeal::open(info, cur_horizon, i, &event.order_book);
+                                let horizon = get_horizon_pnl(events, i, event.order_book.timestamp + config.hold_time).unwrap_or(f64::NAN);
+                                let deal = TestDeal::open(info, horizon, i, &event.order_book);
                                 active_deal = Some(deal);
                             }
                         }

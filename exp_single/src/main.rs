@@ -12,7 +12,7 @@ use crate::orderbook_values::OrderBookValues;
 use chrono::{DateTime, TimeDelta, Utc};
 use db::Db;
 use log::{error, info, LevelFilter};
-use model::common::{CommonError, EmptyResult, PredictionDebugInfo, TimeDiapason};
+use model::common::{export_features_to_csv, CommonError, EmptyResult, PredictionDebugInfo, TimeDiapason};
 use model::math_util::OutputType::{DerivativeNorm, Raw, StandardDeviation, TrendDeviation, TrendDeviationDerivativeNorm};
 use model::math_util::{FeaturesRollingWindow, OutputType, get_normalized_rank};
 use model::{DataSource, Instrument, OrderBook, TradeDirection, order_book_cache};
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use crate::trend_filter::TrendFilter;
 
-const HOLD_TIME: f64 = 14.144;
+const HOLD_TIME: f64 = 8.0;
 const TRAIN_DIAPASON: i64 = 5 * 60;
 const TEST_DIAPASON: i64 = 45;
 const THRESHOLD_POSITIVE: f32 = 4.88;
@@ -44,7 +44,7 @@ const FEATURES_OUTPUT: [OutputType; 13] = [
     DerivativeNorm("i50"),
 ];
 
-const OPTIMIZE_GBM: bool = true;
+const OPTIMIZE_GBM: bool = false;
 const OPTIMIZE_GLOBAL: bool = false;
 
 const DIRECTION: TradeDirection = TradeDirection::Buy;
@@ -64,6 +64,7 @@ async fn main() -> EmptyResult {
     let inst_id = find_instrument_id(&all_instruments, ticker).expect("Instrument not found");
 
     //let global_params = GlobalParams { derivatives_normalize: 57.28, trend_tau: 614.61 };
+    //let global_params = GlobalParams { derivatives_normalize: 154.06066359974238, trend_tau: 188.50253617850086 };
     let global_params = GlobalParams { derivatives_normalize: 434.58, trend_tau: 49.9 };
 
     let (mut config_positive, mut config_negative) = (None, Option::<MachineConfig>::None);
@@ -77,7 +78,7 @@ async fn main() -> EmptyResult {
         let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
         info!("Got {} order book values", values.len());
         let fh =
-            get_features_with_horizons(&values, train_end, global_params, HOLD_TIME, DIRECTION);
+            get_features_with_horizons(&values, train_end, global_params, HOLD_TIME, 0.0, DIRECTION);
 
         let train_values_arc = Arc::new(fh.train_features);
         let train_horizons_arc = Arc::new(fh.train_horizons);
@@ -108,8 +109,8 @@ async fn main() -> EmptyResult {
         info!("Best negative config: {config}");
         config_negative = Some(config);
     } else {
-        config_positive = Some(MachineConfig::GBDT(GbdtConfig { max_depth: 7, iterations: 98, shrinkage: 0.0053386633647191485, min_leaf_size: 378, data_sample_ratio: 0.7917056472120758, feature_sample_ratio: 0.5066184969063494 }));
-        config_negative = Some(MachineConfig::GBDT(GbdtConfig { max_depth: 6, iterations: 95, shrinkage: 0.005878415064157608, min_leaf_size: 243, data_sample_ratio: 0.6650489555889336, feature_sample_ratio: 0.8102900523207806 }));
+        config_positive = Some(MachineConfig::LightGBM(serde_json::from_str(r#"{"bagging_fraction":0.7348924472483985,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.5598798946712412,"lambda_l1":0.00013137942540926634,"lambda_l2":0.01833097440970101,"learning_rate":0.008480676750000433,"max_depth":-1,"metric":"binary_logloss","min_child_samples":427,"n_jobs":-1,"num_iterations":2000,"num_leaves":12,"objective":"binary","random_state":42,"verbosity":-1}"#)?));
+        config_negative = Some(MachineConfig::LightGBM(serde_json::from_str(r#"{"bagging_fraction":0.9299833245094198,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.9052532226346467,"lambda_l1":0.0007166624155583156,"lambda_l2":0.005054111952699828,"learning_rate":0.0051878076001226365,"max_depth":-1,"metric":"binary_logloss","min_child_samples":74,"n_jobs":-1,"num_iterations":2000,"num_leaves":16,"objective":"binary","random_state":42,"verbosity":-1}"#)?));
     }
 
     if let Some(config_positive) = &config_positive && let Some(config_negative) = &config_negative {
@@ -126,10 +127,16 @@ async fn main() -> EmptyResult {
             info!("{global:?}");
         }
 
-        let fh = get_features_with_horizons(&values, train_end, global_params, HOLD_TIME, DIRECTION);
+        let fh = get_features_with_horizons(&values, train_end, global_params, HOLD_TIME, 0.0, DIRECTION);
+        export_features_to_csv(&fh.train_features, &fh.train_horizons, "experiment_train_data.csv");
+
+        let test_milliseconds = (fh.test_timestamps[fh.test_timestamps.len() - 1] - fh.test_timestamps[0]).num_milliseconds();
+        let events_per_hold = HOLD_TIME * 1000.0 * values.len() as f64 / test_milliseconds as f64;
+        info!("Events per hold: {events_per_hold}");
 
         info!("Train Linear model on {} values...", fh.train_features.len());
-        let linear = calibrate_linear_signal(None, &fh.train_features, &fh.train_horizons).ok_or("Unable to calibrate linear signal")?;
+        let linear = calibrate_linear_signal(None, &fh.train_features, &fh.train_horizons, events_per_hold as usize)
+            .ok_or("Unable to calibrate linear signal")?;
         let predictions_linear = linear.test(&fh.test_features);
         info!("Train UP model...");
         let classificator_positive = GradientBoost::train(positive, config_positive, &fh.train_features, &fh.train_horizons)?;
@@ -154,47 +161,47 @@ async fn main() -> EmptyResult {
         let mut best_threshold_linear = 0.0;
         let mut best_threshold_gbm = 0.0;
 
-        let trend_length = 0.0;
-        //for trend_length in [0.0, 2.25, 5.0, 10.0] {
-        info!("Trend Filter length {trend_length:?}");
+        for trend_length in [0.0, 2.25, 5.0, 10.0] {
+            info!("Trend Filter length {trend_length:?}");
+            let fh = get_features_with_horizons(&values, train_end, global_params, HOLD_TIME, trend_length, DIRECTION);
 
-        let mut predictions = Vec::with_capacity(fh.test_timestamps.len() - NORMALIZE_WINDOW_SIZE);
-        for i in NORMALIZE_WINDOW_SIZE .. fh.test_timestamps.len() {
-            let info = PredictionDebugInfo {
-                is_filtered_by_trend: true,// fh.test_filtered_by_trend[i],
-                linear_raw: predictions_linear[i],
-                gbm_positive_raw: predictions_positive[i],
-                gbm_negative_raw: predictions_negative[i],
-                linear_ranked: ranks_linear[i - NORMALIZE_WINDOW_SIZE],
-                gbm_ranked: ranks_gbm[i - NORMALIZE_WINDOW_SIZE],
-            };
-            predictions.push(
-                (fh.test_timestamps[i], info, fh.test_horizons[i]),
-            )
-        }
-        if let Err(err) = save_predictions_csv(&predictions, "experimental_predictions.csv") {
-            error!("Error saving predictions csv: {err}");
-        }
+            let mut predictions = Vec::with_capacity(fh.test_timestamps.len() - NORMALIZE_WINDOW_SIZE);
+            for i in NORMALIZE_WINDOW_SIZE .. fh.test_timestamps.len() {
+                let info = PredictionDebugInfo {
+                    is_filtered_by_trend: fh.test_filtered_by_trend[i],
+                    linear_raw: predictions_linear[i],
+                    gbm_positive_raw: predictions_positive[i],
+                    gbm_negative_raw: predictions_negative[i],
+                    linear_ranked: ranks_linear[i - NORMALIZE_WINDOW_SIZE],
+                    gbm_ranked: ranks_gbm[i - NORMALIZE_WINDOW_SIZE],
+                };
+                predictions.push(
+                    (fh.test_timestamps[i], info, fh.test_horizons[i]),
+                )
+            }
+            if let Err(err) = save_predictions_csv(&predictions, "experimental_predictions.csv") {
+                error!("Error saving predictions csv: {err}");
+            }
 
-        const PERCENTILES: [f64; 6] = [0.9, 0.93, 0.96, 0.99, 0.993, 0.996];
-        for threshold_linear in PERCENTILES {
-            for threshold_gbm in PERCENTILES {
-                let pnls = predictions.iter()
-                    .filter(|(_, info, _)| info.is_filtered_by_trend && info.linear_ranked >= threshold_linear && info.gbm_ranked >= threshold_gbm)
-                    .map(|(_, _, horizon)| *horizon)
-                    .collect::<Vec<_>>();
-                let total_pnl = pnls.iter().copied().sum::<f32>();
-                info!("Linear {threshold_linear}, GBM {threshold_gbm} => {total_pnl}, {} ({})", pnls.len(), total_pnl / pnls.len() as f32);
+            const PERCENTILES: [f64; 6] = [0.9, 0.93, 0.96, 0.99, 0.993, 0.996];
+            for threshold_linear in PERCENTILES {
+                for threshold_gbm in PERCENTILES {
+                    let pnls = predictions.iter()
+                        .filter(|(_, info, _)| info.is_filtered_by_trend && info.linear_ranked >= threshold_linear && info.gbm_ranked >= threshold_gbm)
+                        .map(|(_, _, horizon)| *horizon)
+                        .collect::<Vec<_>>();
+                    let total_pnl = pnls.iter().copied().sum::<f32>();
+                    info!("Linear {threshold_linear}, GBM {threshold_gbm} => {total_pnl}, {} ({})", pnls.len(), total_pnl / pnls.len() as f32);
 
-                let score = total_pnl - pnls.len() as f32;
-                if score > best_score {
-                    best_score = score;
-                    best_trend_length = trend_length;
-                    best_threshold_linear = threshold_linear;
-                    best_threshold_gbm = threshold_gbm;
+                    let score = total_pnl - pnls.len() as f32;
+                    if score > best_score {
+                        best_score = score;
+                        best_trend_length = trend_length;
+                        best_threshold_linear = threshold_linear;
+                        best_threshold_gbm = threshold_gbm;
+                    }
                 }
             }
-            //}
         }
 
         info!("Best score {best_score} on trend_length {best_trend_length}, threshold_linear {best_threshold_linear}, threshold_gbm {best_threshold_gbm}");
@@ -245,6 +252,7 @@ fn get_features_with_horizons(
     train_end: DateTime<Utc>,
     global_params: GlobalParams,
     hold_seconds: f64,
+    trend_filter_seconds: f64,
     direction: TradeDirection,
 ) -> FeaturesWithHorizons {
     let hold = TimeDelta::milliseconds((1000.0 * hold_seconds) as i64);
@@ -256,7 +264,7 @@ fn get_features_with_horizons(
         &FEATURES_OUTPUT,
     );
 
-    let mut trend_filter = TrendFilter::new(TradeDirection::Buy, hold_seconds);
+    let mut trend_filter = TrendFilter::new(TradeDirection::Buy, trend_filter_seconds);
 
     let mut train_features = Vec::new();
     let mut test_features = Vec::new();
@@ -282,7 +290,13 @@ fn get_features_with_horizons(
                 test_horizons.push(pnl);
                 test_timestamps.push(values.time);
 
-                test_filtered_by_trend.push(trend_filter.process(values));
+                test_filtered_by_trend.push(
+                    if trend_filter_seconds > 0.0 {
+                        trend_filter.process(values)
+                    } else {
+                        true
+                    }
+                );
             }
         }
     }

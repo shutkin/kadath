@@ -1,7 +1,7 @@
-use crate::gradient_boost::{GradientBoost, MachineConfig, PredictionType};
+use crate::gradient_boost::{MachineConfig, PredictionType};
 use crate::nelder_mead::calibrate_linear_signal;
 use crate::orderbook_values::OrderBookValues;
-use crate::{get_features_with_horizons};
+use crate::get_features_with_horizons;
 use argmin::core::{CostFunction, Error, Executor, State};
 use argmin::solver::neldermead::NelderMead;
 use chrono::{DateTime, Utc};
@@ -105,9 +105,11 @@ impl CostFunction for GlobalProblem<'_> {
     fn cost(&self, param: &Self::Param) -> Result<Self::Output, Error> {
         let global = GlobalParams::from_param(param, self.functions);
 
-        let fh = get_features_with_horizons(self.values, self.train_end, global, self.hold_ms, TradeDirection::Buy);
+        let fh = get_features_with_horizons(self.values, self.train_end, global, self.hold_ms, 0.0, TradeDirection::Buy);
+        let test_milliseconds = (fh.test_timestamps[fh.test_timestamps.len() - 1] - fh.test_timestamps[0]).num_milliseconds();
+        let events_per_hold = self.hold_ms * self.values.len() as f64 / test_milliseconds as f64;
 
-        let linear = calibrate_linear_signal(None, &fh.train_features, &fh.train_horizons).unwrap();
+        let linear = calibrate_linear_signal(None, &fh.train_features, &fh.train_horizons, events_per_hold as usize).unwrap();
         let predictions_linear = linear.test(&fh.test_features);
 
         //let up = GradientBoost::train(self.prediction_type, &self.config_up, &train_values, &train_horizons).unwrap();
@@ -124,16 +126,18 @@ impl CostFunction for GlobalProblem<'_> {
         //    .map(|(&r_pos, &r_neg)| r_pos * (0.0 + 1.0 * r_neg))
         //    .collect();
 
-        let threshold_linear = percentile(&predictions_linear, 0.96);
+        let threshold_linear = percentile(&predictions_linear, 0.99);
         //let threshold_gbm = percentile(&predictions_gbm, 0.93);
 
-        let pnl = predictions_linear.iter().zip(fh.test_horizons.iter())
+        let pnls = predictions_linear.iter().zip(fh.test_horizons.iter())
                 .filter(|(p, _)| **p >= threshold_linear)
                 .map(|(_, pnl)| *pnl)
-                .sum::<f32>();
+                .collect::<Vec<_>>();
+        let sum = pnls.iter().copied().sum::<f32>();
+        let score = sum - pnls.len() as f32;
 
         let count = self.count.fetch_add(1, Ordering::Relaxed);
-        info!("{count}: {global:?} => {pnl}");
-        Ok(-pnl as f64)
+        info!("{count}: {global:?} => {score}");
+        Ok(-score as f64)
     }
 }

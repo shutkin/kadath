@@ -37,3 +37,23 @@ impl Default for PredictionDebugInfo {
         }
     }
 }
+
+pub fn export_features_to_csv<D: std::fmt::Display>(data: &[Vec<D>], horizons: &[f32], filename: &str) {
+    let size = data[0].len();
+    let mut csv = Vec::new();
+
+    let header = format!("{},horizon", (0..size).map(|i| format!("f{i}")).collect::<Vec<_>>().join(","));
+    csv.push(header);
+
+    for (features, horizon) in data.iter().zip(horizons.iter()) {
+        if features.len() != size {
+            println!("Feature length mismatch: expected {}, got {}", size, features.len())
+        }
+        let row = format!("{},{horizon:.2}", features.iter().map(|f| format!("{f:.6}")).collect::<Vec<_>>().join(","));
+        csv.push(row);
+    }
+
+    if let Err(err) = std::fs::write(filename, csv.join("\n")) {
+        println!("Failed to export data to CSV: {}", err);
+    }
+}
