@@ -349,3 +349,152 @@ impl FeaturesRollingWindow {
         result.into_iter().map(|f| f as f32).collect()
     }
 }
+
+pub fn rolling_normalize_binary(data: &[f64], invert: bool, window_size: usize) -> Vec<f64> {
+    let mut normalizer = BinaryRollingNormalizer::new(window_size, invert);
+    let mut result = Vec::with_capacity(data.len() - window_size);
+
+    for x in data {
+        if let Some(rank) = normalizer.process(*x) {
+            result.push(rank);
+        }
+    }
+
+    result
+}
+
+pub struct BinaryRollingNormalizer {
+    window_size: usize,
+    invert: bool,
+    window: Vec<(f64, usize)>,
+    counter: usize,
+}
+
+impl BinaryRollingNormalizer {
+    pub fn new(window_size: usize, invert: bool) -> Self {
+        Self {
+            window_size,
+            invert,
+            window: Vec::with_capacity(window_size),
+            counter: 0,
+        }
+    }
+
+    pub fn process(&mut self, x: f64) -> Option<f64> {
+        if self.window.len() == self.window_size
+            && let Some(oldest_index) = self.window.iter().enumerate()
+            .min_by_key(|(_, (_, item_index))| item_index).map(|(i, _)| i) {
+            self.window.remove(oldest_index);
+        }
+
+        let position = insert_binary(x, self.counter, &mut self.window);
+        self.counter += 1;
+
+        if self.counter >= self.window_size {
+            let n = if self.invert { self.window_size - 1 - position } else { position } as f64 / self.window_size as f64;
+            Some(n)
+        } else {
+            None
+        }
+    }
+}
+
+fn insert_binary(x: f64, index: usize, window: &mut Vec<(f64, usize)>) -> usize {
+    if window.is_empty() {
+        window.push((x, index));
+        return 0;
+    }
+
+    let (mut down, mut up) = (0, window.len() - 1);
+    while up - down > 1 {
+        let center = (down + up) / 2;
+        if x < window[center].0 {
+            up = center;
+        } else {
+            down = center;
+        }
+    }
+    let insert_at;
+    if up - down == 1 {
+        if x < window[down].0 {
+            window.insert(down, (x, index));
+            insert_at = down;
+        } else if x > window[up].0 {
+            window.insert(up + 1, (x, index));
+            insert_at = up + 1;
+        } else {
+            window.insert(down + 1, (x, index));
+            insert_at = down + 1;
+        }
+    } else {
+        if x < window[down].0 {
+            window.insert(down, (x, index));
+            insert_at = down;
+        } else {
+            window.insert(up + 1, (x, index));
+            insert_at = up + 1;
+        }
+    }
+    insert_at
+}
+
+#[cfg(test)]
+mod unit_test {
+    use crate::math_util::{get_normalized_rank, BinaryRollingNormalizer};
+
+    fn rolling_normalize(x: &[f64], invert: bool, window_size: usize) -> Vec<f64> {
+        let mut result = Vec::with_capacity(x.len() - window_size);
+
+        for i in 0..=x.len() - window_size {
+            let rank = get_normalized_rank(&x[i..i + window_size], invert);
+            result.push(rank);
+        }
+
+        result
+    }
+
+    #[test]
+    fn test_binary_rolling_window() {
+        let data = vec![5.0, 3.0, 1.0, -6.0, 7.0, 4.0];
+
+        let mut normalizer = BinaryRollingNormalizer::new(4, false);
+        for x in data {
+            normalizer.process(x);
+        }
+
+        let window = normalizer.window.iter().map(|&(x, _)| x).collect::<Vec<_>>();
+        assert_eq!(window, vec![-6.0, 1.0, 4.0, 7.0]);
+
+        let n = normalizer.process(0.25);
+        println!("{n:?}");
+    }
+
+    #[test]
+    fn test_rolling_normalize() {
+        let data = vec![5.0, 3.0, 1.0, -6.0, 7.0, 4.0, 0.25, -1.4, 4.5];
+
+        let old_result = rolling_normalize(&data, false, 4);
+
+        let mut normalizer = BinaryRollingNormalizer::new(4, false);
+        let mut new_result = Vec::new();
+        for x in &data {
+            if let Some(y) = normalizer.process(*x) {
+                new_result.push(y);
+            }
+        }
+        println!("No inversion {new_result:?}");
+        assert_eq!(old_result, new_result);
+
+        let old_result = rolling_normalize(&data, true, 4);
+
+        let mut normalizer = BinaryRollingNormalizer::new(4, true);
+        let mut new_result = Vec::new();
+        for x in &data {
+            if let Some(y) = normalizer.process(*x) {
+                new_result.push(y);
+            }
+        }
+        println!("Inverted {new_result:?}");
+        assert_eq!(old_result, new_result);
+    }
+}

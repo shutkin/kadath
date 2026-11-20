@@ -21,6 +21,10 @@ impl TrendFilter {
     }
 
     pub fn process(&mut self, book: &OrderBookValues) -> bool {
+        if self.length.is_zero() {
+            return true;
+        }
+
         let cur_price = book.mid as f32;
         let mean = if self.buffer_prices.len() > 5 {
             mean_f32(&self.buffer_prices)

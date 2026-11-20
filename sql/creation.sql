@@ -83,6 +83,7 @@ create table test_session
     instrument_id integer not null
 );
 
+drop table test_signals;
 create table test_signals
 (
     id bigserial primary key,
@@ -90,7 +91,8 @@ create table test_signals
     event_time timestamp with time zone not null,
     signal1 float4,
     signal2 float4,
-    signal3 float4
+    signal3 float4,
+    horizon float4
 );
 create index on test_signals (session_id);
 create index on test_signals (event_time);

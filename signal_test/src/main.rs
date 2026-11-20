@@ -1,3 +1,7 @@
+mod predefined_configs;
+mod session_exp;
+mod gradient_boost;
+
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc};
 use db::Db;
 use linfa::DatasetBase;
@@ -17,7 +21,10 @@ use rust_decimal::Decimal;
 use signal::{DealData, ModelConfig, TradeSignal, WalkForwardModel, WindowData};
 use std::collections::{HashMap, HashSet};
 use simplelog::SimpleLogger;
+use db::test_db::TestDb;
 use signal::orderbook_values::OrderBookValues;
+use crate::predefined_configs::PredefinedConfigs;
+use crate::session_exp::test_session_experiment;
 
 #[derive(Copy, Clone)]
 struct TestDeal {
@@ -97,33 +104,24 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
     order_book.bids.iter().map(|data| data.price).max().unwrap()
 }
 
-const OPTIMIZED_CONFIGS: [(&str, &str); 0] = [
-    /*(
-        r#"{"bagging_fraction":0.9935068555416049,"bagging_freq":4,"boosting_type":"gbdt","feature_fraction":0.7353956006111915,"lambda_l1":0.004835634691281931,"lambda_l2":0.08677622023365808,"learning_rate":0.01739334599447901,"max_depth":-1,"metric":"binary_logloss","min_child_samples":107,"n_jobs":-1,"num_iterations":2000,"num_leaves":7,"objective":"binary","random_state":42,"verbosity":-1}"#,
-        r#"{"bagging_fraction":0.8225036017134486,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.6935680940734733,"lambda_l1":0.0372767394349404,"lambda_l2":0.0002387386018516706,"learning_rate":0.008426934107383165,"max_depth":-1,"metric":"binary_logloss","min_child_samples":1125,"n_jobs":-1,"num_iterations":2000,"num_leaves":10,"objective":"binary","random_state":42,"verbosity":-1}"#,
-    ),
-    (
-        r#"{"bagging_fraction":0.7348924472483985,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.5598798946712412,"lambda_l1":0.00013137942540926634,"lambda_l2":0.01833097440970101,"learning_rate":0.008480676750000433,"max_depth":-1,"metric":"binary_logloss","min_child_samples":427,"n_jobs":-1,"num_iterations":2000,"num_leaves":12,"objective":"binary","random_state":42,"verbosity":-1}"#,
-        r#"{"bagging_fraction":0.9299833245094198,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.9052532226346467,"lambda_l1":0.0007166624155583156,"lambda_l2":0.005054111952699828,"learning_rate":0.0051878076001226365,"max_depth":-1,"metric":"binary_logloss","min_child_samples":74,"n_jobs":-1,"num_iterations":2000,"num_leaves":16,"objective":"binary","random_state":42,"verbosity":-1}"#,
-    ),
-    (
-        r#"{"bagging_fraction":0.7348924472483985,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.5598798946712412,"lambda_l1":0.00013137942540926634,"lambda_l2":0.01833097440970101,"learning_rate":0.008480676750000433,"max_depth":-1,"metric":"binary_logloss","min_child_samples":427,"n_jobs":-1,"num_iterations":2000,"num_leaves":12,"objective":"binary","random_state":42,"verbosity":-1}"#,
-        r#"{"bagging_fraction":0.9299833245094198,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.9052532226346467,"lambda_l1":0.0007166624155583156,"lambda_l2":0.005054111952699828,"learning_rate":0.0051878076001226365,"max_depth":-1,"metric":"binary_logloss","min_child_samples":74,"n_jobs":-1,"num_iterations":2000,"num_leaves":16,"objective":"binary","random_state":42,"verbosity":-1}"#,
-    ),*/
-];
-
 #[tokio::main]
 async fn main() -> EmptyResult {
+    test_session_experiment().await
+}
+
+#[tokio::main]
+async fn __main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
     let db = Db::new(&db_url).await?;
+    let test_db = TestDb::new(&db_url).await?;
 
     let ticker = "SiZ6";
 
     let config = ModelConfig {
-        derivatives_normalize_diapason_s: 434.58,// 434.57978286751774,
-        trend_tau_s: 49.9,// 49.90139948829677,
+        derivatives_normalize_diapason_s: 434.58,
+        trend_tau_s: 49.9,
         train_buf_size: 138000,
         train_min_size: 100000,
         optimize_iterations: 35,
@@ -131,7 +129,7 @@ async fn main() -> EmptyResult {
         expected_delta: 4.88,
         prediction_percentile_linear: 0.996,
         prediction_percentile_gbm: 0.96,
-        trend_filter_length: 0.0,// 2.242490085551831,
+        trend_filter_length: 0.0,
     };
 
     /*let config = ModelConfig {
@@ -177,7 +175,7 @@ async fn main() -> EmptyResult {
             d.to += TimeDelta::days(1);
         }
     }
-    let (pnl, deals, visualizations) = rolling_test(&events, instrument_id, config, diapason, end);
+    let (pnl, deals, visualizations) = rolling_test_with_logs(&events, instrument_id, config, diapason, end, &test_db).await?;
     info!("Total pnl {pnl} on {deals} deals");
 
     for (i, visualization) in visualizations.iter().enumerate() {
@@ -210,19 +208,6 @@ async fn _main() -> EmptyResult {
     let db = Db::new(&db_url).await?;
 
     let ticker = "SiZ6";
-
-    /*let config = ModelConfig {
-        derivatives_normalize_diapason_s: 57.28,
-        trend_tau_s: 614.61,
-        train_buf_size: 142000,
-        train_min_size: 100000,
-        optimize_iterations: 30,
-        hold_time: TimeDelta::milliseconds(4000),
-        expected_delta: 5.0,
-        prediction_percentile_linear: 0.993,
-        prediction_percentile_gbm: 0.99,
-        trend_filter_length: 0.0,
-    };*/
 
     let diapason = TimeDiapason::new(
         DateTime::parse_from_rfc3339("2026-11-09T05:00:00Z")?.to_utc(),
@@ -288,7 +273,7 @@ async fn _main() -> EmptyResult {
                     optimize_iterations: 30,
                 };
                 info!("{config:?}");
-                let (pnl, deals, _) = rolling_test(&events, instrument_id, config, diapason, end);
+                let (pnl, deals) = rolling_test_sync(&events, instrument_id, config, diapason, end);
                 Ok(pnl - deals as f64)
             } else {
                 Err(optimizer::Error::Internal("Failed to suggest config"))
@@ -316,106 +301,28 @@ async fn _main() -> EmptyResult {
 }
 
 
-fn rolling_test(
-    all_events: &HashMap<NaiveDate, Vec<OrderBookEvent>>, instrument_id: i32, config: ModelConfig, mut diapason: TimeDiapason, end: DateTime<Utc>
-) -> (f64, usize, Vec<Vec<f64>>) {
-    let mut window_data = WindowData::new(&config);
+async fn rolling_test_with_logs(
+    all_events: &HashMap<NaiveDate, Vec<OrderBookEvent>>, instrument_id: i32, config: ModelConfig,
+    mut diapason: TimeDiapason, end: DateTime<Utc>, test_db: &TestDb,
+) -> Result<(f64, usize, Vec<Vec<f64>>), CommonError> {
+    let session_id = test_db.start_session(instrument_id).await?;
+
     let model = WalkForwardModel::new(instrument_id, config);
 
-    let mut active_deal = Option::<TestDeal>::None;
-    let mut deals = Vec::new();
-    let mut deals_visualizations = Vec::new();
+    let mut context = RollingTestContext::new(&config, diapason);
 
-    let mut do_not_trade_until = None;
-
-    let mut optimized_config_index = 0;
-    let mut train_index = 0;
-    let mut last_optimize_time = diapason.from;
-    let mut last_train_linear_time = diapason.from + TimeDelta::hours(5);
-    let mut last_train_gbm_time = diapason.from + TimeDelta::hours(5);
-
-    let mut predictions = Vec::new();
+    let gbm_configs = PredefinedConfigs::read("gbm_configs.json")?;
+    info!("Parse {} predefined GBM configs", gbm_configs.len());
 
     while diapason.from < end {
         if !matches!(diapason.from.weekday().number_from_monday(), 6 | 7) {
             info!("DAY {}", diapason.from.date_naive());
 
             if let Some(events) = all_events.get(&diapason.from.date_naive()) {
-                for (i, event) in events.iter().enumerate() {
-                    if last_optimize_time < event.order_book.timestamp - TimeDelta::hours(5)
-                        && model.optimize_config(OPTIMIZED_CONFIGS.get(optimized_config_index).copied()) {
-                        info!("Optimized on {}", event.order_book.timestamp);
-                        last_optimize_time = event.order_book.timestamp;
-                        optimized_config_index += 1;
-                    }
-
-                    if last_train_linear_time < event.order_book.timestamp - TimeDelta::minutes(30)
-                        && model.train_linear() {
-                        last_train_linear_time = event.order_book.timestamp;
-                    }
-
-                    if last_train_gbm_time < event.order_book.timestamp - TimeDelta::minutes(60) {
-                        //if train_index == 1 {
-                        //    break;
-                        //}
-                        if model.train_gbm(event.order_book.timestamp) {
-                            last_train_gbm_time = event.order_book.timestamp;
-                            train_index += 1;
-                        }
-                    }
-
-                    let signal = model.process(&mut window_data, event);
-
-                    if train_index == 1
-                        && let Some(horizon) = get_horizon_pnl(events, i, event.order_book.timestamp + config.hold_time) {
-                        match signal {
-                            TradeSignal::None(info) => {
-                                if info.linear_ranked >= 0.0 && info.gbm_ranked >= 0.0 {
-                                    predictions.push((event.order_book.timestamp, info, horizon));
-                                }
-                            }
-                            TradeSignal::Sell(_) => {}
-                            TradeSignal::Buy(info) => {
-                                if info.linear_ranked >= 0.0 && info.gbm_ranked >= 0.0 {
-                                    predictions.push((event.order_book.timestamp, info, horizon));
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(deal) = active_deal.as_mut() {
-                        if model.is_it_time_to_close_deal(&event.order_book, &mut deal.deal_data) {
-                            deal.close(i, &event.order_book);
-                            let pnl = deal.pnl();
-                            info!(
-                                "{} {:?}: {:?}, horizon {}",
-                                deal.open_time,
-                                deal.prediction_info,
-                                pnl,
-                                deal.horizon,
-                            );
-                            if pnl.1 < -5.0 {
-                                do_not_trade_until = Some(event.order_book.timestamp + TimeDelta::minutes(4));
-                            }
-                            deals.push(*deal);
-                            if let Some(visualization) = build_deal_visualization(events, deal) {
-                                deals_visualizations.push(visualization);
-                            }
-                            active_deal = None;
-                        }
-                    } else {
-                        let do_trade = do_not_trade_until
-                            .map(|until| event.order_book.timestamp > until)
-                            .unwrap_or(true);
-                        if do_trade {
-                            do_not_trade_until = None;
-                            if let TradeSignal::Buy(info) = signal {
-                                let horizon = get_horizon_pnl(events, i, event.order_book.timestamp + config.hold_time).unwrap_or(f64::NAN);
-                                let deal = TestDeal::open(info, horizon, i, &event.order_book);
-                                active_deal = Some(deal);
-                            }
-                        }
-                    }
+                let daily_signals = rolling_test_day(events, &gbm_configs, &model, &mut context, true);
+                if !daily_signals.is_empty() {
+                    test_db.batch_insert_signals(session_id, &daily_signals).await?;
+                    info!("Inserted {} daily signals", daily_signals.len());
                 }
             }
         }
@@ -425,7 +332,7 @@ fn rolling_test(
 
     let mut pnl = 0.0;
     let (mut neutrals, mut positives, mut negatives) = (0, 0, 0);
-    for deal in &deals {
+    for deal in &context.deals {
         let deal_pnl = deal.pnl();
         pnl += deal_pnl.0;
         if deal_pnl.0 >= 1.5 {
@@ -436,14 +343,156 @@ fn rolling_test(
             neutrals += 1;
         }
     }
-    info!("Total PnL {pnl}, PnL per deal {}", pnl / deals.len() as f64);
+    info!("Total PnL {pnl}, PnL per deal {}", pnl / context.deals.len() as f64);
     info!("Positives {positives}, negatives {negatives}, neutrals {neutrals}");
 
-    if let Err(err) = save_predictions_csv(&predictions, "signal_test_predictions.csv") {
-        error!("Error while saving predictions csv: {err}");
+    Ok((pnl, context.deals.len(), context.deals_visualizations))
+}
+
+fn rolling_test_sync(
+    all_events: &HashMap<NaiveDate, Vec<OrderBookEvent>>, instrument_id: i32, config: ModelConfig,
+    mut diapason: TimeDiapason, end: DateTime<Utc>,
+) -> (f64, usize) {
+    let model = WalkForwardModel::new(instrument_id, config);
+
+    let mut context = RollingTestContext::new(&config, diapason);
+
+    while diapason.from < end {
+        if !matches!(diapason.from.weekday().number_from_monday(), 6 | 7) {
+            info!("DAY {}", diapason.from.date_naive());
+
+            if let Some(events) = all_events.get(&diapason.from.date_naive()) {
+                rolling_test_day(events, &[], &model, &mut context, false);
+            }
+        }
+        diapason.from += TimeDelta::days(1);
+        diapason.to += TimeDelta::days(1);
     }
-    
-    (pnl, deals.len(), deals_visualizations)
+
+    let pnl = context.deals.iter().map(|deal| deal.pnl().0).sum();
+
+    (pnl, context.deals.len())
+}
+
+struct RollingTestContext {
+    window_data: WindowData,
+
+    active_deal: Option<TestDeal>,
+    deals: Vec<TestDeal>,
+    deals_visualizations: Vec<Vec<f64>>,
+
+    do_not_trade_until: Option<DateTime<Utc>>,
+
+    optimized_config_index: usize,
+
+    last_optimize_time: DateTime<Utc>,
+    last_train_linear_time: DateTime<Utc>,
+    last_train_gbm_time: DateTime<Utc>,
+}
+
+impl RollingTestContext {
+    fn new(config: &ModelConfig, diapason: TimeDiapason) -> Self {
+        Self {
+            window_data: WindowData::new(config),
+
+            active_deal: Option::<TestDeal>::None,
+            deals: Vec::new(),
+            deals_visualizations: Vec::new(),
+
+            do_not_trade_until: None,
+
+            optimized_config_index: 0,
+            last_optimize_time: diapason.from,
+            last_train_linear_time: diapason.from + TimeDelta::hours(5),
+            last_train_gbm_time: diapason.from + TimeDelta::hours(5),
+        }
+    }
+}
+
+fn rolling_test_day(
+    events: &[OrderBookEvent],
+    predefined_configs: &[PredefinedConfigs],
+    model: &WalkForwardModel,
+    ctx: &mut RollingTestContext,
+    visualize: bool
+) -> Vec<(DateTime<Utc>, f32, f32, f32, f32)> {
+    let mut daily_signals = Vec::new();
+    let hold_time = model.get_config().hold_time;
+
+    for (i, event) in events.iter().enumerate() {
+        if ctx.last_optimize_time < event.order_book.timestamp - TimeDelta::hours(5) {
+            let predefined_config = predefined_configs.get(ctx.optimized_config_index)
+                .map(|cfg| (cfg.positive.clone(), cfg.negative.clone()));
+            if model.optimize_config(predefined_config) {
+                info!("Optimized on {}", event.order_book.timestamp);
+                ctx.last_optimize_time = event.order_book.timestamp;
+                ctx.optimized_config_index += 1;
+            }
+        }
+
+        if ctx.last_train_linear_time < event.order_book.timestamp - TimeDelta::minutes(30)
+            && model.train_linear() {
+            ctx.last_train_linear_time = event.order_book.timestamp;
+        }
+
+        if ctx.last_train_gbm_time < event.order_book.timestamp - TimeDelta::minutes(60)
+            && model.train_gbm(event.order_book.timestamp) {
+            ctx.last_train_gbm_time = event.order_book.timestamp;
+        }
+
+        let signal = model.process(&mut ctx.window_data, event);
+
+        let debug_info = signal.get_debug_info();
+        if debug_info.linear_ranked >= 0.0
+            && let Some(horizon) = get_horizon_pnl(events, i, event.order_book.timestamp + hold_time) {
+            daily_signals.push((
+                event.order_book.timestamp,
+                debug_info.linear_raw as f32,
+                debug_info.gbm_positive_raw as f32,
+                debug_info.gbm_negative_raw as f32,
+                horizon as f32,
+            ));
+        }
+
+        if let Some(deal) = ctx.active_deal.as_mut() {
+            if model.is_it_time_to_close_deal(&event.order_book, &mut deal.deal_data) {
+                deal.close(i, &event.order_book);
+                let pnl = deal.pnl();
+                info!(
+                                "{} {:?}: {:?}, horizon {}",
+                                deal.open_time,
+                                deal.prediction_info,
+                                pnl,
+                                deal.horizon,
+                            );
+                if pnl.1 < -5.0 {
+                    ctx.do_not_trade_until = Some(event.order_book.timestamp + TimeDelta::minutes(4));
+                }
+                ctx.deals.push(*deal);
+
+                if visualize
+                    && let Some(visualization) = build_deal_visualization(events, deal) {
+                    ctx.deals_visualizations.push(visualization);
+                }
+
+                ctx.active_deal = None;
+            }
+        } else {
+            let do_trade = ctx.do_not_trade_until
+                .map(|until| event.order_book.timestamp > until)
+                .unwrap_or(true);
+            if do_trade {
+                ctx.do_not_trade_until = None;
+                if let TradeSignal::Buy(info) = signal {
+                    let horizon = get_horizon_pnl(events, i, event.order_book.timestamp + model.get_config().hold_time).unwrap_or(f64::NAN);
+                    let deal = TestDeal::open(info, horizon, i, &event.order_book);
+                    ctx.active_deal = Some(deal);
+                }
+            }
+        }
+    }
+
+    daily_signals
 }
 
 fn get_horizon_pnl(events: &[OrderBookEvent], index: usize, target_time: DateTime<Utc>) -> Option<f64> {
@@ -474,7 +523,7 @@ fn average_deal_visual(deals: &[Vec<f64>]) -> Result<Vec<(usize, Vec<f64>)>, Com
         let mut centroid = deal[0..len].iter().map(|&d| d - mean).collect::<Vec<f64>>();
         let max = centroid.iter().map(|x| x.abs()).reduce(f64::max).unwrap_or_default();
         for i in 0..len {
-            centroid[i] = centroid[i] / max;
+            centroid[i] /= max;
         }
         centroid
     }).collect::<Vec<Vec<f64>>>();
@@ -588,7 +637,6 @@ fn visualize_deal(prices: &[f64], title: &str, filename: &str) -> EmptyResult {
     // Save the buffer to disk
     root.present()?;
     Ok(())
-
 }
 
 fn find_instrument_id(instruments: &[Instrument], ticker: &str) -> Option<i32> {
@@ -607,19 +655,4 @@ async fn get_order_books(ticker: &str, id: i32, diapason: TimeDiapason, db: Opti
         order_book_cache::write(ticker, diapason, &order_books, true)?;
         Ok(order_books)
     }
-}
-
-fn save_predictions_csv(data: &[(DateTime<Utc>, PredictionDebugInfo, f64)], filename: &str) -> Result<(), CommonError> {
-    let mut csv = Vec::with_capacity(data.len() + 1);
-    csv.push("time,trend_filter,linear,gbm positive,gbm negative,linear ranked,gbm ranked,horizon".to_string());
-
-    for (time, info, horizon) in data {
-        csv.push(format!("{time},{},{:.6},{:.6},{:.6},{:.6},{:.6},{horizon:.1}",
-                         info.is_filtered_by_trend, info.linear_raw, info.gbm_positive_raw,
-                         info.gbm_negative_raw, info.linear_ranked, info.gbm_ranked));
-    }
-
-    std::fs::write(filename, csv.join("\n"))?;
-
-    Ok(())
 }

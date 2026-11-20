@@ -5,16 +5,17 @@ mod gradient_boost;
 mod nelder_mead;
 mod trend_filter;
 
+use std::str::FromStr;
 use crate::global_optimizer::{GlobalParams, global_optimize};
-use crate::gradient_boost::{optimize_gbdt, optimize_light_gbm, GbdtConfig, GradientBoost, MachineConfig, PredictionType};
+use crate::gradient_boost::{optimize_gbdt, optimize_light_gbm, GbdtConfig, GradientBoost, MachineConfig, PredictionType, calculate_predictions_brier};
 use crate::nelder_mead::calibrate_linear_signal;
 use crate::orderbook_values::OrderBookValues;
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use db::Db;
 use log::{error, info, LevelFilter};
 use model::common::{export_features_to_csv, CommonError, EmptyResult, PredictionDebugInfo, TimeDiapason};
 use model::math_util::OutputType::{DerivativeNorm, Raw, StandardDeviation, TrendDeviation, TrendDeviationDerivativeNorm};
-use model::math_util::{FeaturesRollingWindow, OutputType, get_normalized_rank};
+use model::math_util::{rolling_normalize_binary, FeaturesRollingWindow, OutputType};
 use model::{DataSource, Instrument, OrderBook, TradeDirection, order_book_cache};
 use simplelog::SimpleLogger;
 use std::sync::Arc;
@@ -44,7 +45,7 @@ const FEATURES_OUTPUT: [OutputType; 13] = [
     DerivativeNorm("i50"),
 ];
 
-const OPTIMIZE_GBM: bool = false;
+const OPTIMIZE_GBM: bool = true;
 const OPTIMIZE_GLOBAL: bool = false;
 
 const DIRECTION: TradeDirection = TradeDirection::Buy;
@@ -69,12 +70,17 @@ async fn main() -> EmptyResult {
 
     let (mut config_positive, mut config_negative) = (None, Option::<MachineConfig>::None);
 
+    let day = NaiveDate::from_str("2026-11-13")?;
+
     if OPTIMIZE_GBM {
         let diapason = TimeDiapason::new(
             DateTime::parse_from_rfc3339("2026-11-13T05:00:00Z")?.to_utc(),
             DateTime::parse_from_rfc3339("2026-11-13T11:00:00Z")?.to_utc(),
+            //day.and_time(NaiveTime::from_str("05:00:00")?).and_utc(),
+            //day.and_time(NaiveTime::from_str("10:00:00")?).and_utc(),
         );
         let train_end = DateTime::parse_from_rfc3339("2026-11-13T10:00:00Z")?.to_utc();
+        //let train_end = day.and_time(NaiveTime::from_str("09:00:00")?).and_utc();
         let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
         info!("Got {} order book values", values.len());
         let fh =
@@ -109,7 +115,7 @@ async fn main() -> EmptyResult {
         info!("Best negative config: {config}");
         config_negative = Some(config);
     } else {
-        config_positive = Some(MachineConfig::LightGBM(serde_json::from_str(r#"{"bagging_fraction":0.7348924472483985,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.5598798946712412,"lambda_l1":0.00013137942540926634,"lambda_l2":0.01833097440970101,"learning_rate":0.008480676750000433,"max_depth":-1,"metric":"binary_logloss","min_child_samples":427,"n_jobs":-1,"num_iterations":2000,"num_leaves":12,"objective":"binary","random_state":42,"verbosity":-1}"#)?));
+        config_positive = Some(MachineConfig::LightGBM(serde_json::from_str(r#"{"bagging_fraction":0.6890659760234314,"bagging_freq":4,"boosting_type":"gbdt","boosting":"gbdt","feature_fraction":0.6522623624620375,"lambda_l1":1.7229466260187964,"lambda_l2":4.38945976241284,"learning_rate":0.0070150674971257085,"max_depth":-1,"metric":"binary_logloss","min_child_samples":752,"n_jobs":-1,"num_iterations":8000,"num_leaves":24,"objective":"binary","verbosity":-1}"#)?));
         config_negative = Some(MachineConfig::LightGBM(serde_json::from_str(r#"{"bagging_fraction":0.9299833245094198,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.9052532226346467,"lambda_l1":0.0007166624155583156,"lambda_l2":0.005054111952699828,"learning_rate":0.0051878076001226365,"max_depth":-1,"metric":"binary_logloss","min_child_samples":74,"n_jobs":-1,"num_iterations":2000,"num_leaves":16,"objective":"binary","random_state":42,"verbosity":-1}"#)?));
     }
 
@@ -117,8 +123,11 @@ async fn main() -> EmptyResult {
         let diapason = TimeDiapason::new(
             DateTime::parse_from_rfc3339("2026-11-13T06:48:20Z")?.to_utc(),
             DateTime::parse_from_rfc3339("2026-11-13T13:58:32Z")?.to_utc(),
+            //day.and_time(NaiveTime::from_str("06:00:00")?).and_utc(),
+            //day.and_time(NaiveTime::from_str("12:00:00")?).and_utc(),
         );
         let train_end = DateTime::parse_from_rfc3339("2026-11-13T11:59:59Z")?.to_utc();
+        //let train_end = day.and_time(NaiveTime::from_str("10:00:00")?).and_utc();
         let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
         info!("Got {} order book values", values.len());
 
@@ -141,14 +150,15 @@ async fn main() -> EmptyResult {
         info!("Train UP model...");
         let classificator_positive = GradientBoost::train(positive, config_positive, &fh.train_features, &fh.train_horizons)?;
         let predictions_positive = classificator_positive.test(&fh.test_features)?;
+        check_gbm_predictions(&predictions_positive, &fh.test_horizons, positive);
         info!("Train DOWN model...");
         let classificator_negative = GradientBoost::train(negative, config_negative, &fh.train_features, &fh.train_horizons)?;
         let predictions_negative = classificator_negative.test(&fh.test_features)?;
         info!("{} predictions", predictions_linear.len());
 
-        let ranks_linear = rolling_normalize(&predictions_linear, false);
-        let ranks_pos = rolling_normalize(&predictions_positive, false);
-        let ranks_neg = rolling_normalize(&predictions_negative, true);
+        let ranks_linear = rolling_normalize_binary(&predictions_linear, false, NORMALIZE_WINDOW_SIZE);
+        let ranks_pos = rolling_normalize_binary(&predictions_positive, false, NORMALIZE_WINDOW_SIZE);
+        let ranks_neg = rolling_normalize_binary(&predictions_negative, true, NORMALIZE_WINDOW_SIZE);
         info!("{} positive and {} negative ranked predictions", ranks_pos.len(), ranks_neg.len());
 
         let ranks_gbm: Vec<f64> = ranks_pos.iter()
@@ -210,18 +220,17 @@ async fn main() -> EmptyResult {
     Ok(())
 }
 
-const NORMALIZE_WINDOW_SIZE: usize = 25000;
-
-fn rolling_normalize(x: &[f64], invert: bool) -> Vec<f64> {
-    let mut result = Vec::with_capacity(x.len() - NORMALIZE_WINDOW_SIZE);
-
-    for i in 0..x.len() - NORMALIZE_WINDOW_SIZE {
-        let rank = get_normalized_rank(&x[i..i + NORMALIZE_WINDOW_SIZE], invert);
-        result.push(rank);
+fn check_gbm_predictions(predictions: &[f64], horizons: &[f32], prediction_type: PredictionType) {
+    let mut from = 0;
+    while from < predictions.len() {
+        let to = (from + 1000).min(predictions.len());
+        let score = calculate_predictions_brier(&predictions[from..to], &horizons[from..to], prediction_type);
+        info!("{from}..{to}: {score}");
+        from += 1000;
     }
-
-    result
 }
+
+const NORMALIZE_WINDOW_SIZE: usize = 25000;
 
 fn save_predictions_csv(data: &[(DateTime<Utc>, PredictionDebugInfo, f32)], filename: &str) -> Result<(), CommonError> {
     let mut csv = Vec::with_capacity(data.len() + 1);

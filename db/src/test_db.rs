@@ -3,6 +3,7 @@ use model::common::CommonError;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, Row};
 
+#[derive(Clone)]
 pub struct TestDb {
     pool: Pool<Postgres>,
 }
@@ -22,33 +23,55 @@ impl TestDb {
         Ok(id_row.get(0))
     }
 
-    pub async fn insert_signals(&self, session_id: i32, time: DateTime<Utc>, s0: f32, s1: f32, s2: f32) -> Result<(), CommonError> {
-        sqlx::query("INSERT INTO test_signals (session_id, event_time, signal1, signal2, signal3) VALUES ($1, $2, $3, $4, $5)")
+    pub async fn insert_signals(&self, session_id: i32, time: DateTime<Utc>, s0: f32, s1: f32, s2: f32, horizon: f32) -> Result<(), CommonError> {
+        sqlx::query("INSERT INTO test_signals (session_id, event_time, signal1, signal2, signal3) VALUES ($1, $2, $3, $4, $5, $6)")
             .bind(session_id)
             .bind(time)
             .bind(s0)
             .bind(s1)
             .bind(s2)
+            .bind(horizon)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    pub async fn batch_insert_signals(&self, session_id: i32, time_signals: &[(DateTime<Utc>, f32, f32, f32)]) -> Result<(), CommonError> {
+    pub async fn batch_insert_signals(&self, session_id: i32, time_signals: &[(DateTime<Utc>, f32, f32, f32, f32)]) -> Result<(), CommonError> {
         for chunk in time_signals.chunks(2048) {
-            let times = chunk.iter().map(|&(t, _, _, _)| t).collect::<Vec<_>>();
-            let s0 = chunk.iter().map(|&(_, s, _, _)| s).collect::<Vec<f32>>();
-            let s2 = chunk.iter().map(|&(_, _, s, _)| s).collect::<Vec<f32>>();
-            let s1 = chunk.iter().map(|&(_, _, _, s)| s).collect::<Vec<f32>>();
-            sqlx::query("INSERT INTO test_signals (session_id, event_time, signal1, signal2, signal3) SELECT $1, * FROM UNNEST($2, $3, $4, $5)")
+            let times = chunk.iter().map(|&(t, _, _, _, _)| t).collect::<Vec<_>>();
+            let s0 = chunk.iter().map(|&(_, s, _, _, _)| s).collect::<Vec<f32>>();
+            let s2 = chunk.iter().map(|&(_, _, s, _, _)| s).collect::<Vec<f32>>();
+            let s1 = chunk.iter().map(|&(_, _, _, s, _)| s).collect::<Vec<f32>>();
+            let horizons = chunk.iter().map(|&(_, _, _, _, h)| h).collect::<Vec<f32>>();
+            sqlx::query("INSERT INTO test_signals (session_id, event_time, signal1, signal2, signal3, horizon) SELECT $1, * FROM UNNEST($2, $3, $4, $5, $6)")
                 .bind(session_id)
                 .bind(times)
                 .bind(s0)
                 .bind(s1)
                 .bind(s2)
+                .bind(horizons)
                 .execute(&self.pool)
                 .await?;
         }
         Ok(())
+    }
+
+    pub async fn query_session_signals(&self, session_id: i32) -> Result<Vec<(DateTime<Utc>, f32, f32, f32, f32)>, CommonError> {
+        let rows = sqlx::query("SELECT event_time, signal1, signal2, signal3, horizon FROM test_signals WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            result.push((
+                row.get::<DateTime<Utc>, _>(0),
+                row.get::<f32, _>(1),
+                row.get::<f32, _>(2),
+                row.get::<f32, _>(3),
+                row.get::<f32, _>(4),
+            ));
+        }
+        Ok(result)
     }
 }

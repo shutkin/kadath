@@ -19,7 +19,7 @@ unsafe impl Sync for SafeBooster {}
 
 #[derive(Copy, Clone, Debug)]
 pub enum PredictionType {
-    ClassificationPositive(f32), ClassificationNegative(f32)
+    ClassificationPositive(f32), ClassificationNegative(f32), Regression,
 }
 
 impl PredictionType {
@@ -27,6 +27,7 @@ impl PredictionType {
         match self {
             PredictionType::ClassificationPositive(threshold) => if horizon > *threshold {1.0} else {0.0},
             PredictionType::ClassificationNegative(threshold) => if horizon < *threshold {1.0} else {0.0},
+            PredictionType::Regression => horizon,
         }
     }
 }
@@ -152,6 +153,7 @@ impl LightGBMConfig {
                     "objective": "binary",
                     "metric": "binary_logloss",
                     "boosting_type": "gbdt",
+                    "boosting": "gbdt",
 
                     "num_leaves": num_leaves,
                     "min_child_samples": min_child_samples,
@@ -162,10 +164,45 @@ impl LightGBMConfig {
                     "lambda_l1": lambda_l1,
                     "lambda_l2": lambda_l2,
 
-                    "num_iterations": 2000,
+                    "num_iterations": 1024,
                     "max_depth": -1,
                     "verbosity": -1,
-                    "random_state": 42,
+                    "n_jobs": -1,
+                }
+            })
+        } else {
+            None
+        }
+    }
+
+    fn to_json_regression(&self) -> Option<Value> {
+        if let Some(num_leaves) = self.num_leaves
+            && let Some(min_child_samples) = self.min_child_samples
+            && let Some(learning_rate) = self.learning_rate
+            && let Some(feature_fraction) = self.feature_fraction
+            && let Some(bagging_fraction) = self.bagging_fraction
+            && let bagging_freq = self.bagging_freq
+            && let lambda_l1 = self.lambda_l1
+            && let lambda_l2 = self.lambda_l2
+        {
+            Some(json! {
+                {
+                    "objective": "regression",
+                    "metric": "l2",
+                    "boosting_type": "gbdt",
+
+                    "num_leaves": num_leaves,
+                    "min_child_samples": min_child_samples,
+                    "learning_rate": learning_rate,
+                    "feature_fraction": feature_fraction,
+                    "bagging_fraction": bagging_fraction,
+                    "bagging_freq": bagging_freq,
+                    "lambda_l1": lambda_l1,
+                    "lambda_l2": lambda_l2,
+
+                    "num_iterations": 1024,
+                    "max_depth": -1,
+                    "verbosity": -1,
                     "n_jobs": -1,
                 }
             })
@@ -205,7 +242,12 @@ pub fn optimize_light_gbm (
                 lambda_l1: lambda_l1_param.suggest(trial).ok(),
                 lambda_l2: lambda_l2_param.suggest(trial).ok(),
             };
-            if let Some(value) = config.to_json() {
+            let config_value = match prediction_type {
+                PredictionType::ClassificationPositive(_) => config.to_json(),
+                PredictionType::ClassificationNegative(_) => config.to_json(),
+                PredictionType::Regression => config.to_json_regression(),
+            };
+            if let Some(value) = config_value {
                 check(&MachineConfig::LightGBM(value), prediction_type, train_data.as_ref(), train_horizons.as_ref(), test_data.as_ref(), test_horizons.as_ref())
             } else {
                 Err(optimizer::Error::Internal("Failed to suggest config"))
@@ -304,38 +346,19 @@ fn check(
     info!("{} {machine_config}: {score}", match prediction_type {
         PredictionType::ClassificationPositive(t) => if t > 0.0 { "PROFIT" } else { "UP" },
         PredictionType::ClassificationNegative(_) => "DOWN",
+        PredictionType::Regression => "REGRESS",
     });
     Ok::<_, optimizer::Error>(score)
-}
-
-pub fn calculate_predictions_pnl(predictions: &[f64], horizons: &[f64], prediction_type: PredictionType) -> f64 {
-    let max_p = predictions.iter().copied().reduce(f64::max).unwrap();
-    let p_threshold = max_p * 0.95;
-    let (mut pnl, mut commission) = (0.0, 0.0);
-    predictions.iter().zip(horizons)
-        .filter(|(p, _)| **p >= p_threshold)
-        .for_each(|(_, h)| {
-            match prediction_type {
-                PredictionType::ClassificationPositive(_) => {
-                    pnl += *h;
-                    commission += 5.0;
-                },
-                PredictionType::ClassificationNegative(_) => {
-                    pnl -= *h;
-                    commission += 5.0;
-                },
-            };
-        });
-    pnl - commission
 }
 
 pub fn calculate_predictions_brier(predictions: &[f64], horizons: &[f32], prediction_type: PredictionType) -> f64 {
     let count = predictions.len();
     let variance = predictions.iter().zip(horizons)
-        .map(|(p, h)| {
+        .map(|(&p, &h)| {
             let diff = match prediction_type {
-                PredictionType::ClassificationPositive(threshold) => if *h > threshold { 1.0 - p } else { *p },
-                PredictionType::ClassificationNegative(threshold) => if *h < threshold { 1.0 - p } else { *p },
+                PredictionType::ClassificationPositive(threshold) => if h > threshold { 1.0 - p } else { p },
+                PredictionType::ClassificationNegative(threshold) => if h < threshold { 1.0 - p } else { p },
+                PredictionType::Regression => h as f64 - p,
             };
             diff * diff
         })

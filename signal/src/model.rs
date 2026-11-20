@@ -35,6 +35,16 @@ impl Default for TradeSignal {
     }
 }
 
+impl TradeSignal {
+    pub fn get_debug_info(&self) -> PredictionDebugInfo {
+        match self {
+            TradeSignal::None(info) => *info,
+            TradeSignal::Sell(info) => *info,
+            TradeSignal::Buy(info) => *info,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct ModelConfig {
     pub derivatives_normalize_diapason_s: f64,
@@ -387,12 +397,12 @@ impl WalkForwardModel {
         false
     }
 
-    pub fn optimize_config(&self, predefined_configs: Option<(&str, &str)>) -> bool {
+    pub fn optimize_config(&self, predefined_configs: Option<(Value, Value)>) -> bool {
         if let Some((positive, negative)) = predefined_configs
             && let Ok(mut write_positive) = self.gbm_config_positive.write()
             && let Ok(mut write_negative) = self.gbm_config_negative.write() {
-            *write_positive = Some(serde_json::from_str(positive).unwrap());
-            *write_negative = Some(serde_json::from_str(negative).unwrap());
+            *write_positive = Some(positive);
+            *write_negative = Some(negative);
             info!("New predefined booster config saved");
             return true;
         }
