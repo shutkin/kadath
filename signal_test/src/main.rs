@@ -105,12 +105,12 @@ fn get_best_bid(order_book: &OrderBook) -> Decimal {
 }
 
 #[tokio::main]
-async fn main() -> EmptyResult {
+async fn __main() -> EmptyResult {
     test_session_experiment().await
 }
 
 #[tokio::main]
-async fn __main() -> EmptyResult {
+async fn main() -> EmptyResult {
     dotenv::dotenv().ok();
     SimpleLogger::init(LevelFilter::Info, simplelog::Config::default()).ok();
     let db_url = std::env::var("DB_URL").expect("DB_URL is not set");
@@ -127,29 +127,16 @@ async fn __main() -> EmptyResult {
         optimize_iterations: 35,
         hold_time: TimeDelta::milliseconds(8000),
         expected_delta: 4.88,
-        prediction_percentile_linear: 0.996,
-        prediction_percentile_gbm: 0.96,
+        prediction_percentile_linear: 0.9,
+        prediction_percentile_gbm: 0.97,
         trend_filter_length: 0.0,
     };
 
-    /*let config = ModelConfig {
-        derivatives_normalize_diapason_s: 57.28,
-        trend_tau_s: 614.61,
-        train_buf_size: 142000,
-        train_min_size: 100000,
-        optimize_iterations: 30,
-        hold_time: TimeDelta::milliseconds(4000),
-        expected_delta: 5.0,
-        prediction_percentile_linear: 0.993,
-        prediction_percentile_gbm: 0.99,
-        trend_filter_length: 0.0,
-    };*/
-
     let diapason = TimeDiapason::new(
-        DateTime::parse_from_rfc3339("2026-11-11T05:00:00Z")?.to_utc(),
-        DateTime::parse_from_rfc3339("2026-11-11T20:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-11-16T05:00:00Z")?.to_utc(),
+        DateTime::parse_from_rfc3339("2026-11-16T20:00:00Z")?.to_utc(),
     );
-    let end = DateTime::parse_from_rfc3339("2026-11-14T00:00:00Z")?.to_utc();
+    let end = DateTime::parse_from_rfc3339("2026-11-19T00:00:00Z")?.to_utc();
 
     let all_instruments = db.get_instruments(DataSource::TInvest).await?;
     let instrument_id = find_instrument_id(&all_instruments, ticker).ok_or("Failed to find instrument")?;
@@ -178,11 +165,11 @@ async fn __main() -> EmptyResult {
     let (pnl, deals, visualizations) = rolling_test_with_logs(&events, instrument_id, config, diapason, end, &test_db).await?;
     info!("Total pnl {pnl} on {deals} deals");
 
-    for (i, visualization) in visualizations.iter().enumerate() {
-        if let Err(err) = visualize_deal(visualization, &format!("Deal {i}"), &format!("deal_{i}.png")) {
-            error!("Failed to print deals visualisation {err}");
-        }
-    }
+    //for (i, visualization) in visualizations.iter().enumerate() {
+    //    if let Err(err) = visualize_deal(visualization, &format!("Deal {i}"), &format!("deal_{i}.png")) {
+    //        error!("Failed to print deals visualisation {err}");
+    //    }
+    //}
 
     /*match average_deal_visual(&visualizations) {
         Ok(visualizations) => {
@@ -311,7 +298,7 @@ async fn rolling_test_with_logs(
 
     let mut context = RollingTestContext::new(&config, diapason);
 
-    let gbm_configs = PredefinedConfigs::read("gbm_configs.json")?;
+    let gbm_configs = PredefinedConfigs::read("gbm_configs_16.json")?;
     info!("Parse {} predefined GBM configs", gbm_configs.len());
 
     while diapason.from < end {
@@ -430,12 +417,12 @@ fn rolling_test_day(
             }
         }
 
-        if ctx.last_train_linear_time < event.order_book.timestamp - TimeDelta::minutes(30)
+        if ctx.last_train_linear_time < event.order_book.timestamp - TimeDelta::minutes(8)
             && model.train_linear() {
             ctx.last_train_linear_time = event.order_book.timestamp;
         }
 
-        if ctx.last_train_gbm_time < event.order_book.timestamp - TimeDelta::minutes(60)
+        if ctx.last_train_gbm_time < event.order_book.timestamp - TimeDelta::minutes(120)
             && model.train_gbm(event.order_book.timestamp) {
             ctx.last_train_gbm_time = event.order_book.timestamp;
         }

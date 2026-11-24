@@ -1,16 +1,25 @@
-use lightgbm3::{Booster, Dataset};
-use log::{debug, error, info};
-use model::common::CommonError;
-use model::math_util::percentile;
-use optimizer::Study;
-use optimizer::prelude::{FloatParam, IntParam, Parameter};
-use serde_json::{Value, json};
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
+use chrono::TimeDelta;
+use gbdt::config::Config;
+use gbdt::decision_tree::Data;
+use gbdt::gradient_boost::GBDT;
+use lightgbm3::{Booster, Dataset};
+use log::{error, info, warn};
+use optimizer::prelude::{FloatParam, IntParam, Parameter};
+use optimizer::Study;
+use serde_json::{json, Value};
+use model::common::CommonError;
+use model::math_util::{FeaturesRollingWindow, OutputType, TimedFeatures};
+use model::math_util::OutputType::{DerivativeNorm, Raw, TrendDeviation, TrendDeviationDerivativeNorm};
+
+pub struct SafeBooster(pub Booster);
+unsafe impl Send for SafeBooster {}
+unsafe impl Sync for SafeBooster {}
 
 #[derive(Copy, Clone, Debug)]
 pub enum PredictionType {
-    ClassificationPositive(f32),
-    ClassificationNegative(f32),
+    ClassificationPositive(f32), ClassificationNegative(f32), Regression,
 }
 
 impl PredictionType {
@@ -18,42 +27,102 @@ impl PredictionType {
         match self {
             PredictionType::ClassificationPositive(threshold) => if horizon > *threshold {1.0} else {0.0},
             PredictionType::ClassificationNegative(threshold) => if horizon < *threshold {1.0} else {0.0},
+            PredictionType::Regression => horizon,
         }
     }
 }
 
-struct BoosterMultithread (Booster);
-unsafe impl Send for BoosterMultithread {}
-unsafe impl Sync for BoosterMultithread {}
-
-pub struct GradientBoost {
-    booster: BoosterMultithread,
+#[derive(Copy, Clone, Debug)]
+pub struct GbdtConfig {
+    pub max_depth: i64,
+    pub iterations: i64,
+    pub shrinkage: f64,
+    pub min_leaf_size: i64,
+    pub data_sample_ratio: f64,
+    pub feature_sample_ratio: f64,
 }
 
-pub enum DataVec<'a> {
-    Owned(Vec<Vec<f32>>), Pointer(&'a [Vec<f32>])
+impl GbdtConfig {
+    pub fn to_config(&self) -> Config {
+        let mut cfg = Config::new();
+        cfg.set_feature_size(13);
+        cfg.set_debug(false);
+        cfg.set_loss("LogLikelyhood");
+
+        cfg.set_data_sample_ratio(self.data_sample_ratio);
+        cfg.set_feature_sample_ratio(self.feature_sample_ratio);
+        cfg.set_max_depth(self.max_depth as u32);
+        cfg.set_iterations(self.iterations as usize);
+        cfg.set_shrinkage(self.shrinkage as f32);
+        cfg.set_min_leaf_size(self.min_leaf_size as usize);
+        cfg
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum MachineConfig {
+    GBDT(GbdtConfig), LightGBM(Value)
+}
+
+impl Display for MachineConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MachineConfig::GBDT(cfg) => write!(f, "{cfg:?}"),
+            MachineConfig::LightGBM(cfg) => write!(f, "{}", serde_json::to_string(cfg).unwrap_or("Invalid JSON".to_string())),
+        }
+    }
+}
+
+pub enum Machine {
+    GBDT(GBDT), LightGBM(SafeBooster)
+}
+
+pub struct GradientBoost {
+    prediction_type: PredictionType,
+    machine: Machine,
 }
 
 impl GradientBoost {
-    pub fn train(prediction_type: PredictionType, config: &Value, data: DataVec, horizons: &[f32]) -> Result<Self, CommonError> {
-        let labels = horizons.to_vec();//.iter().map(|&h| prediction_type.get_label(h)).collect::<Vec<_>>();
-        let dataset = match data {
-            DataVec::Owned(vec) => {
-                Dataset::from_vec_of_vec(vec, labels, true)
+    pub fn train(prediction_type: PredictionType, config: &MachineConfig, data: &[Vec<f32>], horizons: &[f32]) -> Result<Self, CommonError> {
+
+        let machine = match config {
+            MachineConfig::GBDT(cfg) => {
+                let mut train_data = data.iter().zip(horizons.iter())
+                    .map(|(features, horizon)| {
+                        Data::new_training_data(features.to_vec(), 1.0, prediction_type.get_label(*horizon), None)
+                    }).collect::<Vec<_>>();
+                let mut gbdt = GBDT::new(&cfg.to_config());
+                gbdt.fit(&mut train_data);
+                Machine::GBDT(gbdt)
             }
-            DataVec::Pointer(ptr) => {
-                Dataset::from_vec_of_vec(ptr.to_vec(), labels, true)
+            MachineConfig::LightGBM(cfg) => {
+                let labels = horizons.iter().map(|&h| prediction_type.get_label(h)).collect::<Vec<_>>();
+                let dataset = Dataset::from_vec_of_vec(data.to_vec(), labels, true)?;
+                let booster = Booster::train(dataset, cfg)?;
+                Machine::LightGBM(SafeBooster(booster))
             }
-        }?;
-        let booster = Booster::train(dataset, config)?;
+        };
+
         Ok(Self {
-            booster: BoosterMultithread(booster),
+            prediction_type,
+            machine,
         })
     }
 
     pub fn test(&self, data: &[Vec<f32>]) -> Result<Vec<f64>, CommonError> {
-        let output = self.booster.0.predict_from_vec_of_vec(data.to_vec(), true)?;
-        Ok(output.iter().map(|v| v[0]).collect())
+        match &self.machine {
+            Machine::GBDT(gbdt) => {
+                let test_data = data.iter().map(|values| {
+                    Data::new_training_data(values.to_vec(), 1.0, 0.0, None)
+                }).collect::<Vec<_>>();
+                let predict_vec = gbdt.predict(&test_data);
+                Ok(predict_vec.into_iter().map(|p| p as f64).collect())
+            }
+            Machine::LightGBM(booster) => {
+                let output = booster.0.predict_from_vec_of_vec(data.to_vec(), true)?;
+                Ok(output.iter().map(|v| v[0]).collect())
+            }
+        }
     }
 }
 
@@ -84,6 +153,7 @@ impl LightGBMConfig {
                     "objective": "binary",
                     "metric": "binary_logloss",
                     "boosting_type": "gbdt",
+                    "boosting": "gbdt",
 
                     "num_leaves": num_leaves,
                     "min_child_samples": min_child_samples,
@@ -94,10 +164,45 @@ impl LightGBMConfig {
                     "lambda_l1": lambda_l1,
                     "lambda_l2": lambda_l2,
 
-                    "num_iterations": 2000,
+                    "num_iterations": 1024,
                     "max_depth": -1,
                     "verbosity": -1,
-                    "random_state": 42,
+                    "n_jobs": -1,
+                }
+            })
+        } else {
+            None
+        }
+    }
+
+    fn to_json_regression(&self) -> Option<Value> {
+        if let Some(num_leaves) = self.num_leaves
+            && let Some(min_child_samples) = self.min_child_samples
+            && let Some(learning_rate) = self.learning_rate
+            && let Some(feature_fraction) = self.feature_fraction
+            && let Some(bagging_fraction) = self.bagging_fraction
+            && let bagging_freq = self.bagging_freq
+            && let lambda_l1 = self.lambda_l1
+            && let lambda_l2 = self.lambda_l2
+        {
+            Some(json! {
+                {
+                    "objective": "regression",
+                    "metric": "l2",
+                    "boosting_type": "gbdt",
+
+                    "num_leaves": num_leaves,
+                    "min_child_samples": min_child_samples,
+                    "learning_rate": learning_rate,
+                    "feature_fraction": feature_fraction,
+                    "bagging_fraction": bagging_fraction,
+                    "bagging_freq": bagging_freq,
+                    "lambda_l1": lambda_l1,
+                    "lambda_l2": lambda_l2,
+
+                    "num_iterations": 1024,
+                    "max_depth": -1,
+                    "verbosity": -1,
                     "n_jobs": -1,
                 }
             })
@@ -114,7 +219,7 @@ pub fn optimize_light_gbm (
     test_data: &[Vec<f32>],
     test_horizons: &[f32],
     iterations: usize,
-) -> Result<Value, CommonError> {
+) -> Result<MachineConfig, CommonError> {
     let num_leaves_param = IntParam::new(7, 127).name("num leaves");
     let learning_rate_param = FloatParam::new(0.005, 0.1).name("learning rate").log_scale();
     let feature_fraction_param = FloatParam::new(0.5, 1.0).name("feature fraction").log_scale();
@@ -138,8 +243,13 @@ pub fn optimize_light_gbm (
                 lambda_l1: lambda_l1_param.suggest(trial).ok(),
                 lambda_l2: lambda_l2_param.suggest(trial).ok(),
             };
-            if let Some(value) = config.to_json() {
-                check(&value, prediction_type, train_data, train_horizons, test_data, test_horizons)
+            let config_value = match prediction_type {
+                PredictionType::ClassificationPositive(_) => config.to_json(),
+                PredictionType::ClassificationNegative(_) => config.to_json(),
+                PredictionType::Regression => config.to_json_regression(),
+            };
+            if let Some(value) = config_value {
+                check(&MachineConfig::LightGBM(value), prediction_type, train_data.as_ref(), train_horizons.as_ref(), test_data.as_ref(), test_horizons.as_ref())
             } else {
                 Err(optimizer::Error::Internal("Failed to suggest config"))
             }
@@ -158,21 +268,72 @@ pub fn optimize_light_gbm (
         lambda_l2: best.get(&lambda_l2_param),
     };
     if let Some(best_value) = best_config.to_json() {
-        Ok(best_value)
+        Ok(MachineConfig::LightGBM(best_value))
     } else {
         Err("Failed to get best config".into())
     }
 }
 
+pub fn optimize_gbdt (
+    prediction_type: PredictionType,
+    train_data: Arc<Vec<Vec<f32>>>,
+    train_horizons: Arc<Vec<f32>>,
+    test_data: Arc<Vec<Vec<f32>>>,
+    test_horizons: Arc<Vec<f32>>,
+) -> Result<MachineConfig, CommonError> {
+    let max_depth_param = IntParam::new(2, 7).name("max depth");
+    let iterations_param = IntParam::new(50, 200).name("iterations");
+    let shrinkage_param = FloatParam::new(0.005, 0.1).name("shrinkage").log_scale();
+    let min_leaf_size_param = IntParam::new(100, 500).name("min-leaf size");
+    let data_sample_ratio = FloatParam::new(0.5, 1.0).name("data sample ratio");
+    let feature_sample_ratio = FloatParam::new(0.5, 1.0).name("feature sample ratio");
+
+    info!("Starting optimization");
+    let study: Study<f64> = Study::new(optimizer::Direction::Maximize);
+    study
+        .optimize(30, |trial: &mut optimizer::Trial| {
+            if let Some(max_depth) = max_depth_param.suggest(trial).ok()
+                && let Some(iterations) = iterations_param.suggest(trial).ok()
+                && let Some(shrinkage) = shrinkage_param.suggest(trial).ok()
+                && let Some(min_leaf_size) = min_leaf_size_param.suggest(trial).ok()
+                && let Some(data_sample_ratio) = data_sample_ratio.suggest(trial).ok()
+                && let Some(feature_sample_ratio) = feature_sample_ratio.suggest(trial).ok() {
+                let config = GbdtConfig {
+                    max_depth,
+                    iterations,
+                    shrinkage,
+                    min_leaf_size,
+                    data_sample_ratio,
+                    feature_sample_ratio,
+                };
+                check(&MachineConfig::GBDT(config), prediction_type, train_data.as_ref(), train_horizons.as_ref(), test_data.as_ref(), test_horizons.as_ref())
+            } else {
+                Err(optimizer::Error::Internal("Failed to suggest config"))
+            }
+        })?;
+
+    let best = study.best_trial()?;
+    info!("{} best: {}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" }, best.value);
+    let config = GbdtConfig {
+        max_depth: best.get(&max_depth_param).ok_or("max_depth")?,
+        iterations: best.get(&iterations_param).ok_or("iterations")?,
+        shrinkage: best.get(&shrinkage_param).ok_or("shrinkage")?,
+        min_leaf_size: best.get(&min_leaf_size_param).ok_or("min_leaf_size")?,
+        data_sample_ratio: best.get(&data_sample_ratio).ok_or("data_sample_ratio")?,
+        feature_sample_ratio: best.get(&feature_sample_ratio).ok_or("feature_sample_ratio")?,
+    };
+    Ok(MachineConfig::GBDT(config))
+}
+
 fn check(
-    config: &Value,
+    machine_config: &MachineConfig,
     prediction_type: PredictionType,
     train_data: &[Vec<f32>],
     train_horizons: &[f32],
     test_data: &[Vec<f32>],
     test_horizons: &[f32],
 ) -> Result<f64, optimizer::Error> {
-    let machine = GradientBoost::train(prediction_type, config, DataVec::Pointer(train_data), train_horizons)
+    let machine = GradientBoost::train(prediction_type, machine_config, train_data, train_horizons)
         .map_err(|err| {
             error!("Failed to train LightGBM: {err}");
             optimizer::Error::Internal("Failed to train LightGBM")
@@ -183,28 +344,12 @@ fn check(
             optimizer::Error::Internal("Failed to test LightGBM")
         })?;
     let score = calculate_predictions_brier(&predictions, test_horizons, prediction_type);
-    info!("{} {config:?}: {score}", if matches!(prediction_type, PredictionType::ClassificationPositive(_)) { "UP" } else { "DOWN" });
+    info!("{} {machine_config}: {score}", match prediction_type {
+        PredictionType::ClassificationPositive(t) => if t > 0.0 { "PROFIT" } else { "UP" },
+        PredictionType::ClassificationNegative(_) => "DOWN",
+        PredictionType::Regression => "REGRESS",
+    });
     Ok::<_, optimizer::Error>(score)
-}
-
-pub fn calculate_predictions_pnl(predictions: &[f64], horizons: &[f32], prediction_type: PredictionType) -> f64 {
-    let threshold = percentile(predictions, 0.995);
-    let (mut pnl, mut commission) = (0.0, 0.0);
-    predictions.iter().zip(horizons)
-        .filter(|(p, _)| **p >= threshold)
-        .for_each(|(_, h)| {
-            match prediction_type {
-                PredictionType::ClassificationPositive(_) => {
-                    pnl += *h as f64;
-                    commission += 2.0;
-                },
-                PredictionType::ClassificationNegative(_) => {
-                    pnl -= *h as f64;
-                    commission += 2.0;
-                },
-            };
-        });
-    pnl - commission
 }
 
 pub fn calculate_predictions_brier(predictions: &[f64], horizons: &[f32], prediction_type: PredictionType) -> f64 {
@@ -214,6 +359,7 @@ pub fn calculate_predictions_brier(predictions: &[f64], horizons: &[f32], predic
             let diff = match prediction_type {
                 PredictionType::ClassificationPositive(threshold) => if h > threshold { 1.0 - p } else { p },
                 PredictionType::ClassificationNegative(threshold) => if h < threshold { 1.0 - p } else { p },
+                PredictionType::Regression => h as f64 - p,
             };
             diff * diff
         })

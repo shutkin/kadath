@@ -1,0 +1,54 @@
+[
+  {
+    "positive": {"bagging_fraction":0.6250562453547818,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.589152373692082,"lambda_l1":0.00032025203916600647,"lambda_l2":4.455013157454882,"learning_rate":0.012349319854858534,"max_depth":-1,"metric":"binary_logloss","min_child_samples":337,"n_jobs":-1,"num_iterations":2000,"num_leaves":10,"objective":"binary","random_state":42,"verbosity":-1},
+    "negative": {"bagging_fraction":0.9792445717482712,"bagging_freq":4,"boosting_type":"gbdt","feature_fraction":0.5332023487923456,"lambda_l1":0.007574834544021024,"lambda_l2":0.001280721603020149,"learning_rate":0.005044157917335358,"max_depth":-1,"metric":"binary_logloss","min_child_samples":89,"n_jobs":-1,"num_iterations":2000,"num_leaves":35,"objective":"binary","random_state":42,"verbosity":-1}
+  },
+  {
+    "positive": {"bagging_fraction":0.6760689476988433,"bagging_freq":4,"boosting_type":"gbdt","feature_fraction":0.681332626017104,"lambda_l1":0.0008231321861488824,"lambda_l2":0.06405758478956237,"learning_rate":0.0068837659189660986,"max_depth":-1,"metric":"binary_logloss","min_child_samples":500,"n_jobs":-1,"num_iterations":2000,"num_leaves":24,"objective":"binary","random_state":42,"verbosity":-1},
+    "negative": {"bagging_fraction":0.7015803743820023,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.540307171171074,"lambda_l1":0.008283353646277686,"lambda_l2":0.0003537638034715091,"learning_rate":0.005393070202387442,"max_depth":-1,"metric":"binary_logloss","min_child_samples":463,"n_jobs":-1,"num_iterations":2000,"num_leaves":25,"objective":"binary","random_state":42,"verbosity":-1}
+  },
+  {
+    "positive": {"bagging_fraction":0.8081392712399899,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.7336598575518302,"lambda_l1":0.262906369914934,"lambda_l2":0.2466641033661778,"learning_rate":0.023945667971417117,"max_depth":-1,"metric":"binary_logloss","min_child_samples":244,"n_jobs":-1,"num_iterations":2000,"num_leaves":78,"objective":"binary","random_state":42,"verbosity":-1},
+    "negative": {"bagging_fraction":0.6740175265406454,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.8506362564564015,"lambda_l1":0.0003166444027225377,"lambda_l2":0.0004671855560604105,"learning_rate":0.00616736942769041,"max_depth":-1,"metric":"binary_logloss","min_child_samples":1727,"n_jobs":-1,"num_iterations":2000,"num_leaves":121,"objective":"binary","random_state":42,"verbosity":-1}
+  },
+  {
+    "positive": {"bagging_fraction":0.7310628185983399,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.6225037472940466,"lambda_l1":0.00015784021408116487,"lambda_l2":4.893156115360387,"learning_rate":0.006548824256662993,"max_depth":-1,"metric":"binary_logloss","min_child_samples":241,"n_jobs":-1,"num_iterations":2000,"num_leaves":13,"objective":"binary","random_state":42,"verbosity":-1},
+    "negative": {"bagging_fraction":0.7635082490235043,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.518079120653489,"lambda_l1":0.00897129005286288,"lambda_l2":0.5952499828096879,"learning_rate":0.006164146840261076,"max_depth":-1,"metric":"binary_logloss","min_child_samples":260,"n_jobs":-1,"num_iterations":2000,"num_leaves":9,"objective":"binary","random_state":42,"verbosity":-1}
+  },
+  {
+    "positive": {"bagging_fraction":0.9134036366074766,"bagging_freq":1,"boosting_type":"gbdt","feature_fraction":0.6559458715599504,"lambda_l1":0.00036407369752844047,"lambda_l2":0.005988607076039561,"learning_rate":0.005684865517728791,"max_depth":-1,"metric":"binary_logloss","min_child_samples":1047,"n_jobs":-1,"num_iterations":2000,"num_leaves":28,"objective":"binary","random_state":42,"verbosity":-1},
+    "negative": {"bagging_fraction":0.9141219093217273,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.943480169017011,"lambda_l1":0.5108829634860651,"lambda_l2":5.695838144687278,"learning_rate":0.006767502338326114,"max_depth":-1,"metric":"binary_logloss","min_child_samples":242,"n_jobs":-1,"num_iterations":2000,"num_leaves":14,"objective":"binary","random_state":42,"verbosity":-1}
+  },
+  {
+    "positive": {"bagging_fraction":0.6968125457163654,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.5665685402528595,"lambda_l1":0.0009387716627590937,"lambda_l2":0.0022775954472987114,"learning_rate":0.009391964761809321,"max_depth":-1,"metric":"binary_logloss","min_child_samples":80,"n_jobs":-1,"num_iterations":2000,"num_leaves":56,"objective":"binary","random_state":42,"verbosity":-1},
+    "negative": {"bagging_fraction":0.6981473722142143,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.6327316389942699,"lambda_l1":0.0008949619115564401,"lambda_l2":4.781080522919424,"learning_rate":0.015550620818467222,"max_depth":-1,"metric":"binary_logloss","min_child_samples":68,"n_jobs":-1,"num_iterations":2000,"num_leaves":11,"objective":"binary","random_state":42,"verbosity":-1}
+  },
+  {
+    "positive": {"bagging_fraction":0.8221275999135645,"bagging_freq":5,"boosting_type":"gbdt","feature_fraction":0.51961138235435,"lambda_l1":0.019705882452965454,"lambda_l2":0.0724013114492715,"learning_rate":0.024110312280240416,"max_depth":-1,"metric":"binary_logloss","min_child_samples":915,"n_jobs":-1,"num_iterations":2000,"num_leaves":10,"objective":"binary","random_state":42,"verbosity":-1},
+    "negative": {"bagging_fraction":0.7514509549420609,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.5842957433076869,"lambda_l1":0.05466048255316376,"lambda_l2":0.4039479412270419,"learning_rate":0.005027556055653436,"max_depth":-1,"metric":"binary_logloss","min_child_samples":1410,"n_jobs":-1,"num_iterations":2000,"num_leaves":8,"objective":"binary","random_state":42,"verbosity":-1}
+  },
+  {
+    "positive": {"bagging_fraction":0.9633320991717544,"bagging_freq":4,"boosting_type":"gbdt","feature_fraction":0.5603424077139432,"lambda_l1":0.49883091901131943,"lambda_l2":0.008866638964285757,"learning_rate":0.017235661651147295,"max_depth":-1,"metric":"binary_logloss","min_child_samples":122,"n_jobs":-1,"num_iterations":2000,"num_leaves":12,"objective":"binary","random_state":42,"verbosity":-1},
+    "negative": {"bagging_fraction":0.739903983474384,"bagging_freq":2,"boosting_type":"gbdt","feature_fraction":0.5665663704869698,"lambda_l1":0.020260971322371656,"lambda_l2":0.007600482280038371,"learning_rate":0.011536226547588464,"max_depth":-1,"metric":"binary_logloss","min_child_samples":908,"n_jobs":-1,"num_iterations":2000,"num_leaves":8,"objective":"binary","random_state":42,"verbosity":-1}
+  },
+  {
+    "positive": {},
+    "negative": {}
+  },
+  {
+    "positive": {},
+    "negative": {}
+  },
+  {
+    "positive": {},
+    "negative": {}
+  },
+  {
+    "positive": {},
+    "negative": {}
+  },
+  {
+    "positive": {},
+    "negative": {}
+  }
+]

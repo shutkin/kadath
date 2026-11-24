@@ -84,6 +84,7 @@ impl LightGBMConfig {
                     "objective": "binary",
                     "metric": "binary_logloss",
                     "boosting_type": "gbdt",
+                    "boosting": "gbdt",
 
                     "num_leaves": num_leaves,
                     "min_child_samples": min_child_samples,
@@ -94,10 +95,9 @@ impl LightGBMConfig {
                     "lambda_l1": lambda_l1,
                     "lambda_l2": lambda_l2,
 
-                    "num_iterations": 2000,
+                    "num_iterations": 1024,
                     "max_depth": -1,
                     "verbosity": -1,
-                    "random_state": 42,
                     "n_jobs": -1,
                 }
             })

@@ -45,7 +45,7 @@ const FEATURES_OUTPUT: [OutputType; 13] = [
     DerivativeNorm("i50"),
 ];
 
-const OPTIMIZE_GBM: bool = true;
+const OPTIMIZE_GBM: bool = false;
 const OPTIMIZE_GLOBAL: bool = false;
 
 const DIRECTION: TradeDirection = TradeDirection::Buy;
@@ -70,17 +70,17 @@ async fn main() -> EmptyResult {
 
     let (mut config_positive, mut config_negative) = (None, Option::<MachineConfig>::None);
 
-    let day = NaiveDate::from_str("2026-11-13")?;
+    let day = NaiveDate::from_str("2026-11-18")?;
 
     if OPTIMIZE_GBM {
         let diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-11-13T05:00:00Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-11-13T11:00:00Z")?.to_utc(),
-            //day.and_time(NaiveTime::from_str("05:00:00")?).and_utc(),
-            //day.and_time(NaiveTime::from_str("10:00:00")?).and_utc(),
+            //DateTime::parse_from_rfc3339("2026-11-13T05:00:00Z")?.to_utc(),
+            //DateTime::parse_from_rfc3339("2026-11-13T11:00:00Z")?.to_utc(),
+            day.and_time(NaiveTime::from_str("05:00:00")?).and_utc(),
+            day.and_time(NaiveTime::from_str("11:00:00")?).and_utc(),
         );
-        let train_end = DateTime::parse_from_rfc3339("2026-11-13T10:00:00Z")?.to_utc();
-        //let train_end = day.and_time(NaiveTime::from_str("09:00:00")?).and_utc();
+        //let train_end = DateTime::parse_from_rfc3339("2026-11-13T10:00:00Z")?.to_utc();
+        let train_end = day.and_time(NaiveTime::from_str("10:00:00")?).and_utc();
         let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
         info!("Got {} order book values", values.len());
         let fh =
@@ -115,19 +115,19 @@ async fn main() -> EmptyResult {
         info!("Best negative config: {config}");
         config_negative = Some(config);
     } else {
-        config_positive = Some(MachineConfig::LightGBM(serde_json::from_str(r#"{"bagging_fraction":0.6890659760234314,"bagging_freq":4,"boosting_type":"gbdt","boosting":"gbdt","feature_fraction":0.6522623624620375,"lambda_l1":1.7229466260187964,"lambda_l2":4.38945976241284,"learning_rate":0.0070150674971257085,"max_depth":-1,"metric":"binary_logloss","min_child_samples":752,"n_jobs":-1,"num_iterations":8000,"num_leaves":24,"objective":"binary","verbosity":-1}"#)?));
-        config_negative = Some(MachineConfig::LightGBM(serde_json::from_str(r#"{"bagging_fraction":0.9299833245094198,"bagging_freq":3,"boosting_type":"gbdt","feature_fraction":0.9052532226346467,"lambda_l1":0.0007166624155583156,"lambda_l2":0.005054111952699828,"learning_rate":0.0051878076001226365,"max_depth":-1,"metric":"binary_logloss","min_child_samples":74,"n_jobs":-1,"num_iterations":2000,"num_leaves":16,"objective":"binary","random_state":42,"verbosity":-1}"#)?));
+        config_positive = Some(MachineConfig::LightGBM(serde_json::from_str(r#"{"bagging_fraction":0.8889848340024885,"bagging_freq":1,"boosting":"gbdt","boosting_type":"gbdt","feature_fraction":0.5719577298240524,"lambda_l1":0.0010595697254521565,"lambda_l2":0.009031086047182635,"learning_rate":0.005039422066214845,"max_depth":-1,"metric":"binary_logloss","min_child_samples":68,"n_jobs":-1,"num_iterations":1024,"num_leaves":27,"objective":"binary","verbosity":-1}"#)?));
+        config_negative = Some(MachineConfig::LightGBM(serde_json::from_str(r#"{"bagging_fraction":0.7630432732215129,"bagging_freq":4,"boosting":"gbdt","boosting_type":"gbdt","feature_fraction":0.7409146825041885,"lambda_l1":5.833203411198864,"lambda_l2":0.3364142738542241,"learning_rate":0.005624857669614658,"max_depth":-1,"metric":"binary_logloss","min_child_samples":64,"n_jobs":-1,"num_iterations":1024,"num_leaves":8,"objective":"binary","verbosity":-1}"#)?));
     }
 
     if let Some(config_positive) = &config_positive && let Some(config_negative) = &config_negative {
         let diapason = TimeDiapason::new(
-            DateTime::parse_from_rfc3339("2026-11-13T06:48:20Z")?.to_utc(),
-            DateTime::parse_from_rfc3339("2026-11-13T13:58:32Z")?.to_utc(),
-            //day.and_time(NaiveTime::from_str("06:00:00")?).and_utc(),
-            //day.and_time(NaiveTime::from_str("12:00:00")?).and_utc(),
+            //DateTime::parse_from_rfc3339("2026-11-13T06:48:20Z")?.to_utc(),
+            //DateTime::parse_from_rfc3339("2026-11-13T13:58:32Z")?.to_utc(),
+            day.and_time(NaiveTime::from_str("07:00:00")?).and_utc(),
+            day.and_time(NaiveTime::from_str("14:00:00")?).and_utc(),
         );
-        let train_end = DateTime::parse_from_rfc3339("2026-11-13T11:59:59Z")?.to_utc();
-        //let train_end = day.and_time(NaiveTime::from_str("10:00:00")?).and_utc();
+        //let train_end = DateTime::parse_from_rfc3339("2026-11-13T11:59:59Z")?.to_utc();
+        let train_end = day.and_time(NaiveTime::from_str("12:00:00")?).and_utc();
         let values = get_order_books_values(ticker, diapason, Some(inst_id), Some(&db)).await?;
         info!("Got {} order book values", values.len());
 
@@ -147,6 +147,7 @@ async fn main() -> EmptyResult {
         let linear = calibrate_linear_signal(None, &fh.train_features, &fh.train_horizons, events_per_hold as usize)
             .ok_or("Unable to calibrate linear signal")?;
         let predictions_linear = linear.test(&fh.test_features);
+        check_linear_predictions(&predictions_linear, &fh.test_horizons);
         info!("Train UP model...");
         let classificator_positive = GradientBoost::train(positive, config_positive, &fh.train_features, &fh.train_horizons)?;
         let predictions_positive = classificator_positive.test(&fh.test_features)?;
@@ -159,7 +160,7 @@ async fn main() -> EmptyResult {
         let ranks_linear = rolling_normalize_binary(&predictions_linear, false, NORMALIZE_WINDOW_SIZE);
         let ranks_pos = rolling_normalize_binary(&predictions_positive, false, NORMALIZE_WINDOW_SIZE);
         let ranks_neg = rolling_normalize_binary(&predictions_negative, true, NORMALIZE_WINDOW_SIZE);
-        info!("{} positive and {} negative ranked predictions", ranks_pos.len(), ranks_neg.len());
+        info!("{} ranked predictions", ranks_linear.len());
 
         let ranks_gbm: Vec<f64> = ranks_pos.iter()
             .zip(ranks_neg.iter())
@@ -171,7 +172,7 @@ async fn main() -> EmptyResult {
         let mut best_threshold_linear = 0.0;
         let mut best_threshold_gbm = 0.0;
 
-        for trend_length in [0.0, 2.25, 5.0, 10.0] {
+        for trend_length in [0.0/*, 2.25, 5.0, 10.0*/] {
             info!("Trend Filter length {trend_length:?}");
             let fh = get_features_with_horizons(&values, train_end, global_params, HOLD_TIME, trend_length, DIRECTION);
 
@@ -189,11 +190,12 @@ async fn main() -> EmptyResult {
                     (fh.test_timestamps[i], info, fh.test_horizons[i]),
                 )
             }
-            if let Err(err) = save_predictions_csv(&predictions, "experimental_predictions.csv") {
+            if trend_length < 1.0
+                && let Err(err) = save_predictions_csv(&predictions, "experimental_predictions.csv") {
                 error!("Error saving predictions csv: {err}");
             }
 
-            const PERCENTILES: [f64; 6] = [0.9, 0.93, 0.96, 0.99, 0.993, 0.996];
+            const PERCENTILES: [f64; 6] = [0.75, 0.8, 0.85, 0.9, 0.95, 0.975];
             for threshold_linear in PERCENTILES {
                 for threshold_gbm in PERCENTILES {
                     let pnls = predictions.iter()
@@ -227,6 +229,34 @@ fn check_gbm_predictions(predictions: &[f64], horizons: &[f32], prediction_type:
         let score = calculate_predictions_brier(&predictions[from..to], &horizons[from..to], prediction_type);
         info!("{from}..{to}: {score}");
         from += 1000;
+    }
+}
+
+fn check_linear_predictions(predictions: &[f64], horizons: &[f32]) {
+    let mut from = 0;
+    while from < predictions.len() {
+        let to = (from + 3000).min(predictions.len());
+
+        let mut pnl = 0.0;
+        let mut skip_counter = 0;
+        let mut deals = 0;
+
+        predictions[from..to].iter()
+            .zip(horizons[from..to].iter())
+            .for_each(|(&signal, &horizon)| {
+                if skip_counter > 0 {
+                    skip_counter -= 1;
+                } else {
+                    if signal > 0.0 {
+                        pnl += horizon - 0.5;
+                        skip_counter = 193;
+                        deals += 1;
+                    }
+                }
+            });
+
+        info!("{from}..{to}: {pnl}");
+        from += 3000;
     }
 }
 

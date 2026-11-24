@@ -5,20 +5,19 @@ pub mod gradient_boost;
 mod nelder_mead;
 mod trend_filter;
 
-use crate::gradient_boost::{optimize_light_gbm, DataVec, GradientBoost, PredictionType};
+use crate::gradient_boost::{DataVec, GradientBoost, PredictionType, optimize_light_gbm};
 use crate::nelder_mead::{LinearSignal, calibrate_linear_signal};
 use crate::orderbook_values::OrderBookValues;
 use chrono::{DateTime, TimeDelta, Utc};
 use log::{error, info};
+use model::common::{PredictionDebugInfo, export_features_to_csv};
 use model::events::OrderBookEvent;
 use model::math_util::OutputType::{DerivativeNorm, Raw, StandardDeviation, TrendDeviation, TrendDeviationDerivativeNorm};
-use model::math_util::{get_normalized_rank, FeaturesRollingWindow};
+use model::math_util::{BinaryRollingNormalizer, FeaturesRollingWindow, get_normalized_rank};
 use model::{OrderBook, TradeDirection};
+use serde_json::Value;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use serde_json::Value;
-use model::common::{export_features_to_csv, PredictionDebugInfo};
-use crate::trend_filter::TrendFilter;
 
 const LAST_PREDICTIONS_SIZE: usize = 25000;
 
@@ -61,10 +60,10 @@ pub struct ModelConfig {
 
 pub struct WindowData {
     window: FeaturesRollingWindow,
-    last_predictions_linear: Vec<f64>,
-    last_predictions_gbm_positive: Vec<f64>,
-    last_predictions_gbm_negative: Vec<f64>,
-    trend_filter: TrendFilter,
+    linear_normalizer: BinaryRollingNormalizer,
+    gbm_positive_normalizer: BinaryRollingNormalizer,
+    gbm_negative_normalizer: BinaryRollingNormalizer,
+    //trend_filter: TrendFilter,
 }
 
 impl WindowData {
@@ -91,10 +90,10 @@ impl WindowData {
         );
         Self {
             window,
-            last_predictions_linear: Vec::new(),
-            last_predictions_gbm_negative: Vec::new(),
-            last_predictions_gbm_positive: Vec::new(),
-            trend_filter: TrendFilter::new(TradeDirection::Buy, config.trend_filter_length),
+            linear_normalizer: BinaryRollingNormalizer::new(LAST_PREDICTIONS_SIZE, false),
+            gbm_positive_normalizer: BinaryRollingNormalizer::new(LAST_PREDICTIONS_SIZE, false),
+            gbm_negative_normalizer: BinaryRollingNormalizer::new(LAST_PREDICTIONS_SIZE, true),
+            //trend_filter: TrendFilter::new(TradeDirection::Buy, config.trend_filter_length),
         }
     }
 }
@@ -166,17 +165,27 @@ impl WalkForwardModel {
 
     pub fn is_it_time_to_close_deal(&self, book: &OrderBook, deal_data: &mut DealData) -> bool {
         let cur_time = book.timestamp;
-        
-        /*let cur_price = OrderBookValues::from_order_book(book).mid;
-        let is_loss = match deal_data.direction {
-            TradeDirection::Buy => cur_price < deal_data.open_price - 0.5,
-            TradeDirection::Sell => cur_price > deal_data.open_price + 0.5,
+
+        let cur_price = OrderBookValues::from_order_book(book).mid;
+        let pnl = match deal_data.direction {
+            TradeDirection::Buy => cur_price - deal_data.open_price,
+            TradeDirection::Sell => deal_data.open_price - cur_price,
         };
-        if is_loss {
+        if pnl < -0.5 {
             return true;
-        }*/
-        
-        cur_time > deal_data.open_time + self.config.hold_time
+        }
+
+        let dt = (cur_time - deal_data.prev_price_time).as_seconds_f64();
+        let alpha = 1.0 - (-dt / 1.5).exp();
+        deal_data.trend += alpha * (pnl - deal_data.trend);
+
+        if deal_data.max_trend < deal_data.trend {
+            deal_data.max_trend = deal_data.trend;
+        }
+
+        deal_data.prev_price_time = cur_time;
+
+        cur_time > deal_data.open_time + self.config.hold_time && deal_data.trend < deal_data.max_trend - 0.5
     }
 
     pub fn process(&self, window_data: &mut WindowData, event: &OrderBookEvent) -> TradeSignal {
@@ -194,7 +203,7 @@ impl WalkForwardModel {
                 bid: book.bid as f32,
             };
             features = window_data.window.process(book.to_features());
-            window_data.trend_filter.process(&book);
+            //window_data.trend_filter.process(&book);
             is_filtered_by_trend = true;
             prediction_debug.is_filtered_by_trend = is_filtered_by_trend;
         } else {
@@ -244,30 +253,26 @@ impl WalkForwardModel {
         if let Some(prediction_linear_raw) = prediction_linear_opt
             && let Some(prediction_gbm_positive_raw) = prediction_gbm_positive_opt
             && let Some(prediction_gbm_negative_raw) = prediction_gbm_negative_opt {
-            window_data.last_predictions_linear.push(prediction_linear_raw);
-            window_data.last_predictions_gbm_positive.push(prediction_gbm_positive_raw);
-            window_data.last_predictions_gbm_negative.push(prediction_gbm_negative_raw);
+            let linear_normalized = window_data.linear_normalizer.process(prediction_linear_raw);
+            let gbm_positive_normalized = window_data.gbm_positive_normalizer.process(prediction_gbm_positive_raw);
+            let gbm_negative_normalized = window_data.gbm_negative_normalizer.process(prediction_gbm_negative_raw);
 
             prediction_debug.linear_raw = prediction_linear_raw;
             prediction_debug.gbm_positive_raw = prediction_gbm_positive_raw;
             prediction_debug.gbm_negative_raw = prediction_gbm_negative_raw;
 
-            if window_data.last_predictions_linear.len() == LAST_PREDICTIONS_SIZE {
-                let prediction_linear = get_normalized_rank(&window_data.last_predictions_linear, false);
-                let positive_ranked = get_normalized_rank(&window_data.last_predictions_gbm_positive, false);
-                let negative_ranked = get_normalized_rank(&window_data.last_predictions_gbm_negative, true);
-                let prediction_gbm = positive_ranked * (0.75 + 0.25 * negative_ranked);
+            if let Some(linear_normalized) = linear_normalized
+                && let Some(gbm_positive_normalized) = gbm_positive_normalized
+                && let Some(gbm_negative_normalized) = gbm_negative_normalized {
+                let gbm_normalized = gbm_positive_normalized * (0.85 + 0.15 * gbm_negative_normalized);
 
-                prediction_debug.linear_ranked = prediction_linear;
-                prediction_debug.gbm_ranked = prediction_gbm;
-
-                window_data.last_predictions_gbm_positive.remove(0);
-                window_data.last_predictions_gbm_negative.remove(0);
-                window_data.last_predictions_linear.remove(0);
+                prediction_debug.linear_ranked = linear_normalized;
+                prediction_debug.gbm_ranked = gbm_normalized;
 
                 if is_filtered_by_trend
-                    && prediction_linear >= self.config.prediction_percentile_linear
-                    && prediction_gbm >= self.config.prediction_percentile_gbm {
+                    && linear_normalized < 0.98
+                    && linear_normalized >= self.config.prediction_percentile_linear
+                    && gbm_normalized >= self.config.prediction_percentile_gbm {
                     return TradeSignal::Buy(prediction_debug)
                 }
             }
